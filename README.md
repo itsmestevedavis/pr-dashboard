@@ -106,3 +106,4 @@ Unit tests cover the pure status/result-derivation logic. The HTTP/git/Claude in
 - `claude` CLI on PATH
 - Python 3.8+
 - For Slack nudges: the Slack MCP must be configured for `claude`.
+
