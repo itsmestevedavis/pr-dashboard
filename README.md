@@ -78,6 +78,19 @@ Other knobs (at the top of `server.py`, edit directly):
 | `AGENT_CLONES_DIR`  | Root for agent clones (default ~/.cache/pr-tools/clones).                    |
 | `LOG_DIR`           | Root for stream logs.                                                        |
 
+## Auto-sync
+
+`scripts/auto-sync.py` is a tiny stdlib watcher that polls the repo every 2s and, after 5s of no further changes, runs `git add -A && git commit -m "auto: <timestamp>" && git push origin main`. Wire it as a macOS LaunchAgent for hands-off syncing:
+
+```sh
+cp scripts/com.example.pr-dashboard-sync.plist.template \
+   ~/Library/LaunchAgents/com.example.pr-dashboard-sync.plist
+# edit the plist: replace /Users/USER paths with your own
+launchctl load ~/Library/LaunchAgents/com.example.pr-dashboard-sync.plist
+```
+
+Stop with `launchctl unload <plist>`. Logs at `/tmp/pr-dashboard-sync.log`.
+
 ## Tests
 
 ```sh
