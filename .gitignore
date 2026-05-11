@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Local config — never commit. .env.example is the tracked template.
+.env
+
+# Design/spec/plan docs are local-only per CLAUDE.md rule.
+docs/
