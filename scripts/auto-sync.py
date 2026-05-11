@@ -33,7 +33,17 @@ def collect_mtimes():
     return out
 
 
+# Run git with credential.helper forced to gh — bypasses osxkeychain so
+# launchd-spawned pushes don't trigger an interactive keychain prompt.
+GIT_OVERRIDES = [
+    "-c", "credential.helper=",
+    "-c", "credential.helper=!/usr/local/bin/gh auth git-credential",
+]
+
+
 def run(args):
+    if args and args[0] == "git":
+        args = ["git", *GIT_OVERRIDES, *args[1:]]
     return subprocess.run(
         args, cwd=REPO, capture_output=True, text=True, check=False,
     )
