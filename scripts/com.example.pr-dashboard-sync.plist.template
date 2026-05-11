@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent template for auto-syncing the pr-dashboard repo.
+
+  To install (replace /Users/USER with your home dir):
+    1. cp this file to ~/Library/LaunchAgents/com.example.pr-dashboard-sync.plist
+    2. Edit it: set the two absolute paths under <ProgramArguments> to point
+       at your /usr/bin/python3 and your auto-sync.py.
+    3. launchctl load ~/Library/LaunchAgents/com.example.pr-dashboard-sync.plist
+
+  Disable:
+    launchctl unload ~/Library/LaunchAgents/com.example.pr-dashboard-sync.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.pr-dashboard-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/USER/pr-reviewer/scripts/auto-sync.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/pr-dashboard-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/pr-dashboard-sync.log</string>
+</dict>
+</plist>
