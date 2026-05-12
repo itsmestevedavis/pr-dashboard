@@ -1396,19 +1396,39 @@ INDEX_HTML = r"""<!doctype html>
   .tab:hover:not(.active) { color: var(--text); }
   .status-list { list-style: none; padding: 0; margin: 0; }
   .status-item {
-    display: flex;
-    align-items: center;
-    gap: 14px;
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px 16px;
     margin-bottom: 8px;
   }
+  .status-item details { width: 100%; }
+  .status-item summary {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    cursor: pointer;
+    list-style: none;
+    outline: none;
+    user-select: none;
+  }
+  .status-item summary::-webkit-details-marker { display: none; }
   .status-icon { font-size: 18px; flex-shrink: 0; }
   .status-name { font-size: 13px; font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .status-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
-  .status-detail { font-size: 11px; color: var(--muted); margin-top: 2px; font-style: italic; }
+  .status-chevron { margin-left: auto; color: var(--muted); font-size: 11px; transition: transform 0.15s; flex-shrink: 0; }
+  .status-item details[open] .status-chevron { transform: rotate(90deg); }
+  .status-excerpt {
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: #0a0e14;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #c9d1d9;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
 </style>
 </head>
 <body>
@@ -1921,15 +1941,22 @@ function setActiveTab(tab) {
 function renderStatus(checks) {
   const content = document.getElementById('content');
   const items = checks.map(c => {
-    const detail = c.detail ? `<div class="status-detail">${escapeHtml(c.detail)}</div>` : '';
+    const excerpt = c.excerpt
+      ? `<div class="status-excerpt">${escapeHtml(c.excerpt)}</div>`
+      : '';
     return `
     <li class="status-item">
-      <span class="status-icon">${c.ok ? '✅' : '❌'}</span>
-      <div>
-        <div class="status-name">${escapeHtml(c.name)}</div>
-        <div class="status-desc">${escapeHtml(c.description)}</div>
-        ${detail}
-      </div>
+      <details>
+        <summary>
+          <span class="status-icon">${c.ok ? '✅' : '❌'}</span>
+          <div>
+            <div class="status-name">${escapeHtml(c.name)}</div>
+            <div class="status-desc">${escapeHtml(c.description)}</div>
+          </div>
+          <span class="status-chevron">▶</span>
+        </summary>
+        ${excerpt}
+      </details>
     </li>`;
   }).join('');
   content.innerHTML = `<ul class="status-list">${items}</ul>`;
@@ -1979,19 +2006,63 @@ def get_status():
     """Return a list of status checks for the app configuration."""
     checks = []
 
-    def check(name, description, ok, detail=None):
-        checks.append({"name": name, "description": description, "ok": ok, "detail": detail or ""})
+    def check(name, description, ok, excerpt=""):
+        checks.append({"name": name, "description": description, "ok": ok, "excerpt": excerpt})
 
-    check("REVIEW_PROMPT", "Prompt given to Claude on Review", bool(REVIEW_PROMPT and REVIEW_PROMPT.strip()))
-    check("ADDRESS_PROMPT", "Prompt given to Claude on Address", bool(ADDRESS_PROMPT and ADDRESS_PROMPT.strip()))
-    check("NUDGE_PROMPT", "Prompt given to Claude on Nudge", bool(NUDGE_PROMPT and NUDGE_PROMPT.strip()))
-    check("AGENT_CLONES_DIR", f"Agent clones directory ({AGENT_CLONES_DIR})", os.path.isdir(AGENT_CLONES_DIR), "created on first Address job")
-    check("LOG_DIR", f"Log directory ({LOG_DIR})", os.path.isdir(LOG_DIR), "created on first job")
-    check("claude", "claude CLI on PATH", shutil.which("claude") is not None)
-    gh_ok = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
-    check("gh", "gh CLI authenticated", gh_ok)
-    check("FRESH_REVIEWERS", "Slack nudge targets configured", bool(FRESH_REVIEWERS), ", ".join(FRESH_REVIEWERS) if FRESH_REVIEWERS else "")
-    check("TEAM_CHANNEL_ID", "Team Slack channel configured", bool(TEAM_CHANNEL_ID), TEAM_CHANNEL_ID or "")
+    def prompt_excerpt(prompt):
+        if not prompt or not prompt.strip():
+            return "Not set or empty."
+        text = prompt.strip()
+        return text[:500] + ("\n… (truncated)" if len(text) > 500 else "")
+
+    def dir_excerpt(path):
+        if not os.path.isdir(path):
+            return f"Path: {path}\nStatus: does not exist (created automatically on first use)"
+        try:
+            entries = sorted(os.listdir(path))
+            contents = ", ".join(entries[:20]) + ("…" if len(entries) > 20 else "") if entries else "(empty)"
+            return f"Path: {path}\nStatus: exists\nContents: {contents}"
+        except Exception as e:
+            return f"Path: {path}\nError reading directory: {e}"
+
+    check("REVIEW_PROMPT", "Prompt given to Claude on Review",
+          bool(REVIEW_PROMPT and REVIEW_PROMPT.strip()),
+          prompt_excerpt(REVIEW_PROMPT))
+
+    check("ADDRESS_PROMPT", "Prompt given to Claude on Address",
+          bool(ADDRESS_PROMPT and ADDRESS_PROMPT.strip()),
+          prompt_excerpt(ADDRESS_PROMPT))
+
+    check("NUDGE_PROMPT", "Prompt given to Claude on Nudge",
+          bool(NUDGE_PROMPT and NUDGE_PROMPT.strip()),
+          prompt_excerpt(NUDGE_PROMPT))
+
+    check("AGENT_CLONES_DIR", "Agent clones directory",
+          os.path.isdir(AGENT_CLONES_DIR),
+          dir_excerpt(AGENT_CLONES_DIR))
+
+    check("LOG_DIR", "Log directory",
+          os.path.isdir(LOG_DIR),
+          dir_excerpt(LOG_DIR))
+
+    claude_path = shutil.which("claude")
+    check("claude", "claude CLI on PATH",
+          claude_path is not None,
+          f"Found at: {claude_path}" if claude_path else "Not found on PATH")
+
+    gh_result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    gh_output = (gh_result.stdout + gh_result.stderr).strip()
+    check("gh", "gh CLI authenticated",
+          gh_result.returncode == 0,
+          gh_output[:500] if gh_output else "No output from gh auth status")
+
+    check("FRESH_REVIEWERS", "Slack nudge targets (.env)",
+          bool(FRESH_REVIEWERS),
+          "Logins: " + ", ".join(FRESH_REVIEWERS) if FRESH_REVIEWERS else "Not set — add FRESH_REVIEWERS=login1,login2 to .env")
+
+    check("TEAM_CHANNEL_ID", "Team Slack channel (.env)",
+          bool(TEAM_CHANNEL_ID),
+          f"Channel ID: {TEAM_CHANNEL_ID}" if TEAM_CHANNEL_ID else "Not set — add TEAM_CHANNEL_ID=C... to .env")
 
     return checks
 
