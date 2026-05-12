@@ -49,8 +49,8 @@ def _env_list(name, default=()):
     return [s.strip() for s in raw.split(",") if s.strip()] or list(default)
 
 
-# GitHub logins whose open PRs are surfaced in the "Awaiting my review" tab.
-AUTHORS = _env_list("AUTHORS")
+# GitHub logins of teammates whose PRs you review (not your own login).
+AUTHORS = _env_list("REVIEWEE_LOGINS") or _env_list("AUTHORS")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))  # seconds
