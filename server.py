@@ -1649,7 +1649,6 @@ async function onAddress(ev) {
 
 function finishAddress(card, url, data) {
   const actions = card.querySelector('.pr-actions');
-  let cls = 'failed', label = '❌ Failed';
   if (data.status === 'stopped') {
     actions.innerHTML = `
       <span class="review-status stopped">⏹ Stopped</span>
@@ -1715,7 +1714,6 @@ async function onNudge(ev) {
 
 function finishNudge(card, url, data) {
   const actions = card.querySelector('.pr-actions');
-  let cls = 'failed', label = '❌ Failed';
   if (data.status === 'stopped') {
     actions.innerHTML = `
       <span class="review-status stopped">⏹ Stopped</span>
@@ -1854,7 +1852,6 @@ async function onStop(ev) {
 
 function finishReview(card, url, data) {
   const actions = card.querySelector('.pr-actions');
-  let cls = 'failed', label = '❌ Failed';
   if (data.status === 'stopped') {
     actions.innerHTML = `
       <span class="review-status stopped">⏹ Stopped</span>
