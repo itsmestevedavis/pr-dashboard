@@ -1651,8 +1651,16 @@ function finishAddress(card, url, data) {
   const actions = card.querySelector('.pr-actions');
   let cls = 'failed', label = '❌ Failed';
   if (data.status === 'stopped') {
-    cls = 'stopped'; label = '⏹ Stopped';
-  } else if (data.status === 'done') {
+    actions.innerHTML = `
+      <span class="review-status stopped">⏹ Stopped</span>
+      <button class="btn-address" type="button">Address again</button>
+      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+    `;
+    actions.querySelector('.btn-address').addEventListener('click', onAddress);
+    return;
+  }
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
     if (data.result === 'No action') {
       cls = 'commented'; label = 'ℹ No action';
     } else if (data.result === 'Replied only') {
@@ -1709,8 +1717,16 @@ function finishNudge(card, url, data) {
   const actions = card.querySelector('.pr-actions');
   let cls = 'failed', label = '❌ Failed';
   if (data.status === 'stopped') {
-    cls = 'stopped'; label = '⏹ Stopped';
-  } else if (data.status === 'done') {
+    actions.innerHTML = `
+      <span class="review-status stopped">⏹ Stopped</span>
+      <button class="btn-nudge" type="button">Nudge again</button>
+      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+    `;
+    actions.querySelector('.btn-nudge').addEventListener('click', onNudge);
+    return;
+  }
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
     if (data.result === 'No DMs sent' || data.result === 'Channel post failed') {
       cls = 'commented'; label = 'ℹ ' + data.result;
     } else {
@@ -1840,8 +1856,16 @@ function finishReview(card, url, data) {
   const actions = card.querySelector('.pr-actions');
   let cls = 'failed', label = '❌ Failed';
   if (data.status === 'stopped') {
-    cls = 'stopped'; label = '⏹ Stopped';
-  } else if (data.status === 'done') {
+    actions.innerHTML = `
+      <span class="review-status stopped">⏹ Stopped</span>
+      <button class="btn-review" type="button">Review again</button>
+      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+    `;
+    actions.querySelector('.btn-review').addEventListener('click', onReview);
+    return;
+  }
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
     if (data.result === 'approved') {
       cls = 'approved'; label = '✅ Approved';
     } else if ((data.result || '').startsWith('commented:')) {
