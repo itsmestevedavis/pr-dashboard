@@ -56,17 +56,25 @@ CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))  # seconds
 REVIEW_PROMPT = """Review PR #{number} in {repo}.
 
 Steps:
-1. Read the PR: `gh pr view {number} --repo {repo}`
-2. Read the diff: `gh pr diff {number} --repo {repo}`
+1. Read the PR title, description, and metadata:
+   `gh pr view {number} --repo {repo}`
+
+2. Get the list of changed files and their individual patches (do NOT use gh pr diff — it produces one giant file that is too large to read):
+   `gh api repos/{repo}/pulls/{number}/files --paginate`
+   This returns JSON. Each entry has: filename, patch, additions, deletions, status.
+   Review each file's patch field one at a time.
+
 3. Review the changes for bugs, logic errors, missing edge cases, and style issues.
+
 4. Post inline comments on specific lines where needed:
-   `gh api repos/{repo}/pulls/{number}/comments --method POST -f body="..." -f commit_id="..." -f path="..." -F line=N`
+   `gh api repos/{repo}/pulls/{number}/comments --method POST -f body="..." -f commit_id="<sha from step 1>" -f path="<filename>" -F line=<line number>`
+
 5. Submit your final review:
    - If the code is good: `gh pr review {number} --repo {repo} --approve --body "..."`
    - If changes are needed: `gh pr review {number} --repo {repo} --request-changes --body "..."`
-   - If you only want to comment without approving/blocking: `gh pr review {number} --repo {repo} --comment --body "..."`
+   - If you only want to comment: `gh pr review {number} --repo {repo} --comment --body "..."`
 
-Do not ask the user any questions. Do not wait for input. Complete the review autonomously.
+Do not use gh pr diff. Do not ask the user any questions. Do not wait for input. Complete the review autonomously.
 """
 
 STATUS_ORDER = {
