@@ -57,7 +57,18 @@ CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))  # seconds
 
 REVIEW_PROMPT = """Review PR #{number} in {repo}.
 
-Follow the "PR Reviews" workflow in your CLAUDE.md exactly. Do not deviate.
+Steps:
+1. Read the PR: `gh pr view {number} --repo {repo}`
+2. Read the diff: `gh pr diff {number} --repo {repo}`
+3. Review the changes for bugs, logic errors, missing edge cases, and style issues.
+4. Post inline comments on specific lines where needed:
+   `gh api repos/{repo}/pulls/{number}/comments --method POST -f body="..." -f commit_id="..." -f path="..." -F line=N`
+5. Submit your final review:
+   - If the code is good: `gh pr review {number} --repo {repo} --approve --body "..."`
+   - If changes are needed: `gh pr review {number} --repo {repo} --request-changes --body "..."`
+   - If you only want to comment without approving/blocking: `gh pr review {number} --repo {repo} --comment --body "..."`
+
+Do not ask the user any questions. Do not wait for input. Complete the review autonomously.
 """
 
 STATUS_ORDER = {
