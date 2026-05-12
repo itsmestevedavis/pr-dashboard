@@ -16,7 +16,6 @@ Local web UI with two views over the user's GitHub PRs:
    cp ~/pr-reviewer/.env.example ~/pr-reviewer/.env
    # then edit ~/pr-reviewer/.env
    ```
-   - `REVIEWEE_LOGINS` — comma-separated GitHub logins of teammates whose PRs you review. These show up in the "Awaiting my review" tab. Do **not** put your own login here.
    - `FRESH_REVIEWERS` — GitHub logins to DM on Slack when nobody has reviewed your PR yet.
    - `TEAM_CHANNEL_ID` — Slack channel ID the "#Channel" button posts in.
 3. (Optional) symlink `~/.local/bin/prs → ~/pr-reviewer/start.sh` so `prs` works from any directory.
@@ -37,7 +36,7 @@ URL params: `?tab=mine` opens the My PRs view directly.
 
 ### Awaiting my review
 
-Lists open PRs the user is asked to review, by a fixed author list. Clicking **Review** spawns `claude` with the existing PR-review workflow (see "PR Reviews" in the user's CLAUDE.md).
+Lists all open PRs where you are a requested reviewer, sourced directly from GitHub's review-requested queue (no author filter needed). Clicking **Review** spawns `claude` to autonomously review the PR and post comments or an approval.
 
 ### My PRs
 
@@ -60,13 +59,12 @@ Logs persist at `/tmp/pr-tools/logs/`.
 
 `.env` knobs (see `.env.example`):
 
-| Variable           | What it changes                                                                        |
-|--------------------|----------------------------------------------------------------------------------------|
-| `REVIEWEE_LOGINS`  | GitHub logins of teammates whose PRs you review (shown in "Awaiting my review" tab).   |
-| `FRESH_REVIEWERS`  | GitHub logins to DM on Slack when nobody has reviewed your PR yet.                     |
-| `TEAM_CHANNEL_ID`  | Slack channel ID the "#Channel" button posts in.                                       |
-| `HOST`, `PORT`     | Local bind address (default 127.0.0.1:8765).                                           |
-| `CACHE_TTL`        | Seconds the per-PR detail blob is cached for the incoming view (default 30).           |
+| Variable           | What it changes                                                              |
+|--------------------|------------------------------------------------------------------------------|
+| `FRESH_REVIEWERS`  | GitHub logins to DM on Slack when nobody has reviewed your PR yet.           |
+| `TEAM_CHANNEL_ID`  | Slack channel ID the "#Channel" button posts in.                             |
+| `HOST`, `PORT`     | Local bind address (default 127.0.0.1:8765).                                 |
+| `CACHE_TTL`        | Seconds the per-PR detail blob is cached for the incoming view (default 30). |
 
 Other knobs (at the top of `server.py`, edit directly):
 

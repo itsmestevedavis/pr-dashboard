@@ -49,8 +49,6 @@ def _env_list(name, default=()):
     return [s.strip() for s in raw.split(",") if s.strip()] or list(default)
 
 
-# GitHub logins of teammates whose PRs you review (not your own login).
-AUTHORS = _env_list("REVIEWEE_LOGINS") or _env_list("AUTHORS")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))  # seconds
@@ -494,33 +492,26 @@ def determine_status(repo, number, detail, me, fresh):
 
 def list_prs(fresh=False):
     me = get_my_login()
+    results = gh_json([
+        "search", "prs",
+        "--review-requested=@me",
+        "--state=open",
+        "--json", "number,title,author,repository,updatedAt,url",
+    ]) or []
     candidates = []
-    seen = set()
-    for author in AUTHORS:
-        results = gh_json([
-            "search", "prs",
-            "--review-requested=@me",
-            "--state=open",
-            f"--author={author}",
-            "--json", "number,title,author,repository,updatedAt,url",
-        ]) or []
-        for pr in results:
-            repo = (pr.get("repository") or {}).get("nameWithOwner")
-            number = pr.get("number")
-            if not repo or number is None:
-                continue
-            key = (repo, number)
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append({
-                "number": number,
-                "title": pr.get("title") or "",
-                "author": (pr.get("author") or {}).get("login") or "",
-                "repository": repo,
-                "updatedAt": pr.get("updatedAt") or "",
-                "url": pr.get("url") or "",
-            })
+    for pr in results:
+        repo = (pr.get("repository") or {}).get("nameWithOwner")
+        number = pr.get("number")
+        if not repo or number is None:
+            continue
+        candidates.append({
+            "number": number,
+            "title": pr.get("title") or "",
+            "author": (pr.get("author") or {}).get("login") or "",
+            "repository": repo,
+            "updatedAt": pr.get("updatedAt") or "",
+            "url": pr.get("url") or "",
+        })
 
     enriched = []
     for pr in candidates:
@@ -2085,7 +2076,6 @@ def main():
         print(f"Failed to determine GitHub login via gh: {e}", file=sys.stderr)
         sys.exit(1)
     print(f"PR review dashboard")
-    print(f"  authors: {', '.join(AUTHORS)}")
     print(f"  reviewer: {me}")
     print(f"  listening: http://{HOST}:{PORT}")
     print(f"  stop: Ctrl+C")
