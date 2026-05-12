@@ -55,29 +55,7 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))  # seconds
 
-REVIEW_PROMPT = """Review PR #{number} in {repo}.
-
-Steps:
-1. Read the PR title, description, and metadata:
-   `gh pr view {number} --repo {repo}`
-
-2. Get the list of changed files and their individual patches (do NOT use gh pr diff — it produces one giant file that is too large to read):
-   `gh api repos/{repo}/pulls/{number}/files --paginate`
-   This returns JSON. Each entry has: filename, patch, additions, deletions, status.
-   Review each file's patch field one at a time.
-
-3. Review the changes for bugs, logic errors, missing edge cases, and style issues.
-
-4. Post inline comments on specific lines where needed:
-   `gh api repos/{repo}/pulls/{number}/comments --method POST -f body="..." -f commit_id="<sha from step 1>" -f path="<filename>" -F line=<line number>`
-
-5. Submit your final review:
-   - If the code is good: `gh pr review {number} --repo {repo} --approve --body "..."`
-   - If changes are needed: `gh pr review {number} --repo {repo} --request-changes --body "..."`
-   - If you only want to comment: `gh pr review {number} --repo {repo} --comment --body "..."`
-
-Do not use gh pr diff. Do not ask the user any questions. Do not wait for input. Complete the review autonomously.
-"""
+REVIEW_PROMPT = "Review PR #{number} in {repo}.\n\n"
 
 STATUS_ORDER = {
     "re_requested": 0,
@@ -536,6 +514,75 @@ def list_prs(fresh=False):
 
 LOG_DIR = "/tmp/pr-reviewer"
 
+_WORKFLOW_DIR = os.path.expanduser("~/.config/pr-dashboard")
+REVIEW_WORKFLOW  = os.path.join(_WORKFLOW_DIR, "review_workflow.md")
+ADDRESS_WORKFLOW = os.path.join(_WORKFLOW_DIR, "address_workflow.md")
+NUDGE_WORKFLOW   = os.path.join(_WORKFLOW_DIR, "nudge_workflow.md")
+
+_DEFAULT_REVIEW_WORKFLOW = """\
+## Review steps
+
+1. Read the PR title, description, and metadata:
+   `gh pr view {number} --repo {repo}`
+
+2. Get the list of changed files and their individual patches (do NOT use `gh pr diff` — it produces one giant file that is too large):
+   `gh api repos/{repo}/pulls/{number}/files --paginate`
+   This returns JSON. Each entry has: filename, patch, additions, deletions, status.
+   Review each file's patch field one at a time.
+
+3. Review the changes for bugs, logic errors, missing edge cases, and style issues.
+
+4. Post inline comments on specific lines where needed:
+   `gh api repos/{repo}/pulls/{number}/comments --method POST -f body="..." -f commit_id="<sha from step 1>" -f path="<filename>" -F line=<line number>`
+
+5. Submit your final review:
+   - If the code is good: `gh pr review {number} --repo {repo} --approve --body "..."`
+   - If changes are needed: `gh pr review {number} --repo {repo} --request-changes --body "..."`
+   - If you only want to comment: `gh pr review {number} --repo {repo} --comment --body "..."`
+
+Do not use `gh pr diff`. Do not ask the user any questions. Complete the review autonomously.
+"""
+
+_DEFAULT_ADDRESS_WORKFLOW = """\
+## Address steps
+
+For each open review thread on this PR:
+
+1. Decide: apply the fix in code, or reply explaining why the change is not appropriate.
+
+2. If fixing:
+   - Edit the relevant file.
+   - Commit with a clear message.
+
+3. If replying without a code change:
+   - `gh api repos/{repo}/pulls/{number}/comments/<comment_id>/replies --method POST -f body="..."`
+   - Or: `gh pr comment {number} --repo {repo} --body "..."`
+
+After all threads are addressed:
+
+4. Push: `git push origin {local_branch}:{head_ref}`
+
+5. Re-request review from original reviewers:
+   `gh api repos/{repo}/pulls/{number}/requested_reviewers --method POST -f "reviewers[]=<login>"`
+
+Do not ask questions. Do not open new PRs. Only modify files referenced in the comments.
+"""
+
+_DEFAULT_NUDGE_WORKFLOW = """\
+## Nudge steps
+
+1. For each GitHub login in the reviewers list, use the Slack MCP to find their Slack user ID by searching for their display name.
+
+2. Based on mode, send the appropriate message:
+   - `fresh`: DM each reviewer asking them to review the PR for the first time.
+   - `re_review`: DM each reviewer saying you have addressed their comments and asking them to take another look.
+   - `channel`: Post ONE message in the Slack channel tagging all reviewers with @mentions. Do NOT send individual DMs.
+
+3. Keep messages brief and friendly. Always include the PR title and URL.
+
+Do not DM when mode is `channel`. Do not post to channel when mode is `fresh` or `re_review`.
+"""
+
 _jobs = {}  # (repo, number, kind) -> Job
 _jobs_lock = threading.Lock()
 
@@ -733,7 +780,15 @@ def run_review(job):
     job.append(f"Starting review of #{number} in {repo}")
     print(f"[review] starting #{number} in {repo} (log: {log_path})", flush=True)
 
-    prompt = REVIEW_PROMPT.format(number=number, repo=repo)
+    try:
+        workflow = _load_workflow(REVIEW_WORKFLOW)
+    except FileNotFoundError:
+        job.append(f"Review workflow file not found: {REVIEW_WORKFLOW}")
+        job.append("Use the Status tab to create it.")
+        job.finish("failed", "missing_workflow")
+        return
+
+    prompt = REVIEW_PROMPT.format(number=number, repo=repo) + workflow
     events = []
     try:
         proc = subprocess.Popen(
@@ -912,8 +967,6 @@ ADDRESS_PROMPT = (
     "PR head branch on origin: {head_ref}. "
     "Local branch in this worktree: {local_branch}. "
     "Push with: git push origin {local_branch}:{head_ref}\n\n"
-    "Follow the 'Addressing PR comments' workflow in your CLAUDE.md exactly. "
-    "Do not deviate."
 )
 
 _RE_GIT_PUSH = re.compile(r"(^|[\s;&|])git\s+push\b")
@@ -993,10 +1046,18 @@ def run_address(job, head_ref):
         job.append(f"Agent clone ready at {clone_path} (branch: {local_branch})")
         print(f"[address] starting #{number} in {repo} (clone: {clone_path})", flush=True)
 
+        try:
+            workflow = _load_workflow(ADDRESS_WORKFLOW)
+        except FileNotFoundError:
+            job.append(f"Address workflow file not found: {ADDRESS_WORKFLOW}")
+            job.append("Use the Status tab to create it.")
+            job.finish("failed", "missing_workflow")
+            return
+
         prompt = ADDRESS_PROMPT.format(
             number=number, repo=repo,
             head_ref=head_ref, local_branch=local_branch,
-        )
+        ) + workflow
         events = []
         proc = None
         try:
@@ -1062,11 +1123,15 @@ NUDGE_PROMPT = (
     "DM each one asking them to review it for the first time.\n"
     "  - channel: post ONE message in the team channel (the Channel ID above) "
     "tagging the listed reviewers with Slack mentions.\n\n"
-    "Follow the 'Nudging reviewers on Slack' workflow in your CLAUDE.md "
-    "exactly. Pick the message template that matches the mode. Do not deviate."
 )
 
 _RE_SLACK_DM = re.compile(r"slack_send_message\b")
+
+
+def _load_workflow(path):
+    """Read a workflow .md file. Raises FileNotFoundError if missing."""
+    with open(path) as f:
+        return f.read().strip()
 
 
 def derive_nudge_result(events, mode="re_review"):
@@ -1106,10 +1171,18 @@ def run_nudge(job, url, title, reviewers, mode):
     job.append(f"Nudging on Slack ({mode}, {venue}): {', '.join(reviewers)}")
     print(f"[nudge] starting #{number} in {repo} mode={mode} reviewers={reviewers}", flush=True)
 
+    try:
+        workflow = _load_workflow(NUDGE_WORKFLOW)
+    except FileNotFoundError:
+        job.append(f"Nudge workflow file not found: {NUDGE_WORKFLOW}")
+        job.append("Use the Status tab to create it.")
+        job.finish("failed", "missing_workflow")
+        return
+
     prompt = NUDGE_PROMPT.format(
         url=url, title=title, reviewers=", ".join(reviewers),
         mode=mode, channel=TEAM_CHANNEL_ID,
-    )
+    ) + "\n" + workflow
     events = []
     try:
         proc = subprocess.Popen(
@@ -1974,6 +2047,8 @@ function renderStatus(checks) {
         fixHtml = `<div class="fix-row"><button class="btn-fix" data-action="create_dir" data-path="${escapeHtml(c.fix.path)}">Create directory</button></div>`;
       } else if (c.fix.action === 'set_env') {
         fixHtml = `<div class="fix-row"><input class="fix-input" type="text" placeholder="${escapeHtml(c.fix.placeholder)}" data-key="${escapeHtml(c.fix.key)}"><button class="btn-fix" data-action="set_env" data-key="${escapeHtml(c.fix.key)}">Save</button></div>`;
+      } else if (c.fix.action === 'create_file') {
+        fixHtml = `<div class="fix-row"><button class="btn-fix" data-action="create_file" data-path="${escapeHtml(c.fix.path)}">Create file</button></div>`;
       }
     }
     return `
@@ -2018,6 +2093,13 @@ async function onFix(ev) {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ key: btn.dataset.key, value }),
+      });
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || 'HTTP ' + res.status); }
+    } else if (action === 'create_file') {
+      const res = await fetch('/api/status/create-file', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ path: btn.dataset.path }),
       });
       if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || 'HTTP ' + res.status); }
     }
@@ -2113,17 +2195,27 @@ def get_status():
         except Exception as e:
             return f"Path: {path}\nError reading directory: {e}"
 
-    check("REVIEW_PROMPT", "Prompt given to Claude on Review",
-          bool(REVIEW_PROMPT and REVIEW_PROMPT.strip()),
-          prompt_excerpt(REVIEW_PROMPT))
+    def workflow_excerpt(path):
+        if not os.path.isfile(path):
+            return f"File not found: {path}\nClick 'Create file' to generate it with sensible defaults."
+        try:
+            with open(path) as f:
+                text = f.read().strip()
+            return text[:500] + ("\n… (truncated)" if len(text) > 500 else "")
+        except Exception as e:
+            return f"Error reading {path}: {e}"
 
-    check("ADDRESS_PROMPT", "Prompt given to Claude on Address",
-          bool(ADDRESS_PROMPT and ADDRESS_PROMPT.strip()),
-          prompt_excerpt(ADDRESS_PROMPT))
-
-    check("NUDGE_PROMPT", "Prompt given to Claude on Nudge",
-          bool(NUDGE_PROMPT and NUDGE_PROMPT.strip()),
-          prompt_excerpt(NUDGE_PROMPT))
+    for wf_path, wf_name, wf_label in [
+        (REVIEW_WORKFLOW,  "review_workflow.md",  "Review workflow instructions"),
+        (ADDRESS_WORKFLOW, "address_workflow.md", "Address workflow instructions"),
+        (NUDGE_WORKFLOW,   "nudge_workflow.md",   "Nudge workflow instructions"),
+    ]:
+        ok = os.path.isfile(wf_path)
+        check(
+            wf_name, wf_label, ok,
+            workflow_excerpt(wf_path),
+            fix={"action": "create_file", "path": wf_path} if not ok else None,
+        )
 
     check("AGENT_CLONES_DIR", "Agent clones directory",
           os.path.isdir(AGENT_CLONES_DIR),
@@ -2284,6 +2376,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status/set-env":
             self._handle_set_env_post()
             return
+        if parsed.path == "/api/status/create-file":
+            self._handle_create_file_post()
+            return
         self.send_error(404)
 
     def _read_json_body(self):
@@ -2423,6 +2518,30 @@ class Handler(BaseHTTPRequestHandler):
             FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
         elif key == "TEAM_CHANNEL_ID":
             TEAM_CHANNEL_ID = value
+        self._send_json(200, {"ok": True})
+
+    def _handle_create_file_post(self):
+        _defaults = {
+            os.path.realpath(REVIEW_WORKFLOW):  _DEFAULT_REVIEW_WORKFLOW,
+            os.path.realpath(ADDRESS_WORKFLOW): _DEFAULT_ADDRESS_WORKFLOW,
+            os.path.realpath(NUDGE_WORKFLOW):   _DEFAULT_NUDGE_WORKFLOW,
+        }
+        try:
+            data = self._read_json_body()
+            path = os.path.realpath(os.path.expanduser(str(data["path"])))
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        if path not in _defaults:
+            self._send_json(403, {"error": "path not allowed"})
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(_defaults[path])
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+            return
         self._send_json(200, {"ok": True})
 
     def _handle_nudge_post(self):
