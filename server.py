@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -1393,6 +1394,21 @@ INDEX_HTML = r"""<!doctype html>
   }
   .tab.active { color: var(--text); border-bottom-color: var(--blue); }
   .tab:hover:not(.active) { color: var(--text); }
+  .status-list { list-style: none; padding: 0; margin: 0; }
+  .status-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+  }
+  .status-icon { font-size: 18px; flex-shrink: 0; }
+  .status-name { font-size: 13px; font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .status-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .status-detail { font-size: 11px; color: var(--muted); margin-top: 2px; font-style: italic; }
 </style>
 </head>
 <body>
@@ -1404,6 +1420,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="tabs">
     <button class="tab" data-tab="incoming">Awaiting my review</button>
     <button class="tab" data-tab="mine">My PRs</button>
+    <button class="tab" data-tab="status">Status</button>
   </div>
   <main id="content">Loading…</main>
 </div>
@@ -1438,8 +1455,8 @@ const TABS = {
   },
 };
 
-let currentTab = (new URLSearchParams(location.search)).get('tab') === 'mine'
-  ? 'mine' : 'incoming';
+const _tab = (new URLSearchParams(location.search)).get('tab');
+let currentTab = ['mine', 'status'].includes(_tab) ? _tab : 'incoming';
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1887,16 +1904,35 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', status: '⚙️ App status' };
+
 function setActiveTab(tab) {
   currentTab = tab;
   for (const el of document.querySelectorAll('.tab')) {
     el.classList.toggle('active', el.dataset.tab === tab);
   }
-  document.getElementById('pageTitle').textContent = TABS[tab].title;
+  document.getElementById('pageTitle').textContent = TAB_TITLES[tab] || '';
   const url = new URL(location.href);
   if (tab === 'incoming') url.searchParams.delete('tab');
   else url.searchParams.set('tab', tab);
   history.replaceState({}, '', url);
+}
+
+function renderStatus(checks) {
+  const content = document.getElementById('content');
+  const items = checks.map(c => {
+    const detail = c.detail ? `<div class="status-detail">${escapeHtml(c.detail)}</div>` : '';
+    return `
+    <li class="status-item">
+      <span class="status-icon">${c.ok ? '✅' : '❌'}</span>
+      <div>
+        <div class="status-name">${escapeHtml(c.name)}</div>
+        <div class="status-desc">${escapeHtml(c.description)}</div>
+        ${detail}
+      </div>
+    </li>`;
+  }).join('');
+  content.innerHTML = `<ul class="status-list">${items}</ul>`;
 }
 
 async function load(fresh) {
@@ -1904,12 +1940,17 @@ async function load(fresh) {
   btn.disabled = true;
   document.getElementById('content').innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const tab = TABS[currentTab];
-    const url = tab.endpoint + (fresh ? '?fresh=1' : '');
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const prs = await res.json();
-    render(prs);
+    if (currentTab === 'status') {
+      const res = await fetch('/api/status');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      renderStatus(await res.json());
+    } else {
+      const tab = TABS[currentTab];
+      const url = tab.endpoint + (fresh ? '?fresh=1' : '');
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      render(await res.json());
+    }
   } catch (e) {
     document.getElementById('content').innerHTML =
       `<div class="empty">Error: ${escapeHtml(e.message)}</div>`;
@@ -1932,6 +1973,27 @@ load(false);
 </body>
 </html>
 """
+
+
+def get_status():
+    """Return a list of status checks for the app configuration."""
+    checks = []
+
+    def check(name, description, ok, detail=None):
+        checks.append({"name": name, "description": description, "ok": ok, "detail": detail or ""})
+
+    check("REVIEW_PROMPT", "Prompt given to Claude on Review", bool(REVIEW_PROMPT and REVIEW_PROMPT.strip()))
+    check("ADDRESS_PROMPT", "Prompt given to Claude on Address", bool(ADDRESS_PROMPT and ADDRESS_PROMPT.strip()))
+    check("NUDGE_PROMPT", "Prompt given to Claude on Nudge", bool(NUDGE_PROMPT and NUDGE_PROMPT.strip()))
+    check("AGENT_CLONES_DIR", f"Agent clones directory ({AGENT_CLONES_DIR})", os.path.isdir(AGENT_CLONES_DIR), "created on first Address job")
+    check("LOG_DIR", f"Log directory ({LOG_DIR})", os.path.isdir(LOG_DIR), "created on first job")
+    check("claude", "claude CLI on PATH", shutil.which("claude") is not None)
+    gh_ok = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
+    check("gh", "gh CLI authenticated", gh_ok)
+    check("FRESH_REVIEWERS", "Slack nudge targets configured", bool(FRESH_REVIEWERS), ", ".join(FRESH_REVIEWERS) if FRESH_REVIEWERS else "")
+    check("TEAM_CHANNEL_ID", "Team Slack channel configured", bool(TEAM_CHANNEL_ID), TEAM_CHANNEL_ID or "")
+
+    return checks
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1961,6 +2023,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if parsed.path == "/api/status":
+            self._send_json(200, get_status())
             return
         if parsed.path == "/api/prs":
             qs = parse_qs(parsed.query or "")
