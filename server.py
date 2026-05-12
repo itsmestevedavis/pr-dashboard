@@ -429,16 +429,6 @@ def determine_status(repo, number, detail, me, fresh):
     commit_dates = [c.get("committedDate") for c in commits if c.get("committedDate")]
     last_commit_date = max(commit_dates) if commit_dates else None
 
-    # Exclude PRs where any non-bot human (other than me or the PR author) has
-    # already reviewed — let the author handle existing feedback before I pile on.
-    any_other_human_review = any(
-        (r.get("author") or {}).get("login") not in (me, pr_author, None)
-        and not _is_bot_login((r.get("author") or {}).get("login") or "")
-        for r in reviews
-    )
-    if any_other_human_review:
-        return None
-
     me_in_requests = any(
         (u or {}).get("login") == me for u in review_requests
     )
