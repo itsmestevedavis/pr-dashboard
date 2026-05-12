@@ -1,15 +1,22 @@
 # PR dashboard
 
-Local web UI with two views over the user's GitHub PRs:
+Local web UI with two views over your GitHub PRs:
 
-- **Awaiting my review** — PRs from a fixed author list that need a review.
-- **My PRs** — the user's open PRs, grouped by review status. Approved PRs get a Merge button; PRs with comments get an Address button that spawns Claude in a dedicated agent clone to apply or reply to feedback.
+- **Awaiting my review** — all open PRs where you are a requested reviewer, pulled directly from GitHub's review queue.
+- **My PRs** — your open PRs, grouped by review status. Approved PRs get a Merge button; PRs with comments get an Address button that spawns Claude in a dedicated agent clone to apply or reply to feedback.
+
+## Requirements
+
+- Python 3.8+
+- `gh` CLI (authenticated)
+- `claude` CLI on PATH
+- For Slack nudges: the Slack MCP must be configured for `claude`
 
 ## Setup
 
 1. Clone:
    ```sh
-   git clone https://github.com/<you>/pr-dashboard.git ~/pr-reviewer
+   git clone https://github.com/itsmestevedavis/pr-dashboard.git ~/pr-reviewer
    ```
 2. Copy `.env.example` to `.env` and fill in:
    ```sh
@@ -18,7 +25,10 @@ Local web UI with two views over the user's GitHub PRs:
    ```
    - `FRESH_REVIEWERS` — GitHub logins to DM on Slack when nobody has reviewed your PR yet.
    - `TEAM_CHANNEL_ID` — Slack channel ID the "#Channel" button posts in.
-3. (Optional) symlink `~/.local/bin/prs → ~/pr-reviewer/start.sh` so `prs` works from any directory.
+3. (Optional) symlink so `prs` works from any directory:
+   ```sh
+   ln -s ~/pr-reviewer/start.sh ~/.local/bin/prs
+   ```
 
 ## Run
 
@@ -28,7 +38,9 @@ prs                       # if you symlinked it
 bash ~/pr-reviewer/start.sh
 ```
 
-Open http://127.0.0.1:8765 in a browser. Stop with `Ctrl+C`.
+The browser opens automatically at http://127.0.0.1:8765. Stop with `Ctrl+C`.
+
+The server watches `server.py` for changes and restarts automatically — no need to stop and restart while developing.
 
 URL params: `?tab=mine` opens the My PRs view directly.
 
@@ -36,24 +48,25 @@ URL params: `?tab=mine` opens the My PRs view directly.
 
 ### Awaiting my review
 
-Lists all open PRs where you are a requested reviewer, sourced directly from GitHub's review-requested queue (no author filter needed). Clicking **Review** spawns `claude` to autonomously review the PR and post comments or an approval.
+Lists all open PRs where you are a requested reviewer, sourced directly from GitHub's review-requested queue. Clicking **Review** spawns `claude` to autonomously review the PR using the GitHub files API and post inline comments or an approval. A **Stop** button appears while the review is running so you can abort it mid-flight.
 
 ### My PRs
 
-Lists open PRs where the user is the author. Three statuses, derived from GitHub's `reviewDecision` plus an "active commenters" set (anyone with unresolved comments who hasn't approved):
+Lists your open PRs, grouped by status:
 
-- **Approved** → green **Merge** button. Runs `gh pr merge <n> --<viewerDefaultMergeMethod>` (no `--auto`, no `--delete-branch`). Emulates the GitHub Merge button: requires checks green, respects the repo's branch-deletion setting.
-- **Has comments** → blue **Address** button. Runs `claude` against a dedicated agent clone (see below) per the "Addressing PR comments" workflow in CLAUDE.md (evaluate each comment, then either fix-and-push or reply-and-decline, then re-request review from those whose comments were fixed).
+- **Approved** → green **Merge** button. Runs `gh pr merge` using the repo's default merge method.
+- **Has comments** → blue **Address** button. Spawns `claude` in a dedicated agent clone to evaluate each comment, fix or reply, then re-request review.
 - **Not reviewed yet** → no action button.
-- **Nudge** → purple button on every row. DMs stale reviewers (or asks Steve+Pratik for a first review) on Slack via the Slack MCP. Mode and target list are computed server-side.
+- **Nudge** → purple button on every row. DMs stale reviewers via Slack MCP, or asks `FRESH_REVIEWERS` for a first review.
+- **#Channel** → posts in the configured team Slack channel tagging `FRESH_REVIEWERS`.
+
+A **Stop** button appears on Address and Nudge jobs while they are running.
 
 ## Agent clone
 
-The Address job runs in `~/.cache/pr-tools/clones/<owner>_<name>` — a dedicated clone, separate from any IDE workspace under `~/Desktop`. First Address job per repo clones from origin (~30-60s); subsequent jobs reuse the clone (sub-second prep). Per-repo mutex serializes simultaneous jobs against the same repo.
+The Address job runs in `~/.cache/pr-tools/clones/<owner>_<name>` — a dedicated clone separate from any IDE workspace. The first Address job per repo clones from origin (~30-60s); subsequent jobs reuse the clone. Per-repo mutex serializes simultaneous jobs against the same repo.
 
-Your IDE clone (e.g. `~/Desktop/<repo>`) is never touched by the dashboard.
-
-Logs persist at `/tmp/pr-tools/logs/`.
+Logs persist at `/tmp/pr-reviewer/`.
 
 ## Customizing
 
@@ -64,21 +77,21 @@ Logs persist at `/tmp/pr-tools/logs/`.
 | `FRESH_REVIEWERS`  | GitHub logins to DM on Slack when nobody has reviewed your PR yet.           |
 | `TEAM_CHANNEL_ID`  | Slack channel ID the "#Channel" button posts in.                             |
 | `HOST`, `PORT`     | Local bind address (default 127.0.0.1:8765).                                 |
-| `CACHE_TTL`        | Seconds the per-PR detail blob is cached for the incoming view (default 30). |
+| `CACHE_TTL`        | Seconds the per-PR detail blob is cached (default 30).                       |
 
-Other knobs (at the top of `server.py`, edit directly):
+Prompts and paths (edit at the top of `server.py`):
 
-| Constant            | What it changes                                                              |
-|---------------------|------------------------------------------------------------------------------|
-| `REVIEW_PROMPT`     | Prompt for Claude on Review.                                                 |
-| `ADDRESS_PROMPT`    | Prompt for Claude on Address. Points at the CLAUDE.md workflow.              |
-| `NUDGE_PROMPT`      | Prompt for Claude on Nudge. Points at the CLAUDE.md workflow.                |
-| `AGENT_CLONES_DIR`  | Root for agent clones (default ~/.cache/pr-tools/clones).                    |
-| `LOG_DIR`           | Root for stream logs.                                                        |
+| Constant           | What it changes                                                              |
+|--------------------|------------------------------------------------------------------------------|
+| `REVIEW_PROMPT`    | Prompt given to Claude on Review.                                            |
+| `ADDRESS_PROMPT`   | Prompt given to Claude on Address.                                           |
+| `NUDGE_PROMPT`     | Prompt given to Claude on Nudge.                                             |
+| `AGENT_CLONES_DIR` | Root for agent clones (default `~/.cache/pr-tools/clones`).                 |
+| `LOG_DIR`          | Root for job logs (default `/tmp/pr-reviewer`).                              |
 
 ## Auto-sync
 
-`scripts/auto-sync.py` is a tiny stdlib watcher that polls the repo every 2s and, after 5s of no further changes, runs `git add -A && git commit -m "auto: <timestamp>" && git push origin main`. Wire it as a macOS LaunchAgent for hands-off syncing:
+`scripts/auto-sync.py` polls the repo every 2s and, after 5s of no further changes, auto-commits and pushes. Wire it as a macOS LaunchAgent for hands-off syncing:
 
 ```sh
 cp scripts/com.example.pr-dashboard-sync.plist.template \
@@ -95,14 +108,4 @@ Stop with `launchctl unload <plist>`. Logs at `/tmp/pr-dashboard-sync.log`.
 cd ~/pr-reviewer && python3 -m unittest discover -s tests -v
 ```
 
-Unit tests cover the pure status/result-derivation logic. The HTTP/git/Claude integration is exercised manually.
-
-## Requirements
-
-- `gh` (authenticated)
-- `git`
-- `claude` CLI on PATH
-- Python 3.8+
-- For Slack nudges: the Slack MCP must be configured for `claude`.
-
-
+Unit tests cover the status and result-derivation logic. HTTP/git/Claude integration is exercised manually.
