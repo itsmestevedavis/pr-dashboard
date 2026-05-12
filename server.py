@@ -42,7 +42,8 @@ def _load_dotenv(path):
             os.environ[key] = val
 
 
-_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+_load_dotenv(_ENV_PATH)
 
 
 def _env_list(name, default=()):
@@ -1429,6 +1430,29 @@ INDEX_HTML = r"""<!doctype html>
     white-space: pre-wrap;
     word-break: break-word;
   }
+  .fix-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  .fix-input {
+    flex: 1;
+    background: #0a0e14;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 10px;
+    color: var(--text);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  .btn-fix {
+    background: #1f6feb;
+    color: #fff;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .btn-fix:hover:not(:disabled) { background: #388bfd; }
+  .btn-fix:disabled { opacity: 0.6; cursor: wait; }
 </style>
 </head>
 <body>
@@ -1944,6 +1968,14 @@ function renderStatus(checks) {
     const excerpt = c.excerpt
       ? `<div class="status-excerpt">${escapeHtml(c.excerpt)}</div>`
       : '';
+    let fixHtml = '';
+    if (!c.ok && c.fix) {
+      if (c.fix.action === 'create_dir') {
+        fixHtml = `<div class="fix-row"><button class="btn-fix" data-action="create_dir" data-path="${escapeHtml(c.fix.path)}">Create directory</button></div>`;
+      } else if (c.fix.action === 'set_env') {
+        fixHtml = `<div class="fix-row"><input class="fix-input" type="text" placeholder="${escapeHtml(c.fix.placeholder)}" data-key="${escapeHtml(c.fix.key)}"><button class="btn-fix" data-action="set_env" data-key="${escapeHtml(c.fix.key)}">Save</button></div>`;
+      }
+    }
     return `
     <li class="status-item">
       <details>
@@ -1956,10 +1988,44 @@ function renderStatus(checks) {
           <span class="status-chevron">▶</span>
         </summary>
         ${excerpt}
+        ${fixHtml}
       </details>
     </li>`;
   }).join('');
   content.innerHTML = `<ul class="status-list">${items}</ul>`;
+  for (const btn of content.querySelectorAll('.btn-fix')) {
+    btn.addEventListener('click', onFix);
+  }
+}
+
+async function onFix(ev) {
+  const btn = ev.currentTarget;
+  const action = btn.dataset.action;
+  btn.disabled = true;
+  try {
+    if (action === 'create_dir') {
+      const res = await fetch('/api/status/create-dir', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ path: btn.dataset.path }),
+      });
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || 'HTTP ' + res.status); }
+    } else if (action === 'set_env') {
+      const row = btn.closest('.fix-row');
+      const value = row.querySelector('.fix-input').value.trim();
+      if (!value) { btn.disabled = false; return; }
+      const res = await fetch('/api/status/set-env', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ key: btn.dataset.key, value }),
+      });
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || 'HTTP ' + res.status); }
+    }
+    load(false);
+  } catch (e) {
+    toast(`Fix failed: ${e.message}`, true);
+    btn.disabled = false;
+  }
 }
 
 async function load(fresh) {
@@ -2002,12 +2068,34 @@ load(false);
 """
 
 
+def write_env_var(key, value):
+    """Update or append key=value in the .env file and os.environ."""
+    try:
+        with open(_ENV_PATH) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    updated = False
+    new_lines = []
+    for line in lines:
+        if re.match(rf"^\s*{re.escape(key)}\s*=", line):
+            new_lines.append(f"{key}={value}\n")
+            updated = True
+        else:
+            new_lines.append(line)
+    if not updated:
+        new_lines.append(f"{key}={value}\n")
+    with open(_ENV_PATH, "w") as f:
+        f.writelines(new_lines)
+    os.environ[key] = value
+
+
 def get_status():
     """Return a list of status checks for the app configuration."""
     checks = []
 
-    def check(name, description, ok, excerpt=""):
-        checks.append({"name": name, "description": description, "ok": ok, "excerpt": excerpt})
+    def check(name, description, ok, excerpt="", fix=None):
+        checks.append({"name": name, "description": description, "ok": ok, "excerpt": excerpt, "fix": fix})
 
     def prompt_excerpt(prompt):
         if not prompt or not prompt.strip():
@@ -2039,11 +2127,13 @@ def get_status():
 
     check("AGENT_CLONES_DIR", "Agent clones directory",
           os.path.isdir(AGENT_CLONES_DIR),
-          dir_excerpt(AGENT_CLONES_DIR))
+          dir_excerpt(AGENT_CLONES_DIR),
+          fix={"action": "create_dir", "path": AGENT_CLONES_DIR})
 
     check("LOG_DIR", "Log directory",
           os.path.isdir(LOG_DIR),
-          dir_excerpt(LOG_DIR))
+          dir_excerpt(LOG_DIR),
+          fix={"action": "create_dir", "path": LOG_DIR})
 
     claude_path = shutil.which("claude")
     check("claude", "claude CLI on PATH",
@@ -2058,11 +2148,13 @@ def get_status():
 
     check("FRESH_REVIEWERS", "Slack nudge targets (.env)",
           bool(FRESH_REVIEWERS),
-          "Logins: " + ", ".join(FRESH_REVIEWERS) if FRESH_REVIEWERS else "Not set — add FRESH_REVIEWERS=login1,login2 to .env")
+          "Logins: " + ", ".join(FRESH_REVIEWERS) if FRESH_REVIEWERS else "Not set — add FRESH_REVIEWERS=login1,login2 to .env",
+          fix={"action": "set_env", "key": "FRESH_REVIEWERS", "placeholder": "login1,login2"})
 
     check("TEAM_CHANNEL_ID", "Team Slack channel (.env)",
           bool(TEAM_CHANNEL_ID),
-          f"Channel ID: {TEAM_CHANNEL_ID}" if TEAM_CHANNEL_ID else "Not set — add TEAM_CHANNEL_ID=C... to .env")
+          f"Channel ID: {TEAM_CHANNEL_ID}" if TEAM_CHANNEL_ID else "Not set — add TEAM_CHANNEL_ID=C... to .env",
+          fix={"action": "set_env", "key": "TEAM_CHANNEL_ID", "placeholder": "C0123456789"})
 
     return checks
 
@@ -2186,6 +2278,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/job/stop":
             self._handle_stop_post()
             return
+        if parsed.path == "/api/status/create-dir":
+            self._handle_create_dir_post()
+            return
+        if parsed.path == "/api/status/set-env":
+            self._handle_set_env_post()
+            return
         self.send_error(404)
 
     def _read_json_body(self):
@@ -2281,6 +2379,50 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "no running job"})
             return
         job.stop()
+        self._send_json(200, {"ok": True})
+
+    def _handle_create_dir_post(self):
+        try:
+            data = self._read_json_body()
+            path = str(data["path"])
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        allowed = (AGENT_CLONES_DIR, LOG_DIR)
+        if path not in allowed:
+            self._send_json(403, {"error": "path not allowed"})
+            return
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+            return
+        self._send_json(200, {"ok": True})
+
+    def _handle_set_env_post(self):
+        global FRESH_REVIEWERS, TEAM_CHANNEL_ID
+        try:
+            data = self._read_json_body()
+            key = str(data["key"])
+            value = str(data["value"]).strip()
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        if key not in ("FRESH_REVIEWERS", "TEAM_CHANNEL_ID"):
+            self._send_json(403, {"error": "key not allowed"})
+            return
+        if not value:
+            self._send_json(400, {"error": "value required"})
+            return
+        try:
+            write_env_var(key, value)
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+            return
+        if key == "FRESH_REVIEWERS":
+            FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
+        elif key == "TEAM_CHANNEL_ID":
+            TEAM_CHANNEL_ID = value
         self._send_json(200, {"ok": True})
 
     def _handle_nudge_post(self):
