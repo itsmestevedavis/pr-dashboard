@@ -543,13 +543,22 @@ class Job:
         self.repo = repo
         self.number = number
         self.kind = kind  # "review" | "merge" | "address"
-        self.status = "running"  # running | done | failed
+        self.status = "running"  # running | done | failed | stopped
         self.result = None
         self.log = []
         self.subscribers = []
         self.lock = threading.Lock()
         self.start_time = time.time()
         self.log_path = None
+        self.proc = None
+        self._stop_requested = False
+
+    def stop(self):
+        with self.lock:
+            self._stop_requested = True
+            proc = self.proc
+        if proc and proc.poll() is None:
+            proc.terminate()
 
     def append(self, text):
         line = {"ts": time.time(), "type": "line", "text": text}
@@ -742,6 +751,8 @@ def run_review(job):
         job.finish("failed", "spawn_error")
         return
 
+    job.proc = proc
+
     try:
         with open(log_path, "w") as logf:
             for line in proc.stdout:
@@ -765,8 +776,12 @@ def run_review(job):
         return
 
     if proc.returncode != 0:
-        job.append(f"claude exited with code {proc.returncode}")
-        job.finish("failed", f"exit:{proc.returncode}")
+        if job._stop_requested:
+            job.append("Review stopped.")
+            job.finish("stopped", "stopped")
+        else:
+            job.append(f"claude exited with code {proc.returncode}")
+            job.finish("failed", f"exit:{proc.returncode}")
         return
 
     try:
@@ -992,6 +1007,7 @@ def run_address(job, head_ref):
                 text=True, bufsize=1,
                 cwd=clone_path,
             )
+            job.proc = proc
             with open(log_path, "w") as logf:
                 for line in proc.stdout:
                     logf.write(line)
@@ -1014,8 +1030,12 @@ def run_address(job, head_ref):
             return
 
         if proc.returncode != 0:
-            job.append(f"claude exited with code {proc.returncode}")
-            job.finish("failed", f"exit:{proc.returncode}")
+            if job._stop_requested:
+                job.append("Stopped.")
+                job.finish("stopped", "stopped")
+            else:
+                job.append(f"claude exited with code {proc.returncode}")
+                job.finish("failed", f"exit:{proc.returncode}")
             return
 
         result = derive_address_result(events)
@@ -1098,6 +1118,7 @@ def run_nudge(job, url, title, reviewers, mode):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
+        job.proc = proc
         with open(log_path, "w") as logf:
             for line in proc.stdout:
                 logf.write(line)
@@ -1120,8 +1141,12 @@ def run_nudge(job, url, title, reviewers, mode):
         return
 
     if proc.returncode != 0:
-        job.append(f"claude exited with code {proc.returncode}")
-        job.finish("failed", f"exit:{proc.returncode}")
+        if job._stop_requested:
+            job.append("Stopped.")
+            job.finish("stopped", "stopped")
+        else:
+            job.append(f"claude exited with code {proc.returncode}")
+            job.finish("failed", f"exit:{proc.returncode}")
         return
 
     result = derive_nudge_result(events, mode=mode)
@@ -1336,6 +1361,18 @@ INDEX_HTML = r"""<!doctype html>
     animation: spin 0.8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .btn-stop {
+    background: #6e7681;
+    color: #fff;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .btn-stop:hover { background: #8b949e; }
+  .review-status.stopped { background: rgba(110,118,129,0.15); color: #8b949e; border-color: rgba(110,118,129,0.4); }
   .tabs {
     display: flex;
     gap: 4px;
@@ -1567,7 +1604,7 @@ async function onMerge(ev) {
     toast(`Failed to start: ${e.message}`, true);
     return;
   }
-  setRunning(card, 'Merging…');
+  setRunning(card, 'Merging…', 'merge');
   streamJob(card, 'merge', repo, number, url, finishMerge);
 }
 
@@ -1605,14 +1642,16 @@ async function onAddress(ev) {
     toast(`Failed to start: ${e.message}`, true);
     return;
   }
-  setRunning(card, 'Addressing…');
+  setRunning(card, 'Addressing…', 'address');
   streamJob(card, 'address', repo, number, url, finishAddress);
 }
 
 function finishAddress(card, url, data) {
   const actions = card.querySelector('.pr-actions');
   let cls = 'failed', label = '❌ Failed';
-  if (data.status === 'done') {
+  if (data.status === 'stopped') {
+    cls = 'stopped'; label = '⏹ Stopped';
+  } else if (data.status === 'done') {
     if (data.result === 'No action') {
       cls = 'commented'; label = 'ℹ No action';
     } else if (data.result === 'Replied only') {
@@ -1661,14 +1700,16 @@ async function onNudge(ev) {
     toast(`Failed to start: ${e.message}`, true);
     return;
   }
-  setRunning(card, 'Nudging…');
+  setRunning(card, 'Nudging…', 'nudge');
   streamJob(card, 'nudge', repo, number, url, finishNudge);
 }
 
 function finishNudge(card, url, data) {
   const actions = card.querySelector('.pr-actions');
   let cls = 'failed', label = '❌ Failed';
-  if (data.status === 'done') {
+  if (data.status === 'stopped') {
+    cls = 'stopped'; label = '⏹ Stopped';
+  } else if (data.status === 'done') {
     if (data.result === 'No DMs sent' || data.result === 'Channel post failed') {
       cls = 'commented'; label = 'ℹ ' + data.result;
     } else {
@@ -1714,11 +1755,11 @@ async function onChannelPing(ev) {
     toast(`Failed to start: ${e.message}`, true);
     return;
   }
-  setRunning(card, 'Posting in channel…');
+  setRunning(card, 'Posting in channel…', 'nudge');
   streamJob(card, 'nudge', repo, number, url, finishNudge);
 }
 
-function setRunning(card, label) {
+function setRunning(card, label, kind) {
   const main = card.querySelector('.pr-main');
   const actions = card.querySelector('.pr-actions');
   let panel = main.querySelector('.review-log');
@@ -1729,10 +1770,16 @@ function setRunning(card, label) {
   } else {
     panel.innerHTML = '';
   }
-  actions.innerHTML = `<span class="review-status running"><span class="spinner"></span>${escapeHtml(label)}</span>`;
+  // label and kind are server-controlled strings, escaped before insertion
+  const stopBtn = kind
+    ? `<button class="btn-stop" data-kind="${escapeHtml(kind)}">Stop</button>`
+    : '';
+  actions.innerHTML = `<span class="review-status running"><span class="spinner"></span>${escapeHtml(label)}</span>${stopBtn}`;
+  const btn = actions.querySelector('.btn-stop');
+  if (btn) btn.addEventListener('click', onStop);
 }
 
-function setReviewing(card) { setRunning(card, 'Reviewing…'); }
+function setReviewing(card) { setRunning(card, 'Reviewing…', 'review'); }
 
 function appendLogLine(card, text, cls) {
   const panel = card.querySelector('.review-log');
@@ -1768,10 +1815,32 @@ function streamJob(card, kind, repo, number, url, finishLabel) {
   });
 }
 
+async function onStop(ev) {
+  const btn = ev.currentTarget;
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const kind = btn.dataset.kind;
+  btn.disabled = true;
+  btn.textContent = 'Stopping…';
+  try {
+    await fetch('/api/job/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, kind }),
+    });
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Stop';
+  }
+}
+
 function finishReview(card, url, data) {
   const actions = card.querySelector('.pr-actions');
   let cls = 'failed', label = '❌ Failed';
-  if (data.status === 'done') {
+  if (data.status === 'stopped') {
+    cls = 'stopped'; label = '⏹ Stopped';
+  } else if (data.status === 'done') {
     if (data.result === 'approved') {
       cls = 'approved'; label = '✅ Approved';
     } else if ((data.result || '').startsWith('commented:')) {
@@ -1956,6 +2025,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/nudge":
             self._handle_nudge_post()
             return
+        if parsed.path == "/api/job/stop":
+            self._handle_stop_post()
+            return
         self.send_error(404)
 
     def _read_json_body(self):
@@ -2033,6 +2105,25 @@ class Handler(BaseHTTPRequestHandler):
             "repo": repo,
             "kind": "address",
         })
+
+    def _handle_stop_post(self):
+        try:
+            data = self._read_json_body()
+            number = int(data["number"])
+            repo = str(data["repo"])
+            kind = str(data.get("kind") or "review")
+            if "/" not in repo:
+                raise ValueError("repo must be owner/name")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        with _jobs_lock:
+            job = _jobs.get((repo, number, kind))
+        if not job or job.status != "running":
+            self._send_json(404, {"error": "no running job"})
+            return
+        job.stop()
+        self._send_json(200, {"ok": True})
 
     def _handle_nudge_post(self):
         try:
