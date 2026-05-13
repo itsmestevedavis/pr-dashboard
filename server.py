@@ -1520,6 +1520,16 @@ INDEX_HTML = r"""<!doctype html>
   }
   .tab.active { color: var(--text); border-bottom-color: var(--blue); }
   .tab:hover:not(.active) { color: var(--text); }
+  .settings-form { max-width: 560px; display: flex; flex-direction: column; gap: 20px; padding: 8px 0 24px; }
+  .settings-row { display: flex; flex-direction: column; gap: 5px; }
+  .settings-label { font-weight: 600; color: #c9d1d9; font-size: 14px; }
+  .settings-desc { color: #8b949e; font-size: 12px; line-height: 1.4; }
+  .settings-input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 14px; width: 100%; box-sizing: border-box; font-family: inherit; }
+  .settings-input:focus { outline: none; border-color: #388bfd; box-shadow: 0 0 0 3px rgba(56,139,253,0.15); }
+  .settings-restart { color: #f59e0b; font-size: 11px; margin-top: 2px; }
+  .btn-settings-save { background: #238636; color: #fff; border: none; border-radius: 6px; padding: 9px 22px; font-size: 14px; font-weight: 500; cursor: pointer; }
+  .btn-settings-save:hover:not(:disabled) { background: #2ea043; }
+  .btn-settings-save:disabled { opacity: 0.6; cursor: wait; }
   .status-list { list-style: none; padding: 0; margin: 0; }
   .status-item {
     background: var(--card);
@@ -1590,6 +1600,7 @@ INDEX_HTML = r"""<!doctype html>
     <button class="tab" data-tab="incoming">Awaiting my review</button>
     <button class="tab" data-tab="mine">My PRs</button>
     <button class="tab" data-tab="status">Status</button>
+    <button class="tab" data-tab="settings">Settings</button>
   </div>
   <main id="content">Loading…</main>
 </div>
@@ -1625,7 +1636,7 @@ const TABS = {
 };
 
 const _tab = (new URLSearchParams(location.search)).get('tab');
-let currentTab = ['mine', 'status'].includes(_tab) ? _tab : 'incoming';
+let currentTab = ['mine', 'status', 'settings'].includes(_tab) ? _tab : 'incoming';
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2111,7 +2122,7 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
-const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', status: '⚙️ App status' };
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', status: '⚙️ App status', settings: '⚙️ Settings' };
 
 function setActiveTab(tab) {
   currentTab = tab;
@@ -2200,12 +2211,76 @@ async function onFix(ev) {
   }
 }
 
+function renderSettings() {
+  const c = CONFIG;
+  const fields = [
+    { key: 'FRESH_REVIEWERS', label: 'Fresh reviewers', type: 'text',
+      desc: 'GitHub logins to DM on Slack when nobody has reviewed your PR yet (comma-separated).',
+      value: (c.fresh_reviewers || []).join(',') },
+    { key: 'TEAM_CHANNEL_ID', label: 'Team Slack channel ID', type: 'text',
+      desc: 'Slack channel ID for the #Channel button. Find it in Slack: right-click channel → View channel details.',
+      value: c.team_channel_id || '' },
+    { key: 'DEPLOY_TARGET', label: 'Deploy target environment', type: 'text',
+      desc: 'Default environment for the Deploy button on each PR card (e.g. csi-3).',
+      value: c.deploy_target || '' },
+    { key: 'CACHE_TTL', label: 'Cache TTL (seconds)', type: 'number',
+      desc: 'How long per-PR detail data is cached before a background refresh.',
+      value: c.cache_ttl ?? 30 },
+    { key: 'HOST', label: 'Bind host', type: 'text',
+      desc: 'Local address to bind the server to.', restart: true,
+      value: c.host || '127.0.0.1' },
+    { key: 'PORT', label: 'Port', type: 'number',
+      desc: 'Port to listen on.', restart: true,
+      value: c.port ?? 8765 },
+  ];
+  const rows = fields.map(f => `
+    <div class="settings-row">
+      <label class="settings-label" for="s-${f.key}">${escapeHtml(f.label)}</label>
+      <div class="settings-desc">${escapeHtml(f.desc)}</div>
+      ${f.restart ? '<div class="settings-restart">⚠ Requires server restart to take effect.</div>' : ''}
+      <input class="settings-input" id="s-${f.key}" data-key="${escapeHtml(f.key)}"
+             type="${f.type}" value="${escapeHtml(String(f.value))}">
+    </div>`).join('');
+  document.getElementById('content').innerHTML = `
+    <div class="settings-form">
+      ${rows}
+      <div><button class="btn-settings-save" id="settingsSaveBtn">Save &amp; Reload</button></div>
+    </div>`;
+  document.getElementById('settingsSaveBtn').addEventListener('click', saveSettings);
+}
+
+async function saveSettings() {
+  const btn = document.getElementById('settingsSaveBtn');
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  const settings = {};
+  for (const input of document.querySelectorAll('.settings-input')) {
+    settings[input.dataset.key] = input.value.trim();
+  }
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+    location.reload();
+  } catch (e) {
+    toast(`Save failed: ${e.message}`, true);
+    btn.disabled = false;
+    btn.textContent = 'Save & Reload';
+  }
+}
+
 async function load(fresh) {
   const btn = document.getElementById('refreshBtn');
   btn.disabled = true;
   document.getElementById('content').innerHTML = '<div class="empty">Loading…</div>';
   try {
-    if (currentTab === 'status') {
+    if (currentTab === 'settings') {
+      renderSettings();
+    } else if (currentTab === 'status') {
       const res = await fetch('/api/status');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       renderStatus(await res.json());
@@ -2368,6 +2443,9 @@ class Handler(BaseHTTPRequestHandler):
                 "team_channel_id": TEAM_CHANNEL_ID,
                 "deploy_targets": DEPLOY_TARGETS,
                 "deploy_target": DEPLOY_TARGET,
+                "cache_ttl": CACHE_TTL,
+                "host": HOST,
+                "port": PORT,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -2480,6 +2558,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/deploy":
             self._handle_deploy_post()
+            return
+        if parsed.path == "/api/settings":
+            self._handle_settings_post()
             return
         self.send_error(404)
 
@@ -2622,6 +2703,44 @@ class Handler(BaseHTTPRequestHandler):
             TEAM_CHANNEL_ID = value
         elif key == "DEPLOY_TARGET":
             DEPLOY_TARGET = value
+        self._send_json(200, {"ok": True})
+
+    def _handle_settings_post(self):
+        global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET, CACHE_TTL
+        _allowed = {"FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "DEPLOY_TARGET",
+                    "CACHE_TTL", "HOST", "PORT"}
+        try:
+            data = self._read_json_body()
+            settings = data.get("settings", {})
+            if not isinstance(settings, dict):
+                raise ValueError("settings must be a dict")
+        except Exception as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        unknown = set(settings) - _allowed
+        if unknown:
+            self._send_json(403, {"error": f"unknown keys: {', '.join(sorted(unknown))}"})
+            return
+        for key, value in settings.items():
+            value = str(value).strip()
+            if not value:
+                continue
+            try:
+                write_env_var(key, value)
+            except Exception as e:
+                self._send_json(500, {"error": f"failed to write {key}: {e}"})
+                return
+            if key == "FRESH_REVIEWERS":
+                FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
+            elif key == "TEAM_CHANNEL_ID":
+                TEAM_CHANNEL_ID = value
+            elif key == "DEPLOY_TARGET":
+                DEPLOY_TARGET = value
+            elif key == "CACHE_TTL":
+                try:
+                    CACHE_TTL = int(value)
+                except ValueError:
+                    pass
         self._send_json(200, {"ok": True})
 
     def _handle_create_file_post(self):
