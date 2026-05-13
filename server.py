@@ -583,6 +583,43 @@ _DEFAULT_NUDGE_WORKFLOW = """\
 Do not DM when mode is `channel`. Do not post to channel when mode is `fresh` or `re_review`.
 """
 
+DEPLOY_TARGETS_PATH = os.path.join(_WORKFLOW_DIR, "deploy_targets.json")
+
+# Workflow names per repo per environment. Keys are "owner/repo"; values map
+# env slug to the exact GitHub Actions workflow name used for dispatch.
+_DEFAULT_DEPLOY_TARGETS = {
+    "Cognota/cognota-frontend": {
+        "csi-1": "CSI 1 Pipeline",
+        "csi-2": "CSI 2 Pipeline",
+        "csi-3": "CSI 3 Pipeline",
+    },
+    "Cognota/cognota-be": {
+        "csi-1": "CSI-1 Deploy",
+        "csi-2": "CSI-2 Deploy",
+        "csi-3": "CSI-3 Deploy",
+    },
+    "Cognota/learnops": {
+        "csi-1": "CSI-1 Pipeline",
+        "csi-2": "CSI-2 Pipeline",
+        "csi-3": "CSI-3 Pipeline",
+    },
+    "Cognota/learnops-frontend": {
+        "csi-1": "CSI1 Pipeline",
+        "csi-2": "CSI2 Pipeline",
+        "csi-3": "CSI3 Pipeline",
+    },
+}
+
+
+def _load_deploy_targets():
+    if not os.path.isfile(DEPLOY_TARGETS_PATH):
+        return {}
+    with open(DEPLOY_TARGETS_PATH) as f:
+        return json.load(f)
+
+
+DEPLOY_TARGETS = _load_deploy_targets()
+
 _jobs = {}  # (repo, number, kind) -> Job
 _jobs_lock = threading.Lock()
 
@@ -1362,6 +1399,27 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-channel:hover:not(:disabled) { background: #f59e0b; }
   .btn-channel:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .deploy-env {
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn-deploy {
+    background: #0d1117;
+    color: #3fb950;
+    border: 1px solid #238636;
+    border-radius: 6px;
+    padding: 5px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .btn-deploy:hover:not(:disabled) { background: #238636; color: #fff; }
+  .btn-deploy:disabled { opacity: 0.6; cursor: wait; }
   .review-status.merged { background: rgba(35,134,54,0.15); color: #56d364; border-color: rgba(35,134,54,0.4); }
   .pr-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
   .btn-open {
@@ -1628,6 +1686,9 @@ function render(prs) {
   for (const btn of document.querySelectorAll('.btn-channel')) {
     btn.addEventListener('click', onChannelPing);
   }
+  for (const btn of document.querySelectorAll('.btn-deploy')) {
+    btn.addEventListener('click', onDeploy);
+  }
 }
 
 function renderIncomingPR(p) {
@@ -1667,6 +1728,12 @@ function renderMyPR(p) {
         : 'No one to nudge');
   const nudgeBtn = `<button class="btn-nudge" type="button" title="${escapeHtml(nudgeTitle)}">Nudge</button>`;
   const channelBtn = `<button class="btn-channel" type="button" title="Post in team channel tagging Steve and Pratik">#Channel</button>`;
+  const deployEnvs = Object.keys((CONFIG.deploy_targets || {})[p.repository] || {});
+  const deployControls = deployEnvs.length ? `
+    <select class="deploy-env">
+      ${deployEnvs.map(e => `<option value="${escapeHtml(e)}">${escapeHtml(e.toUpperCase())}</option>`).join('')}
+    </select>
+    <button class="btn-deploy" type="button">Deploy</button>` : '';
   return `
   <div class="pr"
        data-number="${p.number}"
@@ -1685,6 +1752,7 @@ function renderMyPR(p) {
     </div>
     <div class="pr-actions">
       <a class="btn-open" href="${escapeHtml(p.url)}" target="_blank" rel="noopener">Open ↗</a>
+      ${deployControls}
       ${channelBtn}
       ${nudgeBtn}
       ${actionBtn}
@@ -1906,6 +1974,35 @@ async function onChannelPing(ev) {
   }
   setRunning(card, 'Posting in channel…', 'nudge');
   streamJob(card, 'nudge', repo, number, url, finishNudge);
+}
+
+async function onDeploy(ev) {
+  const btn = ev.currentTarget;
+  const card = btn.closest('.pr');
+  const repo = card.dataset.repo;
+  const headRef = card.dataset.head;
+  const env = btn.previousElementSibling.value;
+
+  if (!confirm(`Deploy ${repo} (${headRef}) to ${env.toUpperCase()}?`)) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Dispatching…';
+  try {
+    const res = await fetch('/api/deploy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ repo, env, head_ref: headRef }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+    btn.textContent = 'Dispatched ✓';
+    btn.style.cssText = 'background:#238636;color:#fff;';
+    setTimeout(() => { btn.textContent = 'Deploy'; btn.style.cssText = ''; btn.disabled = false; }, 4000);
+  } catch (e) {
+    toast(`Deploy failed: ${e.message}`, true);
+    btn.textContent = 'Deploy';
+    btn.disabled = false;
+  }
 }
 
 function setRunning(card, label, kind) {
@@ -2209,6 +2306,8 @@ def get_status():
         (REVIEW_WORKFLOW,  "review_workflow.md",  "Review workflow instructions"),
         (ADDRESS_WORKFLOW, "address_workflow.md", "Address workflow instructions"),
         (NUDGE_WORKFLOW,   "nudge_workflow.md",   "Nudge workflow instructions"),
+        (DEPLOY_TARGETS_PATH, "deploy_targets.json",
+         "Deploy targets (repo → env → workflow name)"),
     ]:
         ok = os.path.isfile(wf_path)
         check(
@@ -2269,6 +2368,7 @@ class Handler(BaseHTTPRequestHandler):
             config_json = json.dumps({
                 "fresh_reviewers": FRESH_REVIEWERS,
                 "team_channel_id": TEAM_CHANNEL_ID,
+                "deploy_targets": DEPLOY_TARGETS,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -2378,6 +2478,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/status/create-file":
             self._handle_create_file_post()
+            return
+        if parsed.path == "/api/deploy":
+            self._handle_deploy_post()
             return
         self.send_error(404)
 
@@ -2522,9 +2625,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_create_file_post(self):
         _defaults = {
-            os.path.realpath(REVIEW_WORKFLOW):  _DEFAULT_REVIEW_WORKFLOW,
-            os.path.realpath(ADDRESS_WORKFLOW): _DEFAULT_ADDRESS_WORKFLOW,
-            os.path.realpath(NUDGE_WORKFLOW):   _DEFAULT_NUDGE_WORKFLOW,
+            os.path.realpath(REVIEW_WORKFLOW):    _DEFAULT_REVIEW_WORKFLOW,
+            os.path.realpath(ADDRESS_WORKFLOW):   _DEFAULT_ADDRESS_WORKFLOW,
+            os.path.realpath(NUDGE_WORKFLOW):     _DEFAULT_NUDGE_WORKFLOW,
+            os.path.realpath(DEPLOY_TARGETS_PATH): json.dumps(
+                _DEFAULT_DEPLOY_TARGETS, indent=2
+            ) + "\n",
         }
         try:
             data = self._read_json_body()
@@ -2542,6 +2648,30 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"error": str(e)})
             return
+        self._send_json(200, {"ok": True})
+
+    def _handle_deploy_post(self):
+        try:
+            data = self._read_json_body()
+            repo     = str(data["repo"])
+            env      = str(data["env"])
+            head_ref = str(data["head_ref"])
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        workflow_name = DEPLOY_TARGETS.get(repo, {}).get(env)
+        if not workflow_name:
+            self._send_json(400, {"error": f"No workflow configured for {repo} / {env}"})
+            return
+        result = subprocess.run(
+            ["gh", "workflow", "run", workflow_name, "-R", repo, "--ref", head_ref],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout).strip() or "workflow dispatch failed"
+            self._send_json(500, {"error": err})
+            return
+        print(f"[deploy] dispatched '{workflow_name}' on {repo}@{head_ref} for {env}", flush=True)
         self._send_json(200, {"ok": True})
 
     def _handle_nudge_post(self):
