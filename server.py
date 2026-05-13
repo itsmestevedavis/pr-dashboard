@@ -91,6 +91,9 @@ FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
 # Team Slack channel for broadcast-style review requests.
 TEAM_CHANNEL_ID = os.environ.get("TEAM_CHANNEL_ID", "")
 
+# Default deploy environment for all PRs (e.g. "csi-3"). Empty = no Deploy button shown.
+DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
+
 
 def _is_human_author(author):
     """True if the GraphQL author node is a real user (not a Bot, etc)."""
@@ -1399,15 +1402,6 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-channel:hover:not(:disabled) { background: #f59e0b; }
   .btn-channel:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
-  .deploy-env {
-    background: #0d1117;
-    color: #c9d1d9;
-    border: 1px solid #30363d;
-    border-radius: 6px;
-    padding: 5px 8px;
-    font-size: 12px;
-    cursor: pointer;
-  }
   .btn-deploy {
     background: #0d1117;
     color: #3fb950;
@@ -1728,12 +1722,11 @@ function renderMyPR(p) {
         : 'No one to nudge');
   const nudgeBtn = `<button class="btn-nudge" type="button" title="${escapeHtml(nudgeTitle)}">Nudge</button>`;
   const channelBtn = `<button class="btn-channel" type="button" title="Post in team channel tagging Steve and Pratik">#Channel</button>`;
-  const deployEnvs = Object.keys((CONFIG.deploy_targets || {})[p.repository] || {});
-  const deployControls = deployEnvs.length ? `
-    <select class="deploy-env">
-      ${deployEnvs.map(e => `<option value="${escapeHtml(e)}">${escapeHtml(e.toUpperCase())}</option>`).join('')}
-    </select>
-    <button class="btn-deploy" type="button">Deploy</button>` : '';
+  const deployTarget = CONFIG.deploy_target || '';
+  const deployWorkflow = deployTarget && (CONFIG.deploy_targets || {})[p.repository]?.[deployTarget];
+  const deployControls = deployWorkflow
+    ? `<button class="btn-deploy" type="button" data-env="${escapeHtml(deployTarget)}">Deploy to ${escapeHtml(deployTarget.toUpperCase())}</button>`
+    : '';
   return `
   <div class="pr"
        data-number="${p.number}"
@@ -1981,7 +1974,7 @@ async function onDeploy(ev) {
   const card = btn.closest('.pr');
   const repo = card.dataset.repo;
   const headRef = card.dataset.head;
-  const env = btn.previousElementSibling.value;
+  const env = btn.dataset.env;
 
   if (!confirm(`Deploy ${repo} (${headRef}) to ${env.toUpperCase()}?`)) return;
 
@@ -2347,6 +2340,11 @@ def get_status():
           f"Channel ID: {TEAM_CHANNEL_ID}" if TEAM_CHANNEL_ID else "Not set — add TEAM_CHANNEL_ID=C... to .env",
           fix={"action": "set_env", "key": "TEAM_CHANNEL_ID", "placeholder": "C0123456789"})
 
+    check("DEPLOY_TARGET", "Default deploy environment (.env)",
+          bool(DEPLOY_TARGET),
+          f"Target: {DEPLOY_TARGET}" if DEPLOY_TARGET else "Not set — add DEPLOY_TARGET=csi-3 to .env to show Deploy buttons",
+          fix={"action": "set_env", "key": "DEPLOY_TARGET", "placeholder": "csi-3"})
+
     return checks
 
 
@@ -2369,6 +2367,7 @@ class Handler(BaseHTTPRequestHandler):
                 "fresh_reviewers": FRESH_REVIEWERS,
                 "team_channel_id": TEAM_CHANNEL_ID,
                 "deploy_targets": DEPLOY_TARGETS,
+                "deploy_target": DEPLOY_TARGET,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -2598,7 +2597,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_set_env_post(self):
-        global FRESH_REVIEWERS, TEAM_CHANNEL_ID
+        global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET
         try:
             data = self._read_json_body()
             key = str(data["key"])
@@ -2606,7 +2605,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": f"bad request: {e}"})
             return
-        if key not in ("FRESH_REVIEWERS", "TEAM_CHANNEL_ID"):
+        if key not in ("FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "DEPLOY_TARGET"):
             self._send_json(403, {"error": "key not allowed"})
             return
         if not value:
@@ -2621,6 +2620,8 @@ class Handler(BaseHTTPRequestHandler):
             FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
         elif key == "TEAM_CHANNEL_ID":
             TEAM_CHANNEL_ID = value
+        elif key == "DEPLOY_TARGET":
+            DEPLOY_TARGET = value
         self._send_json(200, {"ok": True})
 
     def _handle_create_file_post(self):
