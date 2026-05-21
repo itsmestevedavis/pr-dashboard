@@ -3347,38 +3347,53 @@ def open_in_editor(path: str) -> None:
 
 
 _BRANCHES_GRAPHQL = (
-    "query($owner:String!,$name:String!){"
+    "query($owner:String!,$name:String!,$after:String){"
     "repository(owner:$owner,name:$name){"
     "defaultBranchRef{name}"
-    "refs(refPrefix:\"refs/heads/\",first:100,"
+    "refs(refPrefix:\"refs/heads/\",first:100,after:$after,"
     "orderBy:{field:TAG_COMMIT_DATE,direction:DESC}){"
+    "pageInfo{hasNextPage endCursor}"
     "nodes{name target{...on Commit{"
     "author{user{login}}committer{user{login}}}}}}}}"
 )
 
 
 def list_my_branches(repo: str) -> dict:
-    """Return branches authored or committed by the current user plus the repo's default branch."""
+    """Return branches authored or committed by the current user plus the repo's default branch.
+
+    Paginates through all branches so repos with >100 branches are fully covered.
+    """
     me = get_my_login()
-    owner, name = repo.split("/", 1)
-    out = gh_run([
-        "api", "graphql",
-        "-f", f"query={_BRANCHES_GRAPHQL}",
-        "-f", f"owner={owner}",
-        "-f", f"name={name}",
-    ])
-    data = json.loads(out)
-    repo_data = (data.get("data") or {}).get("repository") or {}
-    base_branch = (repo_data.get("defaultBranchRef") or {}).get("name", "")
-    nodes = repo_data.get("refs", {}).get("nodes") or []
     me_lower = me.lower()
+    owner, name = repo.split("/", 1)
+    base_branch = ""
     my_branches = []
-    for node in nodes:
-        target = node.get("target") or {}
-        author_login = ((target.get("author") or {}).get("user") or {}).get("login", "")
-        committer_login = ((target.get("committer") or {}).get("user") or {}).get("login", "")
-        if author_login.lower() == me_lower or committer_login.lower() == me_lower:
-            my_branches.append(node["name"])
+    cursor = None
+    first_page = True
+    while True:
+        args = [
+            "api", "graphql",
+            "-f", f"query={_BRANCHES_GRAPHQL}",
+            "-f", f"owner={owner}",
+            "-f", f"name={name}",
+            "-f", f"after={cursor or ''}",
+        ]
+        data = json.loads(gh_run(args))
+        repo_data = (data.get("data") or {}).get("repository") or {}
+        if first_page:
+            base_branch = (repo_data.get("defaultBranchRef") or {}).get("name", "")
+            first_page = False
+        refs = repo_data.get("refs") or {}
+        for node in refs.get("nodes") or []:
+            target = node.get("target") or {}
+            author_login = ((target.get("author") or {}).get("user") or {}).get("login", "")
+            committer_login = ((target.get("committer") or {}).get("user") or {}).get("login", "")
+            if author_login.lower() == me_lower or committer_login.lower() == me_lower:
+                my_branches.append(node["name"])
+        page_info = refs.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
     return {"branches": my_branches, "base_branch": base_branch}
 
 
