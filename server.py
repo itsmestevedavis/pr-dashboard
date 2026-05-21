@@ -2269,13 +2269,15 @@ function renderMyPR(p) {
   } else if (p.status === 'has_comments') {
     actionBtn = `<button class="btn-address" type="button">Address</button>`;
   }
+  const nudgeTargetNames = (p.nudge_targets || []).join(' and ') || 'reviewers';
+  const channelTargetNames = (CONFIG.fresh_reviewers || []).join(' and ') || 'reviewers';
   const nudgeTitle = mode === 'fresh'
-    ? 'DM your reviewers to ask for first review'
+    ? `DM ${nudgeTargetNames} to ask for first review`
     : (mode === 're_review'
-        ? 'DM stale reviewers asking them to take another look'
+        ? `DM ${nudgeTargetNames} asking them to take another look`
         : 'No one to nudge');
   const nudgeBtn = `<button class="btn-nudge" type="button" title="${escapeHtml(nudgeTitle)}">Nudge</button>`;
-  const channelBtn = `<button class="btn-channel" type="button" title="Post in team channel tagging your reviewers">#Channel</button>`;
+  const channelBtn = `<button class="btn-channel" type="button" title="Post in team channel tagging ${escapeHtml(channelTargetNames)}">#Channel</button>`;
   const deployTarget = CONFIG.deploy_target || '';
   const deployWorkflow = deployTarget && (CONFIG.deploy_targets || {})[p.repository]?.[deployTarget];
   const alreadyDeployed = deployTarget && (deployedState[deployTarget] || [])
