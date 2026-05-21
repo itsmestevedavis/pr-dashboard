@@ -5,6 +5,7 @@ Lists open GitHub PRs (from a fixed author list) that require my attention,
 and lets me kick off a Claude Code review against each.
 """
 
+import concurrent.futures
 import json
 import os
 import queue
@@ -56,6 +57,10 @@ PORT = int(os.environ.get("PORT", "8765"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))  # seconds
 
 REVIEW_PROMPT = "Review PR #{number} in {repo}.\n\n"
+RE_REVIEW_PROMPT = (
+    "Re-review PR #{number} in {repo}. "
+    "Check whether your previous review comments have been addressed since your last review.\n\n"
+)
 
 STATUS_ORDER = {
     "re_requested": 0,
@@ -93,6 +98,9 @@ TEAM_CHANNEL_ID = os.environ.get("TEAM_CHANNEL_ID", "")
 
 # Default deploy environment for all PRs (e.g. "csi-3"). Empty = no Deploy button shown.
 DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
+
+# Editor command for opening the config folder. Empty = auto-detect (code → open/xdg-open).
+EDITOR_CMD = os.environ.get("EDITOR_CMD", "")
 
 
 def _is_human_author(author):
@@ -139,10 +147,11 @@ def determine_my_pr_status(pr, me):
     }
     approvers.discard(None)
 
-    unresolved_inline_authors = set()
+    # Build a per-reviewer picture of their inline threads so we can tell
+    # whether their CHANGES_REQUESTED is still actionable by me.
+    reviewer_has_active_thread: dict = {}   # login → True if any thread is live
+    reviewer_has_any_thread: dict = {}      # login → True if they left any thread
     for t in threads:
-        if t.get("isResolved"):
-            continue
         cnodes = (t.get("comments") or {}).get("nodes") or []
         if not cnodes:
             continue
@@ -150,8 +159,19 @@ def determine_my_pr_status(pr, me):
         if not _is_human_author(author):
             continue
         login = author.get("login")
-        if login and login not in approvers:
-            unresolved_inline_authors.add(login)
+        if not login:
+            continue
+        reviewer_has_any_thread[login] = True
+        # A thread is "active" only if it is neither resolved nor outdated.
+        # Outdated means the code changed under the comment — the change was
+        # addressed by new commits, so it's no longer something I need to fix.
+        if not t.get("isResolved") and not t.get("isOutdated"):
+            reviewer_has_active_thread[login] = True
+
+    unresolved_inline_authors = {
+        login for login, _ in reviewer_has_active_thread.items()
+        if login not in approvers
+    }
 
     review_body_authors = set()
     for r in latest_reviews:
@@ -161,8 +181,15 @@ def determine_my_pr_status(pr, me):
         if not _is_human_author(author):
             continue
         login = author.get("login")
-        if login:
-            review_body_authors.add(login)
+        if not login:
+            continue
+        # If the reviewer had inline threads but all are now resolved or
+        # outdated, their changes-request has been addressed — the ball is
+        # in their court, not mine. Exclude them from "active" so the PR
+        # doesn't sit in "has comments to address" forever.
+        if reviewer_has_any_thread.get(login) and not reviewer_has_active_thread.get(login):
+            continue
+        review_body_authors.add(login)
     review_body_authors -= approvers
 
     general_comment_authors = set()
@@ -230,6 +257,8 @@ query($q: String!) {
         isDraft
         updatedAt
         headRefName
+        baseRefName
+        mergeStateStatus
         author { login __typename }
         repository {
           nameWithOwner
@@ -255,6 +284,15 @@ query($q: String!) {
           nodes {
             author { login __typename }
             createdAt
+          }
+        }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+              }
+            }
           }
         }
       }
@@ -287,17 +325,26 @@ def list_my_prs():
         if status is None:
             continue
         repo = (pr.get("repository") or {}).get("nameWithOwner") or ""
+        commit_nodes = ((pr.get("commits") or {}).get("nodes") or [])
+        rollup = (
+            ((commit_nodes[0].get("commit") or {}).get("statusCheckRollup") or {})
+            if commit_nodes else {}
+        )
         out_list.append({
             "number": pr.get("number"),
             "title": pr.get("title") or "",
             "url": pr.get("url") or "",
             "updatedAt": pr.get("updatedAt") or "",
             "headRefName": pr.get("headRefName") or "",
+            "baseRefName": pr.get("baseRefName") or "",
             "repository": repo,
             "defaultMergeMethod": (
                 (pr.get("repository") or {}).get("viewerDefaultMergeMethod")
                 or "MERGE"
             ),
+            "review_decision": pr.get("reviewDecision") or "",
+            "check_state": rollup.get("state") or "",
+            "merge_state_status": pr.get("mergeStateStatus") or "",
             **status,
         })
 
@@ -459,6 +506,16 @@ def determine_status(repo, number, detail, me, fresh):
         noun = "reply" if replies == 1 else "replies"
         detail_str = f"{replies} {noun} to your comments"
     elif last_my_review is None:
+        # Skip PRs that another reviewer has already given a verdict on — they
+        # don't need a pile-on from me unless I'm explicitly re-requested.
+        latest_reviews = detail.get("latestReviews") or []
+        other_verdicts = [
+            r for r in latest_reviews
+            if (r.get("author") or {}).get("login") not in (me, None, pr_author)
+            and r.get("state") in ("APPROVED", "CHANGES_REQUESTED")
+        ]
+        if other_verdicts:
+            return None
         status = "untouched"
         detail_str = None
     else:
@@ -518,9 +575,12 @@ def list_prs(fresh=False):
 LOG_DIR = "/tmp/pr-reviewer"
 
 _WORKFLOW_DIR = os.path.expanduser("~/.config/pr-dashboard")
-REVIEW_WORKFLOW  = os.path.join(_WORKFLOW_DIR, "review_workflow.md")
-ADDRESS_WORKFLOW = os.path.join(_WORKFLOW_DIR, "address_workflow.md")
-NUDGE_WORKFLOW   = os.path.join(_WORKFLOW_DIR, "nudge_workflow.md")
+REVIEW_WORKFLOW        = os.path.join(_WORKFLOW_DIR, "review_workflow.md")
+ADDRESS_WORKFLOW       = os.path.join(_WORKFLOW_DIR, "address_workflow.md")
+NUDGE_WORKFLOW         = os.path.join(_WORKFLOW_DIR, "nudge_workflow.md")
+FIX_PIPELINE_WORKFLOW  = os.path.join(_WORKFLOW_DIR, "fix_pipeline_workflow.md")
+REBASE_WORKFLOW        = os.path.join(_WORKFLOW_DIR, "rebase_workflow.md")
+RE_REVIEW_WORKFLOW     = os.path.join(_WORKFLOW_DIR, "re_review_workflow.md")
 
 _DEFAULT_REVIEW_WORKFLOW = """\
 ## Review steps
@@ -584,6 +644,86 @@ _DEFAULT_NUDGE_WORKFLOW = """\
 3. Keep messages brief and friendly. Always include the PR title and URL.
 
 Do not DM when mode is `channel`. Do not post to channel when mode is `fresh` or `re_review`.
+"""
+
+_DEFAULT_FIX_PIPELINE_WORKFLOW = """\
+## Fix failing pipeline steps
+
+1. Find the failing checks on this PR:
+   `gh pr checks {number} --repo {repo}`
+
+2. Identify the failing workflow run ID from the output and fetch its logs:
+   `gh run view <run-id> --repo {repo} --log-failed`
+
+   If the run ID is not obvious from the checks output, list recent runs:
+   `gh run list --repo {repo} --branch {head_ref} --limit 5`
+
+3. Read the error output carefully. Identify the root cause (failing test,
+   type error, lint violation, build error, etc.).
+
+4. Open the relevant source files and fix the issue. Make the smallest
+   change that makes the check pass — do not refactor unrelated code.
+
+5. Commit the fix with a clear message explaining what was broken and why.
+
+6. Push: `git push origin {local_branch}:{head_ref}`
+
+Do not ask questions. Do not open new PRs. Do not modify files unrelated to the failure.
+"""
+
+_DEFAULT_REBASE_WORKFLOW = """\
+## Rebase steps
+
+1. Fetch the latest from origin:
+   `git fetch origin`
+
+2. Rebase onto the base branch:
+   `git rebase origin/{base_ref}`
+
+3. If there are conflicts, resolve them:
+   - For each conflicted file, open it and resolve the conflict markers.
+   - Prefer the intent of this branch's changes — do not silently discard them.
+   - Stage resolved files: `git add <file>`
+   - Continue: `git rebase --continue`
+   - Repeat until no conflicts remain.
+
+4. Push the rebased branch:
+   `git push origin {local_branch}:{head_ref} --force-with-lease`
+
+Do not ask questions. Do not open new PRs. Do not squash commits unless explicitly required.
+"""
+
+_DEFAULT_RE_REVIEW_WORKFLOW = """\
+## Re-review steps
+
+You are re-reviewing this PR. Your job is NOT to do a fresh review — focus exclusively on
+whether your previous comments have been addressed, and check what changed since your last review.
+
+1. Fetch your previous review comments to understand what you originally flagged:
+   `gh api repos/{repo}/pulls/{number}/comments --paginate`
+   Filter for comments where `user.login` is your GitHub login.
+   Also check review-level feedback:
+   `gh api repos/{repo}/pulls/{number}/reviews --paginate`
+
+2. Find your most recent review's commit SHA from the reviews list (field: `commit_id`).
+   Compare what changed since then:
+   `gh api "repos/{repo}/pulls/{number}/files" --paginate`
+   This gives the full diff. Focus only on files you previously commented on.
+
+3. For each of your original threads:
+   - If `resolved: true` — the author addressed it. No action needed.
+   - If the relevant code has changed in a way that addresses your concern — approve the thread's intent,
+     even if the thread is still technically open.
+   - If your concern is unaddressed — note it in your final review body.
+
+4. Submit your verdict:
+   - All concerns resolved: `gh pr review {number} --repo {repo} --approve --body "..."`
+   - Concerns remain: `gh pr review {number} --repo {repo} --request-changes --body "..."`
+   - Progress acknowledged, minor notes: `gh pr review {number} --repo {repo} --comment --body "..."`
+
+Do not leave new inline comments on code unrelated to your original feedback.
+Do not re-review files you never commented on in your original review.
+Do not ask questions. Complete the re-review autonomously.
 """
 
 DEPLOY_TARGETS_PATH = os.path.join(_WORKFLOW_DIR, "deploy_targets.json")
@@ -898,6 +1038,94 @@ def run_review(job):
     print(f"[review] finished #{number} result={result}", flush=True)
 
 
+def run_re_review(job):
+    number = job.number
+    repo = job.repo
+    os.makedirs(LOG_DIR, exist_ok=True)
+    safe_repo = repo.replace("/", "_")
+    log_path = f"{LOG_DIR}/re-review-{safe_repo}-{number}-{int(time.time())}.log"
+    job.log_path = log_path
+    job.append(f"Starting re-review of #{number} in {repo}")
+    print(f"[re-review] starting #{number} in {repo} (log: {log_path})", flush=True)
+
+    try:
+        workflow = _load_workflow(RE_REVIEW_WORKFLOW)
+    except FileNotFoundError:
+        job.append(f"Re-review workflow file not found: {RE_REVIEW_WORKFLOW}")
+        job.append("Use the Status tab to create it.")
+        job.finish("failed", "missing_workflow")
+        return
+
+    prompt = RE_REVIEW_PROMPT.format(number=number, repo=repo) + workflow
+    events = []
+    try:
+        proc = subprocess.Popen(
+            [
+                "claude", "-p", prompt,
+                "--permission-mode", "bypassPermissions",
+                "--output-format", "stream-json",
+                "--verbose",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        job.append(f"Failed to spawn claude: {e}")
+        job.finish("failed", "spawn_error")
+        return
+
+    job.proc = proc
+
+    try:
+        with open(log_path, "w") as logf:
+            for line in proc.stdout:
+                logf.write(line)
+                logf.flush()
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                events.append(ev)
+                friendly = format_event(ev)
+                if friendly:
+                    job.append(friendly)
+        proc.wait()
+    except Exception as e:
+        job.append(f"Stream error: {e}")
+        job.finish("failed", "stream_error")
+        return
+
+    if proc.returncode != 0:
+        if job._stop_requested:
+            job.append("Re-review stopped.")
+            job.finish("stopped", "stopped")
+        else:
+            job.append(f"claude exited with code {proc.returncode}")
+            job.finish("failed", f"exit:{proc.returncode}")
+        return
+
+    try:
+        me = get_my_login()
+    except Exception:
+        me = None
+    result = derive_result(events, repo, number, me)
+    label = {
+        "approved": "Approved PR ✓",
+        "no_action": "Finished (no GitHub action taken)",
+    }.get(result)
+    if label is None and result.startswith("commented:"):
+        n = result.split(":", 1)[1]
+        label = f"Posted {n} pending comment(s)"
+    job.append(label or f"Finished: {result}")
+    job.finish("done", result)
+    print(f"[re-review] finished #{number} result={result}", flush=True)
+
+
 # ---- Merge dispatch --------------------------------------------------------
 
 GH_MERGE_METHOD_FLAG = {
@@ -1147,6 +1375,185 @@ def run_address(job, head_ref):
         print(f"[address] finished #{number} result={result['label']}", flush=True)
 
 
+# ---- Fix-pipeline dispatch -------------------------------------------------
+
+FIX_PIPELINE_PROMPT = (
+    "Fix the failing CI pipeline on PR #{number} in {repo}. "
+    "PR head branch on origin: {head_ref}. "
+    "Local branch in this worktree: {local_branch}. "
+    "Push fixes with: git push origin {local_branch}:{head_ref}\n\n"
+)
+
+
+def run_fix_pipeline(job, head_ref: str) -> None:
+    """Spawn Claude in a worktree to diagnose and fix failing CI checks."""
+    repo = job.repo
+    number = job.number
+
+    with get_repo_lock(repo):
+        try:
+            clone_path, local_branch = prepare_agent_clone(repo, head_ref)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            job.append(f"Agent-clone setup failed: {stderr}")
+            job.finish("failed", "clone_error")
+            return
+
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = f"{LOG_DIR}/fix-pipeline-{repo_flat(repo)}-{number}-{int(time.time())}.log"
+        job.log_path = log_path
+        job.append(f"Agent clone ready at {clone_path} (branch: {local_branch})")
+        print(f"[fix-pipeline] starting #{number} in {repo} (clone: {clone_path})", flush=True)
+
+        try:
+            workflow = _load_workflow(FIX_PIPELINE_WORKFLOW)
+        except FileNotFoundError:
+            job.append(f"Fix-pipeline workflow file not found: {FIX_PIPELINE_WORKFLOW}")
+            job.append("Use the Status tab to create it.")
+            job.finish("failed", "missing_workflow")
+            return
+
+        prompt = FIX_PIPELINE_PROMPT.format(
+            number=number, repo=repo,
+            head_ref=head_ref, local_branch=local_branch,
+        ) + workflow
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ["claude", "-p", prompt,
+                 "--permission-mode", "bypassPermissions",
+                 "--output-format", "stream-json",
+                 "--verbose"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                cwd=clone_path,
+            )
+            job.proc = proc
+            with open(log_path, "w") as logf:
+                for line in proc.stdout:
+                    logf.write(line)
+                    logf.flush()
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    friendly = format_event(ev)
+                    if friendly:
+                        job.append(friendly)
+            proc.wait()
+        except Exception as e:
+            job.append(f"Stream error: {e}")
+            job.finish("failed", "stream_error")
+            return
+
+        if proc.returncode != 0:
+            if job._stop_requested:
+                job.append("Stopped.")
+                job.finish("stopped", "stopped")
+            else:
+                job.append(f"claude exited with code {proc.returncode}")
+                job.finish("failed", f"exit:{proc.returncode}")
+            return
+
+        job.append("Pipeline fix complete.")
+        job.finish("done", "pipeline_fixed")
+        print(f"[fix-pipeline] finished #{number}", flush=True)
+
+
+# ---- Rebase dispatch -------------------------------------------------------
+
+REBASE_PROMPT = (
+    "Rebase PR #{number} in {repo} onto the base branch. "
+    "Base branch: {base_ref}. "
+    "PR head branch on origin: {head_ref}. "
+    "Local branch in this worktree: {local_branch}. "
+    "Push with: git push origin {local_branch}:{head_ref} --force-with-lease\n\n"
+)
+
+
+def run_rebase(job, head_ref: str, base_ref: str) -> None:
+    """Spawn Claude in a worktree to rebase the PR branch onto its base."""
+    repo = job.repo
+    number = job.number
+
+    with get_repo_lock(repo):
+        try:
+            clone_path, local_branch = prepare_agent_clone(repo, head_ref)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            job.append(f"Agent-clone setup failed: {stderr}")
+            job.finish("failed", "clone_error")
+            return
+
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = f"{LOG_DIR}/rebase-{repo_flat(repo)}-{number}-{int(time.time())}.log"
+        job.log_path = log_path
+        job.append(f"Agent clone ready at {clone_path} (branch: {local_branch})")
+        print(f"[rebase] starting #{number} in {repo} (clone: {clone_path})", flush=True)
+
+        try:
+            workflow = _load_workflow(REBASE_WORKFLOW)
+        except FileNotFoundError:
+            job.append(f"Rebase workflow file not found: {REBASE_WORKFLOW}")
+            job.append("Use the Status tab to create it.")
+            job.finish("failed", "missing_workflow")
+            return
+
+        prompt = REBASE_PROMPT.format(
+            number=number, repo=repo,
+            head_ref=head_ref, local_branch=local_branch, base_ref=base_ref,
+        ) + workflow.format(
+            base_ref=base_ref, head_ref=head_ref, local_branch=local_branch,
+        )
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ["claude", "-p", prompt,
+                 "--permission-mode", "bypassPermissions",
+                 "--output-format", "stream-json",
+                 "--verbose"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                cwd=clone_path,
+            )
+            job.proc = proc
+            with open(log_path, "w") as logf:
+                for line in proc.stdout:
+                    logf.write(line)
+                    logf.flush()
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    friendly = format_event(ev)
+                    if friendly:
+                        job.append(friendly)
+            proc.wait()
+        except Exception as e:
+            job.append(f"Stream error: {e}")
+            job.finish("failed", "stream_error")
+            return
+
+        if proc.returncode != 0:
+            if job._stop_requested:
+                job.append("Stopped.")
+                job.finish("stopped", "stopped")
+            else:
+                job.append(f"claude exited with code {proc.returncode}")
+                job.finish("failed", f"exit:{proc.returncode}")
+            return
+
+        job.append("Rebase complete.")
+        job.finish("done", "rebased")
+        print(f"[rebase] finished #{number}", flush=True)
+
+
 # ---- Nudge dispatch --------------------------------------------------------
 
 NUDGE_PROMPT = (
@@ -1354,6 +1761,7 @@ INDEX_HTML = r"""<!doctype html>
   .badge-approved { background: #238636; color: #fff; }
   .badge-has_comments { background: #fb8500; color: #fff; }
   .badge-not_reviewed_yet { background: #30363d; color: var(--text); }
+  .badge-warning { background: #7d4e00; color: #f0a93a; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
   .btn-merge {
     background: var(--green);
     color: #fff;
@@ -1366,6 +1774,9 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-merge:hover:not(:disabled) { background: var(--green-hover); }
   .btn-merge:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .btn-merge-blocked { background: #6e2a2a !important; color: #f85149 !important; border: 1px solid #f8514940 !important; }
+  .btn-fix-pipeline,
+  .btn-rebase,
   .btn-address {
     background: #1f6feb;
     color: #fff;
@@ -1376,7 +1787,11 @@ INDEX_HTML = r"""<!doctype html>
     font-size: 13px;
     font-weight: 500;
   }
+  .btn-fix-pipeline:hover:not(:disabled),
+  .btn-rebase:hover:not(:disabled),
   .btn-address:hover:not(:disabled) { background: #388bfd; }
+  .btn-fix-pipeline:disabled,
+  .btn-rebase:disabled,
   .btn-address:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
   .btn-nudge {
     background: #6e40c9;
@@ -1414,6 +1829,12 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-deploy:hover:not(:disabled) { background: #238636; color: #fff; }
   .btn-deploy:disabled { opacity: 0.6; cursor: wait; }
+  .btn-deploy-live {
+    background: transparent !important;
+    color: #3fb950 !important;
+    border: 1px solid #238636 !important;
+  }
+  .btn-deploy-live:hover:not(:disabled) { background: #1a2e1a !important; }
   .review-status.merged { background: rgba(35,134,54,0.15); color: #56d364; border-color: rgba(35,134,54,0.4); }
   .pr-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
   .btn-open {
@@ -1437,6 +1858,18 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-review:hover:not(:disabled) { background: var(--green-hover); }
   .btn-review:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .btn-re-review {
+    background: #b45309;
+    color: #fff;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .btn-re-review:hover:not(:disabled) { background: #d97706; }
+  .btn-re-review:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
   .empty { text-align: center; color: var(--muted); padding: 48px; font-size: 16px; }
   .toast {
     position: fixed;
@@ -1530,7 +1963,24 @@ INDEX_HTML = r"""<!doctype html>
   .btn-settings-save { background: #238636; color: #fff; border: none; border-radius: 6px; padding: 9px 22px; font-size: 14px; font-weight: 500; cursor: pointer; }
   .btn-settings-save:hover:not(:disabled) { background: #2ea043; }
   .btn-settings-save:disabled { opacity: 0.6; cursor: wait; }
+  .status-toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+  .btn-open-editor {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn-open-editor:hover:not(:disabled) { color: var(--text); border-color: #8b949e; }
+  .btn-open-editor:disabled { opacity: 0.6; cursor: wait; }
   .status-list { list-style: none; padding: 0; margin: 0; }
+  .status-separator {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 16px 0;
+  }
   .status-item {
     background: var(--card);
     border: 1px solid var(--border);
@@ -1588,6 +2038,66 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-fix:hover:not(:disabled) { background: #388bfd; }
   .btn-fix:disabled { opacity: 0.6; cursor: wait; }
+  .deployed-section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 10px;
+    overflow: hidden;
+  }
+  .deployed-env-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    outline: none;
+  }
+  .deployed-env-header::-webkit-details-marker { display: none; }
+  .deployed-env-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+  }
+  .deployed-env-count {
+    font-size: 11px;
+    background: #30363d;
+    color: var(--muted);
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-weight: 600;
+  }
+  .deployed-chevron { margin-left: auto; color: var(--muted); font-size: 10px; transition: transform 0.15s; }
+  .deployed-section[open] .deployed-chevron { transform: rotate(90deg); }
+  .deployed-items { padding: 0 14px 6px; }
+  .deployed-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .deployed-icon { font-size: 15px; flex-shrink: 0; width: 20px; text-align: center; }
+  .deployed-repo { font-weight: 600; min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .deployed-branch {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    background: #1c2433;
+    border: 1px solid var(--border);
+    padding: 2px 7px;
+    border-radius: 4px;
+    white-space: nowrap;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .deployed-meta { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .deployed-error { font-size: 11px; color: #f85149; }
 </style>
 </head>
 <body>
@@ -1599,6 +2109,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="tabs">
     <button class="tab" data-tab="incoming">Awaiting my review</button>
     <button class="tab" data-tab="mine">My PRs</button>
+    <button class="tab" data-tab="deployed">Deployed</button>
     <button class="tab" data-tab="status">Status</button>
     <button class="tab" data-tab="settings">Settings</button>
   </div>
@@ -1636,7 +2147,8 @@ const TABS = {
 };
 
 const _tab = (new URLSearchParams(location.search)).get('tab');
-let currentTab = ['mine', 'status', 'settings'].includes(_tab) ? _tab : 'incoming';
+let currentTab = ['mine', 'deployed', 'status', 'settings'].includes(_tab) ? _tab : 'incoming';
+let deployedState = {};  // environments map from /api/deployed, populated when mine tab loads
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1679,6 +2191,9 @@ function render(prs) {
   for (const btn of document.querySelectorAll('.btn-review')) {
     btn.addEventListener('click', onReview);
   }
+  for (const btn of document.querySelectorAll('.btn-re-review')) {
+    btn.addEventListener('click', onReReview);
+  }
   for (const btn of document.querySelectorAll('.btn-merge')) {
     btn.addEventListener('click', onMerge);
   }
@@ -1694,11 +2209,21 @@ function render(prs) {
   for (const btn of document.querySelectorAll('.btn-deploy')) {
     btn.addEventListener('click', onDeploy);
   }
+  for (const btn of document.querySelectorAll('.btn-fix-pipeline')) {
+    btn.addEventListener('click', onFixPipeline);
+  }
+  for (const btn of document.querySelectorAll('.btn-rebase')) {
+    btn.addEventListener('click', onRebase);
+  }
 }
 
 function renderIncomingPR(p) {
   const detail = p.status_detail
     ? `<div class="pr-detail">${escapeHtml(p.status_detail)}</div>` : '';
+  const isReReview = ['re_requested', 'new_commits', 'author_replied'].includes(p.status);
+  const actionBtn = isReReview
+    ? `<button class="btn-re-review" type="button" title="Check whether your previous comments were addressed">Re-review</button>`
+    : `<button class="btn-review" type="button">Review</button>`;
   return `
   <div class="pr" data-number="${p.number}" data-repo="${escapeHtml(p.repository)}" data-url="${escapeHtml(p.url)}">
     <div class="pr-main">
@@ -1709,7 +2234,7 @@ function renderIncomingPR(p) {
     </div>
     <div class="pr-actions">
       <a class="btn-open" href="${escapeHtml(p.url)}" target="_blank" rel="noopener">Open ↗</a>
-      <button class="btn-review" type="button">Review</button>
+      ${actionBtn}
     </div>
   </div>`;
 }
@@ -1720,9 +2245,27 @@ function renderMyPR(p) {
     : '';
   const targets = (p.nudge_targets || []).join(',');
   const mode = p.nudge_mode || '';
+  const needsRebase = p.merge_state_status === 'BEHIND';
+  const hasConflicts = p.merge_state_status === 'DIRTY';
   let actionBtn = '';
   if (p.status === 'approved') {
-    actionBtn = `<button class="btn-merge" type="button">Merge</button>`;
+    const ciBlocked = ['FAILURE', 'ERROR'].includes(p.check_state);
+    const reviewBlocked = p.review_decision === 'CHANGES_REQUESTED';
+    const blocked = ciBlocked || reviewBlocked || needsRebase || hasConflicts;
+    const reasons = [
+      ciBlocked && 'CI failing',
+      reviewBlocked && 'Changes requested',
+      needsRebase && 'Needs rebase',
+      hasConflicts && 'Has conflicts',
+    ].filter(Boolean);
+    const blockReason = reasons.join(' · ');
+    const mergeBtn = `<button class="btn-merge${blocked ? ' btn-merge-blocked' : ''}" type="button" ${blocked ? `disabled title="${escapeHtml(blockReason)}"` : ''}>Merge</button>`;
+    const fixClass = needsRebase || hasConflicts ? 'btn-rebase'
+      : ciBlocked ? 'btn-fix-pipeline' : 'btn-address';
+    const fixBtn = blocked
+      ? `<button class="${fixClass}" type="button" title="Fix: ${escapeHtml(blockReason)}">Fix</button>`
+      : '';
+    actionBtn = fixBtn + mergeBtn;
   } else if (p.status === 'has_comments') {
     actionBtn = `<button class="btn-address" type="button">Address</button>`;
   }
@@ -1735,8 +2278,12 @@ function renderMyPR(p) {
   const channelBtn = `<button class="btn-channel" type="button" title="Post in team channel tagging your reviewers">#Channel</button>`;
   const deployTarget = CONFIG.deploy_target || '';
   const deployWorkflow = deployTarget && (CONFIG.deploy_targets || {})[p.repository]?.[deployTarget];
+  const alreadyDeployed = deployTarget && (deployedState[deployTarget] || [])
+    .some(d => d.repo === p.repository && d.branch === p.headRefName && d.conclusion === 'success');
   const deployControls = deployWorkflow
-    ? `<button class="btn-deploy" type="button" data-env="${escapeHtml(deployTarget)}">Deploy to ${escapeHtml(deployTarget.toUpperCase())}</button>`
+    ? (alreadyDeployed
+        ? `<button class="btn-deploy btn-deploy-live" type="button" data-env="${escapeHtml(deployTarget)}" title="Branch ${escapeHtml(p.headRefName)} is live — click to re-deploy">✅ ${escapeHtml(deployTarget.toUpperCase())}</button>`
+        : `<button class="btn-deploy" type="button" data-env="${escapeHtml(deployTarget)}">Deploy to ${escapeHtml(deployTarget.toUpperCase())}</button>`)
     : '';
   return `
   <div class="pr"
@@ -1745,11 +2292,12 @@ function renderMyPR(p) {
        data-url="${escapeHtml(p.url)}"
        data-title="${escapeHtml(p.title)}"
        data-head="${escapeHtml(p.headRefName)}"
+       data-base="${escapeHtml(p.baseRefName)}"
        data-method="${escapeHtml(p.defaultMergeMethod)}"
        data-targets="${escapeHtml(targets)}"
        data-mode="${escapeHtml(mode)}">
     <div class="pr-main">
-      <div class="pr-meta">${escapeHtml(p.repository)} · #${p.number}<span class="badge badge-${p.status}">${escapeHtml(p.status_label)}</span></div>
+      <div class="pr-meta">${escapeHtml(p.repository)} · #${p.number}<span class="badge badge-${p.status}">${escapeHtml(p.status_label)}</span>${needsRebase ? '<span class="badge-warning">⚠ Needs rebase</span>' : hasConflicts ? '<span class="badge-warning">⚠ Has conflicts</span>' : ''}</div>
       <div class="pr-title"><a href="${escapeHtml(p.url)}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
       <div class="pr-sub">updated ${relativeTime(p.updatedAt)}</div>
       ${commenters}
@@ -1876,6 +2424,90 @@ function finishAddress(card, url, data) {
   }
   actions.innerHTML = `
     <span class="review-status ${cls}">${escapeHtml(label)}</span>
+    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+  `;
+}
+
+async function onFixPipeline(ev) {
+  const btn = ev.currentTarget;
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const headRefName = card.dataset.head;
+
+  try {
+    const res = await fetch('/api/fix-pipeline', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, headRefName }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, 'Fixing pipeline…', 'fix_pipeline');
+  streamJob(card, 'fix_pipeline', repo, number, url, finishFixPipeline);
+}
+
+function finishFixPipeline(card, url, data) {
+  const actions = card.querySelector('.pr-actions');
+  if (data.status === 'stopped') {
+    actions.innerHTML = `
+      <span class="review-status stopped">⏹ Stopped</span>
+      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+    `;
+    return;
+  }
+  const ok = data.status === 'done';
+  actions.innerHTML = `
+    <span class="review-status ${ok ? 'approved' : 'failed'}">${ok ? '✅ Fix pushed' : '❌ Failed'}</span>
+    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+  `;
+}
+
+async function onRebase(ev) {
+  const btn = ev.currentTarget;
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const headRefName = card.dataset.head;
+  const baseRefName = card.dataset.base;
+  try {
+    const res = await fetch('/api/rebase', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, headRefName, baseRefName }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || 'HTTP ' + res.status);
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, 'Rebasing…', 'rebase');
+  streamJob(card, 'rebase', repo, number, url, finishRebase);
+}
+
+function finishRebase(card, url, data) {
+  const actions = card.querySelector('.pr-actions');
+  if (data.status === 'stopped') {
+    actions.innerHTML = `
+      <span class="review-status stopped">⏹ Stopped</span>
+      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+    `;
+    return;
+  }
+  const ok = data.status === 'done';
+  actions.innerHTML = `
+    <span class="review-status ${ok ? 'approved' : 'failed'}">${ok ? '✅ Rebased & pushed' : '❌ Rebase failed'}</span>
     <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
   `;
 }
@@ -2114,6 +2746,58 @@ function finishReview(card, url, data) {
   `;
 }
 
+async function onReReview(ev) {
+  const btn = ev.currentTarget;
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+
+  try {
+    const res = await fetch('/api/re-review', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo }),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+
+  setRunning(card, 'Re-reviewing…', 're_review');
+  streamJob(card, 're_review', repo, number, url, finishReReview);
+}
+
+function finishReReview(card, url, data) {
+  const actions = card.querySelector('.pr-actions');
+  if (data.status === 'stopped') {
+    actions.innerHTML = `
+      <span class="review-status stopped">⏹ Stopped</span>
+      <button class="btn-re-review" type="button">Re-review again</button>
+      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+    `;
+    actions.querySelector('.btn-re-review').addEventListener('click', onReReview);
+    return;
+  }
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
+    if (data.result === 'approved') {
+      cls = 'approved'; label = '✅ Approved';
+    } else if ((data.result || '').startsWith('commented:')) {
+      const n = data.result.split(':')[1];
+      cls = 'commented';
+      label = `💬 ${n} pending comment${n === '1' ? '' : 's'} left`;
+    } else {
+      cls = 'commented'; label = 'ℹ Done';
+    }
+  }
+  actions.innerHTML = `
+    <span class="review-status ${cls}">${escapeHtml(label)}</span>
+    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+  `;
+}
+
 function toast(msg, error) {
   const el = document.createElement('div');
   el.className = 'toast' + (error ? ' error' : '');
@@ -2122,7 +2806,7 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
-const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', status: '⚙️ App status', settings: '⚙️ Settings' };
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings' };
 
 function setActiveTab(tab) {
   currentTab = tab;
@@ -2136,9 +2820,31 @@ function setActiveTab(tab) {
   history.replaceState({}, '', url);
 }
 
+async function onOpenEditor() {
+  const btn = document.getElementById('openEditorBtn');
+  btn.disabled = true;
+  btn.textContent = 'Opening…';
+  try {
+    const res = await fetch('/api/open-dir', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ path: CONFIG.workflow_dir }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+    btn.textContent = 'Opened ✓';
+    setTimeout(() => { btn.textContent = 'Open config folder ↗'; btn.disabled = false; }, 2000);
+  } catch (e) {
+    toast(`Failed to open: ${e.message}`, true);
+    btn.textContent = 'Open config folder ↗';
+    btn.disabled = false;
+  }
+}
+
 function renderStatus(checks) {
   const content = document.getElementById('content');
   const items = checks.map(c => {
+    if (c.separator) return '<li role="separator" class="status-separator"></li>';
     const excerpt = c.excerpt
       ? `<div class="status-excerpt">${escapeHtml(c.excerpt)}</div>`
       : '';
@@ -2168,7 +2874,12 @@ function renderStatus(checks) {
       </details>
     </li>`;
   }).join('');
-  content.innerHTML = `<ul class="status-list">${items}</ul>`;
+  content.innerHTML = `
+    <div class="status-toolbar">
+      <button class="btn-open-editor" id="openEditorBtn">Open config folder ↗</button>
+    </div>
+    <ul class="status-list">${items}</ul>`;
+  document.getElementById('openEditorBtn').addEventListener('click', onOpenEditor);
   for (const btn of content.querySelectorAll('.btn-fix')) {
     btn.addEventListener('click', onFix);
   }
@@ -2226,6 +2937,9 @@ function renderSettings() {
     { key: 'CACHE_TTL', label: 'Cache TTL (seconds)', type: 'number',
       desc: 'How long per-PR detail data is cached before a background refresh.',
       value: c.cache_ttl ?? 30 },
+    { key: 'EDITOR_CMD', label: 'Editor command', type: 'text',
+      desc: 'Command used by "Open config folder ↗" on the Status tab. E.g. "code", "cursor", "subl". Leave blank to auto-detect (VS Code → system default).',
+      value: c.editor_cmd || '' },
     { key: 'HOST', label: 'Bind host', type: 'text',
       desc: 'Local address to bind the server to.', restart: true,
       value: c.host || '127.0.0.1' },
@@ -2273,6 +2987,57 @@ async function saveSettings() {
   }
 }
 
+function deployedStatusIcon(item) {
+  if (item.error) return '❓';
+  if (item.status === 'in_progress') return '🔄';
+  if (item.status === 'queued') return '⏳';
+  if (item.conclusion === 'success') return '✅';
+  if (item.conclusion === 'failure') return '❌';
+  if (item.conclusion === 'cancelled') return '🚫';
+  return '❓';
+}
+
+function renderDeployed(data) {
+  const content = document.getElementById('content');
+  const envs = data.environments || {};
+  const envKeys = Object.keys(envs).sort();
+  if (!envKeys.length) {
+    const hint = data.target_env
+      ? `No deploy targets found for <strong>${escapeHtml(data.target_env)}</strong> in <code>deploy_targets.json</code>.`
+      : 'No deploy targets configured. Add a <code>deploy_targets.json</code> via the Status tab.';
+    content.innerHTML = `<div class="empty">${hint}</div>`;
+    return;
+  }
+  let html = '';
+  for (const env of envKeys) {
+    const items = (envs[env] || []).slice().sort((a, b) => (a.repo || '').localeCompare(b.repo || ''));
+    html += `<details class="deployed-section" open>
+      <summary class="deployed-env-header">
+        <span class="deployed-env-label">${escapeHtml(env)}</span>
+        <span class="deployed-env-count">${items.length}</span>
+        <span class="deployed-chevron">▶</span>
+      </summary>
+      <div class="deployed-items">`;
+    for (const item of items) {
+      const icon = deployedStatusIcon(item);
+      const repoShort = (item.repo || '').replace(/^[^/]+\//, '');
+      const branchHtml = item.branch
+        ? `<span class="deployed-branch" title="${escapeHtml(item.branch)}">${escapeHtml(item.branch)}</span>` : '';
+      const metaHtml = item.error
+        ? `<span class="deployed-error">${escapeHtml(item.error)}</span>`
+        : `<span class="deployed-meta">${item.createdAt ? relativeTime(item.createdAt) : ''}${item.displayTitle ? ' · ' + escapeHtml(item.displayTitle) : ''}</span>`;
+      html += `<div class="deployed-item">
+        <span class="deployed-icon">${icon}</span>
+        <span class="deployed-repo" title="${escapeHtml(item.repo || '')}">${escapeHtml(repoShort)}</span>
+        ${branchHtml}
+        ${metaHtml}
+      </div>`;
+    }
+    html += '</div></details>';
+  }
+  content.innerHTML = html;
+}
+
 async function load(fresh) {
   const btn = document.getElementById('refreshBtn');
   btn.disabled = true;
@@ -2284,12 +3049,23 @@ async function load(fresh) {
       const res = await fetch('/api/status');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       renderStatus(await res.json());
+    } else if (currentTab === 'deployed') {
+      const res = await fetch('/api/deployed');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      renderDeployed(await res.json());
     } else {
       const tab = TABS[currentTab];
       const url = tab.endpoint + (fresh ? '?fresh=1' : '');
-      const res = await fetch(url);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      render(await res.json());
+      if (currentTab === 'mine') {
+        const [prsRes, depRes] = await Promise.all([fetch(url), fetch('/api/deployed')]);
+        if (!prsRes.ok) throw new Error('HTTP ' + prsRes.status);
+        deployedState = depRes.ok ? (await depRes.json()).environments || {} : {};
+        render(await prsRes.json());
+      } else {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        render(await res.json());
+      }
     }
   } catch (e) {
     document.getElementById('content').innerHTML =
@@ -2344,6 +3120,9 @@ def get_status():
     def check(name, description, ok, excerpt="", fix=None):
         checks.append({"name": name, "description": description, "ok": ok, "excerpt": excerpt, "fix": fix})
 
+    def separator():
+        checks.append({"separator": True})
+
     def prompt_excerpt(prompt):
         if not prompt or not prompt.strip():
             return "Not set or empty."
@@ -2371,10 +3150,13 @@ def get_status():
             return f"Error reading {path}: {e}"
 
     for wf_path, wf_name, wf_label in [
-        (REVIEW_WORKFLOW,  "review_workflow.md",  "Review workflow instructions"),
-        (ADDRESS_WORKFLOW, "address_workflow.md", "Address workflow instructions"),
-        (NUDGE_WORKFLOW,   "nudge_workflow.md",   "Nudge workflow instructions"),
-        (DEPLOY_TARGETS_PATH, "deploy_targets.json",
+        (REVIEW_WORKFLOW,       "review_workflow.md",       "Review workflow instructions"),
+        (RE_REVIEW_WORKFLOW,    "re_review_workflow.md",    "Re-review workflow instructions"),
+        (ADDRESS_WORKFLOW,      "address_workflow.md",      "Address workflow instructions"),
+        (NUDGE_WORKFLOW,        "nudge_workflow.md",        "Nudge workflow instructions"),
+        (FIX_PIPELINE_WORKFLOW, "fix_pipeline_workflow.md", "Fix pipeline workflow instructions"),
+        (REBASE_WORKFLOW,       "rebase_workflow.md",       "Rebase workflow instructions"),
+        (DEPLOY_TARGETS_PATH,   "deploy_targets.json",
          "Deploy targets (repo → env → workflow name)"),
     ]:
         ok = os.path.isfile(wf_path)
@@ -2383,6 +3165,8 @@ def get_status():
             workflow_excerpt(wf_path),
             fix={"action": "create_file", "path": wf_path} if not ok else None,
         )
+
+    separator()
 
     check("AGENT_CLONES_DIR", "Agent clones directory",
           os.path.isdir(AGENT_CLONES_DIR),
@@ -2423,6 +3207,100 @@ def get_status():
     return checks
 
 
+def open_in_editor(path: str) -> None:
+    """Open *path* in the configured or auto-detected editor.
+
+    If EDITOR_CMD is set, that command is used directly (e.g. "cursor", "code",
+    "subl", "open -a TextEdit"). Otherwise: tries ``code``, then falls back to
+    the OS default (``open`` on macOS, ``xdg-open`` on Linux).
+    """
+    import platform
+    import shlex
+    if EDITOR_CMD:
+        cmd = shlex.split(EDITOR_CMD) + [path]
+        subprocess.Popen(cmd)
+        return
+    if shutil.which("code"):
+        subprocess.Popen(["code", path])
+        return
+    system = platform.system()
+    if system == "Darwin":
+        subprocess.Popen(["open", path])
+    elif system == "Linux":
+        subprocess.Popen(["xdg-open", path])
+    else:
+        raise RuntimeError(f"No editor found for platform {system!r}")
+
+
+def get_deployed() -> dict:
+    """Return the latest workflow run per repo for the configured DEPLOY_TARGET.
+
+    If DEPLOY_TARGET is set (e.g. "csi-3"), only that environment's workflow is
+    queried for each repo. If not set, all configured environments are queried.
+    The workflow name comes from DEPLOY_TARGETS[repo][env] — the value in
+    deploy_targets.json — and is passed to ``gh run list -w`` which accepts
+    either a workflow filename or its display name.
+    """
+    target_env = DEPLOY_TARGET
+
+    if target_env:
+        combos = [
+            (repo, target_env, envs[target_env])
+            for repo, envs in DEPLOY_TARGETS.items()
+            if target_env in envs
+        ]
+    else:
+        combos = [
+            (repo, env, wf)
+            for repo, envs in DEPLOY_TARGETS.items()
+            for env, wf in envs.items()
+        ]
+
+    if not combos:
+        return {"environments": {}, "target_env": target_env}
+
+    def fetch_one(combo: tuple) -> tuple:
+        repo, env, workflow_name = combo
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "run", "list",
+                    "-R", repo,
+                    "-w", workflow_name,
+                    "--limit", "1",
+                    "--json", "status,conclusion,headBranch,createdAt,displayTitle",
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout).strip() or "gh run list failed"
+                return repo, env, {"repo": repo, "env": env, "error": err}
+            if not result.stdout.strip():
+                return repo, env, {"repo": repo, "env": env, "error": "no runs found"}
+            runs = json.loads(result.stdout)
+            if not runs:
+                return repo, env, {"repo": repo, "env": env, "error": "no runs found"}
+            run = runs[0]
+            return repo, env, {
+                "repo": repo,
+                "env": env,
+                "branch": run.get("headBranch", ""),
+                "status": run.get("status", ""),
+                "conclusion": run.get("conclusion", ""),
+                "createdAt": run.get("createdAt", ""),
+                "displayTitle": run.get("displayTitle", ""),
+            }
+        except Exception as e:
+            return repo, env, {"repo": repo, "env": env, "error": str(e)}
+
+    by_env: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for repo, env, data in pool.map(fetch_one, combos):
+            by_env.setdefault(env, []).append(data)
+
+    return {"environments": by_env, "target_env": target_env}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
@@ -2446,6 +3324,8 @@ class Handler(BaseHTTPRequestHandler):
                 "cache_ttl": CACHE_TTL,
                 "host": HOST,
                 "port": PORT,
+                "workflow_dir": _WORKFLOW_DIR,
+                "editor_cmd": EDITOR_CMD,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -2458,6 +3338,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/status":
             self._send_json(200, get_status())
+            return
+        if parsed.path == "/api/deployed":
+            try:
+                self._send_json(200, get_deployed())
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
             return
         if parsed.path == "/api/prs":
             qs = parse_qs(parsed.query or "")
@@ -2486,7 +3372,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, "bad number")
                 return
             kind = qs.get("kind", ["review"])[0]
-            if kind not in ("review", "merge", "address", "nudge"):
+            if kind not in ("review", "re_review", "merge", "address", "nudge", "fix_pipeline", "rebase"):
                 self.send_error(400, "bad kind")
                 return
             if "/" not in repo or number <= 0:
@@ -2535,11 +3421,20 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/review":
             self._handle_review_post()
             return
+        if parsed.path == "/api/re-review":
+            self._handle_re_review_post()
+            return
         if parsed.path == "/api/merge":
             self._handle_merge_post()
             return
         if parsed.path == "/api/address":
             self._handle_address_post()
+            return
+        if parsed.path == "/api/fix-pipeline":
+            self._handle_fix_pipeline_post()
+            return
+        if parsed.path == "/api/rebase":
+            self._handle_rebase_post()
             return
         if parsed.path == "/api/nudge":
             self._handle_nudge_post()
@@ -2561,6 +3456,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/settings":
             self._handle_settings_post()
+            return
+        if parsed.path == "/api/open-dir":
+            self._handle_open_dir_post()
             return
         self.send_error(404)
 
@@ -2590,6 +3488,29 @@ class Handler(BaseHTTPRequestHandler):
             "number": number,
             "repo": repo,
             "kind": "review",
+        })
+
+    def _handle_re_review_post(self):
+        try:
+            data = self._read_json_body()
+            number = int(data["number"])
+            repo = str(data["repo"])
+            if "/" not in repo:
+                raise ValueError("repo must be owner/name")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        job, started = get_or_create_job(repo, number, "re_review")
+        if started:
+            threading.Thread(
+                target=run_re_review, args=(job,), daemon=True,
+            ).start()
+        self._send_json(202, {
+            "started": started,
+            "running": True,
+            "number": number,
+            "repo": repo,
+            "kind": "re_review",
         })
 
     def _handle_merge_post(self):
@@ -2638,6 +3559,55 @@ class Handler(BaseHTTPRequestHandler):
             "number": number,
             "repo": repo,
             "kind": "address",
+        })
+
+    def _handle_fix_pipeline_post(self):
+        try:
+            data = self._read_json_body()
+            number = int(data["number"])
+            repo = str(data["repo"])
+            head_ref = str(data["headRefName"])
+            if "/" not in repo or not head_ref:
+                raise ValueError("repo must be owner/name and headRefName required")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        job, started = get_or_create_job(repo, number, "fix_pipeline")
+        if started:
+            threading.Thread(
+                target=run_fix_pipeline, args=(job, head_ref), daemon=True,
+            ).start()
+        self._send_json(202, {
+            "started": started,
+            "running": True,
+            "number": number,
+            "repo": repo,
+            "kind": "fix_pipeline",
+        })
+
+    def _handle_rebase_post(self):
+        try:
+            data = self._read_json_body()
+            number = int(data["number"])
+            repo = str(data["repo"])
+            head_ref = str(data["headRefName"])
+            base_ref = str(data["baseRefName"])
+            if "/" not in repo or not head_ref or not base_ref:
+                raise ValueError("repo, headRefName, and baseRefName are required")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        job, started = get_or_create_job(repo, number, "rebase")
+        if started:
+            threading.Thread(
+                target=run_rebase, args=(job, head_ref, base_ref), daemon=True,
+            ).start()
+        self._send_json(202, {
+            "started": started,
+            "running": True,
+            "number": number,
+            "repo": repo,
+            "kind": "rebase",
         })
 
     def _handle_stop_post(self):
@@ -2706,9 +3676,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_settings_post(self):
-        global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET, CACHE_TTL
+        global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
         _allowed = {"FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "DEPLOY_TARGET",
-                    "CACHE_TTL", "HOST", "PORT"}
+                    "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD"}
         try:
             data = self._read_json_body()
             settings = data.get("settings", {})
@@ -2741,13 +3711,35 @@ class Handler(BaseHTTPRequestHandler):
                     CACHE_TTL = int(value)
                 except ValueError:
                     pass
+            elif key == "EDITOR_CMD":
+                EDITOR_CMD = value
+        self._send_json(200, {"ok": True})
+
+    def _handle_open_dir_post(self):
+        try:
+            data = self._read_json_body()
+            path = str(data.get("path") or "")
+        except Exception as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        if os.path.realpath(path) != os.path.realpath(_WORKFLOW_DIR):
+            self._send_json(403, {"error": "path not allowed"})
+            return
+        try:
+            open_in_editor(path)
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+            return
         self._send_json(200, {"ok": True})
 
     def _handle_create_file_post(self):
         _defaults = {
             os.path.realpath(REVIEW_WORKFLOW):    _DEFAULT_REVIEW_WORKFLOW,
+            os.path.realpath(RE_REVIEW_WORKFLOW): _DEFAULT_RE_REVIEW_WORKFLOW,
             os.path.realpath(ADDRESS_WORKFLOW):   _DEFAULT_ADDRESS_WORKFLOW,
-            os.path.realpath(NUDGE_WORKFLOW):     _DEFAULT_NUDGE_WORKFLOW,
+            os.path.realpath(NUDGE_WORKFLOW):         _DEFAULT_NUDGE_WORKFLOW,
+            os.path.realpath(FIX_PIPELINE_WORKFLOW):  _DEFAULT_FIX_PIPELINE_WORKFLOW,
+            os.path.realpath(REBASE_WORKFLOW):         _DEFAULT_REBASE_WORKFLOW,
             os.path.realpath(DEPLOY_TARGETS_PATH): json.dumps(
                 _DEFAULT_DEPLOY_TARGETS, indent=2
             ) + "\n",
