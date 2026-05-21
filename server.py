@@ -3090,16 +3090,24 @@ async function loadDeployedBranches(container) {
   const selects = [...container.querySelectorAll('.deployed-branch-select')];
   const repos = [...new Set(selects.map(s => s.dataset.repo))];
   await Promise.all(repos.map(async repo => {
-    let branches = [];
+    let branches = [], baseBranch = '';
     try {
       const res = await fetch(`/api/branches?repo=${encodeURIComponent(repo)}`);
       const json = res.ok ? await res.json() : {};
       branches = json.branches || [];
+      baseBranch = json.base_branch || '';
     } catch (_) {}
+    const hasOptions = baseBranch || branches.length;
     for (const sel of selects.filter(s => s.dataset.repo === repo)) {
-      if (branches.length) {
-        sel.innerHTML = '<option value="">— select branch —</option>'
-          + branches.map(b => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
+      if (hasOptions) {
+        let opts = '<option value="">— select branch —</option>';
+        if (baseBranch) {
+          opts += `<optgroup label="Base branch"><option value="${escapeHtml(baseBranch)}">${escapeHtml(baseBranch)}</option></optgroup>`;
+        }
+        if (branches.length) {
+          opts += `<optgroup label="My branches">${branches.map(b => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('')}</optgroup>`;
+        }
+        sel.innerHTML = opts;
         sel.disabled = false;
         sel.addEventListener('change', () => {
           const btn = sel.closest('.deployed-deploy-row').querySelector('.deployed-deploy-btn');
@@ -3341,14 +3349,15 @@ def open_in_editor(path: str) -> None:
 _BRANCHES_GRAPHQL = (
     "query($owner:String!,$name:String!){"
     "repository(owner:$owner,name:$name){"
+    "defaultBranchRef{name}"
     "refs(refPrefix:\"refs/heads/\",first:100,"
     "orderBy:{field:TAG_COMMIT_DATE,direction:DESC}){"
     "nodes{name target{...on Commit{author{user{login}}}}}}}}"
 )
 
 
-def list_my_branches(repo: str) -> list:
-    """Return branches in repo whose HEAD commit was authored by the current user."""
+def list_my_branches(repo: str) -> dict:
+    """Return branches authored by the current user plus the repo's default branch."""
     me = get_my_login()
     owner, name = repo.split("/", 1)
     out = gh_run([
@@ -3358,19 +3367,18 @@ def list_my_branches(repo: str) -> list:
         "-f", f"name={name}",
     ])
     data = json.loads(out)
-    nodes = (
-        ((data.get("data") or {}).get("repository") or {})
-        .get("refs", {}).get("nodes") or []
-    )
-    result = []
+    repo_data = (data.get("data") or {}).get("repository") or {}
+    base_branch = (repo_data.get("defaultBranchRef") or {}).get("name", "")
+    nodes = repo_data.get("refs", {}).get("nodes") or []
+    my_branches = []
     for node in nodes:
         login = (
             (((node.get("target") or {}).get("author") or {}).get("user") or {})
             .get("login", "")
         )
         if login.lower() == me.lower():
-            result.append(node["name"])
-    return result
+            my_branches.append(node["name"])
+    return {"branches": my_branches, "base_branch": base_branch}
 
 
 def get_deployed() -> dict:
@@ -3487,7 +3495,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "repo required"})
                 return
             try:
-                self._send_json(200, {"branches": list_my_branches(repo)})
+                self._send_json(200, list_my_branches(repo))
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
