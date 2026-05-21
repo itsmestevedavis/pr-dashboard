@@ -3352,12 +3352,13 @@ _BRANCHES_GRAPHQL = (
     "defaultBranchRef{name}"
     "refs(refPrefix:\"refs/heads/\",first:100,"
     "orderBy:{field:TAG_COMMIT_DATE,direction:DESC}){"
-    "nodes{name target{...on Commit{author{user{login}}}}}}}}"
+    "nodes{name target{...on Commit{"
+    "author{user{login}}committer{user{login}}}}}}}}"
 )
 
 
 def list_my_branches(repo: str) -> dict:
-    """Return branches authored by the current user plus the repo's default branch."""
+    """Return branches authored or committed by the current user plus the repo's default branch."""
     me = get_my_login()
     owner, name = repo.split("/", 1)
     out = gh_run([
@@ -3370,13 +3371,13 @@ def list_my_branches(repo: str) -> dict:
     repo_data = (data.get("data") or {}).get("repository") or {}
     base_branch = (repo_data.get("defaultBranchRef") or {}).get("name", "")
     nodes = repo_data.get("refs", {}).get("nodes") or []
+    me_lower = me.lower()
     my_branches = []
     for node in nodes:
-        login = (
-            (((node.get("target") or {}).get("author") or {}).get("user") or {})
-            .get("login", "")
-        )
-        if login.lower() == me.lower():
+        target = node.get("target") or {}
+        author_login = ((target.get("author") or {}).get("user") or {}).get("login", "")
+        committer_login = ((target.get("committer") or {}).get("user") or {}).get("login", "")
+        if author_login.lower() == me_lower or committer_login.lower() == me_lower:
             my_branches.append(node["name"])
     return {"branches": my_branches, "base_branch": base_branch}
 
