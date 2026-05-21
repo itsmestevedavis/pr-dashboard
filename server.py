@@ -3359,13 +3359,15 @@ _BRANCHES_GRAPHQL = (
 
 
 def list_my_branches(repo: str) -> dict:
-    """Return branches authored or committed by the current user plus the repo's default branch.
+    """Return branches authored or committed by the current user, plus the default branch.
 
-    Paginates through all branches so repos with >100 branches are fully covered.
+    GitHub has no native author filter on refs, so we page through all branches
+    (100 per GraphQL call) and check the HEAD commit's author/committer login.
+    For a repo with ~200 branches this is typically 2-3 calls.
     """
     me = get_my_login()
     me_lower = me.lower()
-    owner, name = repo.split("/", 1)
+    owner, repo_name = repo.split("/", 1)
     base_branch = ""
     my_branches = []
     cursor = None
@@ -3375,7 +3377,7 @@ def list_my_branches(repo: str) -> dict:
             "api", "graphql",
             "-f", f"query={_BRANCHES_GRAPHQL}",
             "-f", f"owner={owner}",
-            "-f", f"name={name}",
+            "-f", f"name={repo_name}",
             "-f", f"after={cursor or ''}",
         ]
         data = json.loads(gh_run(args))
