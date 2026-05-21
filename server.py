@@ -3351,7 +3351,7 @@ _BRANCHES_GRAPHQL = (
     "repository(owner:$owner,name:$name){"
     "defaultBranchRef{name}"
     "refs(refPrefix:\"refs/heads/\",first:100,after:$after,"
-    "orderBy:{field:TAG_COMMIT_DATE,direction:DESC}){"
+    "orderBy:{field:ALPHABETICAL,direction:ASC}){"
     "pageInfo{hasNextPage endCursor}"
     "nodes{name target{...on Commit{"
     "author{user{login}}committer{user{login}}}}}}}}"
