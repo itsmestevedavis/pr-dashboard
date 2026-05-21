@@ -2098,6 +2098,38 @@ INDEX_HTML = r"""<!doctype html>
   }
   .deployed-meta { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .deployed-error { font-size: 11px; color: #f85149; }
+  .deployed-deploy-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 0 8px 30px;
+    border-top: none;
+  }
+  .deployed-branch-select {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-size: 12px;
+    flex: 1;
+    min-width: 0;
+    max-width: 280px;
+  }
+  .deployed-branch-select:disabled { opacity: 0.5; }
+  .deployed-deploy-btn {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .deployed-deploy-btn:hover:not(:disabled) { background: #2ea043; }
+  .deployed-deploy-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -3010,6 +3042,7 @@ function renderDeployed(data) {
     content.innerHTML = `<div class="empty">${hint}</div>`;
     return;
   }
+  const deployTargets = CONFIG.deploy_targets || {};
   let html = '';
   for (const env of envKeys) {
     const items = (envs[env] || []).slice().sort((a, b) => (a.repo || '').localeCompare(b.repo || ''));
@@ -3028,16 +3061,87 @@ function renderDeployed(data) {
       const metaHtml = item.error
         ? `<span class="deployed-error">${escapeHtml(item.error)}</span>`
         : `<span class="deployed-meta">${item.createdAt ? relativeTime(item.createdAt) : ''}${item.displayTitle ? ' · ' + escapeHtml(item.displayTitle) : ''}</span>`;
+      const hasWorkflow = !!((deployTargets[item.repo] || {})[env]);
+      const deployRow = hasWorkflow
+        ? `<div class="deployed-deploy-row">
+          <select class="deployed-branch-select" data-repo="${escapeHtml(item.repo)}" data-env="${escapeHtml(env)}" disabled>
+            <option value="">Loading branches…</option>
+          </select>
+          <button class="deployed-deploy-btn" data-repo="${escapeHtml(item.repo)}" data-env="${escapeHtml(env)}" disabled>Deploy</button>
+        </div>`
+        : '';
       html += `<div class="deployed-item">
         <span class="deployed-icon">${icon}</span>
         <span class="deployed-repo" title="${escapeHtml(item.repo || '')}">${escapeHtml(repoShort)}</span>
         ${branchHtml}
         ${metaHtml}
-      </div>`;
+      </div>${deployRow}`;
     }
     html += '</div></details>';
   }
   content.innerHTML = html;
+  for (const btn of content.querySelectorAll('.deployed-deploy-btn')) {
+    btn.addEventListener('click', onDeployFromDeployed);
+  }
+  loadDeployedBranches(content);
+}
+
+async function loadDeployedBranches(container) {
+  const selects = [...container.querySelectorAll('.deployed-branch-select')];
+  const repos = [...new Set(selects.map(s => s.dataset.repo))];
+  await Promise.all(repos.map(async repo => {
+    let branches = [];
+    try {
+      const res = await fetch(`/api/branches?repo=${encodeURIComponent(repo)}`);
+      const json = res.ok ? await res.json() : {};
+      branches = json.branches || [];
+    } catch (_) {}
+    for (const sel of selects.filter(s => s.dataset.repo === repo)) {
+      if (branches.length) {
+        sel.innerHTML = '<option value="">— select branch —</option>'
+          + branches.map(b => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
+        sel.disabled = false;
+        sel.addEventListener('change', () => {
+          const btn = sel.closest('.deployed-deploy-row').querySelector('.deployed-deploy-btn');
+          if (btn) btn.disabled = !sel.value;
+        });
+      } else {
+        sel.innerHTML = '<option value="">No branches found</option>';
+      }
+    }
+  }));
+}
+
+async function onDeployFromDeployed(ev) {
+  const btn = ev.currentTarget;
+  const repo = btn.dataset.repo;
+  const env = btn.dataset.env;
+  const sel = btn.closest('.deployed-deploy-row').querySelector('.deployed-branch-select');
+  const headRef = sel?.value;
+  if (!headRef) return;
+  if (!confirm(`Deploy ${repo} (${headRef}) to ${env.toUpperCase()}?`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Deploying…';
+  try {
+    const res = await fetch('/api/deploy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo, env, head_ref: headRef }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Deploy failed');
+    btn.textContent = '✅ Dispatched';
+    btn.style.background = '#1a7f37';
+    setTimeout(() => {
+      btn.textContent = 'Deploy';
+      btn.style.cssText = '';
+      btn.disabled = !sel?.value;
+    }, 4000);
+  } catch (e) {
+    toast(`Deploy failed: ${e.message}`, true);
+    btn.textContent = 'Deploy';
+    btn.disabled = !sel?.value;
+  }
 }
 
 async function load(fresh) {
@@ -3234,6 +3338,41 @@ def open_in_editor(path: str) -> None:
         raise RuntimeError(f"No editor found for platform {system!r}")
 
 
+_BRANCHES_GRAPHQL = (
+    "query($owner:String!,$name:String!){"
+    "repository(owner:$owner,name:$name){"
+    "refs(refPrefix:\"refs/heads/\",first:100,"
+    "orderBy:{field:TAG_COMMIT_DATE,direction:DESC}){"
+    "nodes{name target{...on Commit{author{user{login}}}}}}}}"
+)
+
+
+def list_my_branches(repo: str) -> list:
+    """Return branches in repo whose HEAD commit was authored by the current user."""
+    me = get_my_login()
+    owner, name = repo.split("/", 1)
+    out = gh_run([
+        "api", "graphql",
+        "-f", f"query={_BRANCHES_GRAPHQL}",
+        "-f", f"owner={owner}",
+        "-f", f"name={name}",
+    ])
+    data = json.loads(out)
+    nodes = (
+        ((data.get("data") or {}).get("repository") or {})
+        .get("refs", {}).get("nodes") or []
+    )
+    result = []
+    for node in nodes:
+        login = (
+            (((node.get("target") or {}).get("author") or {}).get("user") or {})
+            .get("login", "")
+        )
+        if login.lower() == me.lower():
+            result.append(node["name"])
+    return result
+
+
 def get_deployed() -> dict:
     """Return the latest workflow run per repo for the configured DEPLOY_TARGET.
 
@@ -3340,6 +3479,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/status":
             self._send_json(200, get_status())
+            return
+        if parsed.path == "/api/branches":
+            qs = parse_qs(parsed.query or "")
+            repo = qs.get("repo", [""])[0]
+            if "/" not in repo:
+                self._send_json(400, {"error": "repo required"})
+                return
+            try:
+                self._send_json(200, {"branches": list_my_branches(repo)})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
             return
         if parsed.path == "/api/deployed":
             try:
