@@ -112,20 +112,6 @@ def _is_human_author(author):
     return typename in (None, "User", "Mannequin", "EnterpriseUserAccount")
 
 
-# Bots that are regular User accounts (so __typename=User on GraphQL and no
-# `[bot]` suffix). Add new entries as they're encountered.
-KNOWN_BOT_LOGINS = {"codacy-production"}
-
-
-def _is_bot_login(login):
-    """Heuristic bot detection by login string only (no __typename)."""
-    if not login:
-        return False
-    if login.endswith("[bot]"):
-        return True
-    return login in KNOWN_BOT_LOGINS
-
-
 def determine_my_pr_status(pr, me):
     """Categorize one of my open PRs.
 
@@ -551,19 +537,26 @@ def list_prs(fresh=False):
             "url": pr.get("url") or "",
         })
 
-    enriched = []
-    for pr in candidates:
+    # Enrich each candidate in parallel: fetch_detail + determine_status both make
+    # blocking `gh` calls, so a sequential loop is O(N) round trips. The detail cache
+    # (_detail_cache/_cache_lock) is thread-safe, so fan out across a small pool.
+    def enrich(pr):
         try:
             detail = fetch_detail(pr["repository"], pr["number"], fresh=fresh)
         except Exception as e:
             print(f"[warn] detail fetch failed for {pr['repository']}#{pr['number']}: {e}", flush=True)
-            continue
-        status = determine_status(
-            pr["repository"], pr["number"], detail, me, fresh,
-        )
+            return None
+        status = determine_status(pr["repository"], pr["number"], detail, me, fresh)
         if status is None:
-            continue
-        enriched.append({**pr, **status})
+            return None
+        return {**pr, **status}
+
+    enriched = []
+    if candidates:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(candidates))) as pool:
+            for result in pool.map(enrich, candidates):
+                if result is not None:
+                    enriched.append(result)
 
     enriched.sort(key=lambda p: p["updatedAt"])
     enriched.sort(key=lambda p: STATUS_ORDER[p["status"]])
@@ -771,7 +764,7 @@ class Job:
     def __init__(self, repo, number, kind):
         self.repo = repo
         self.number = number
-        self.kind = kind  # "review" | "merge" | "address"
+        self.kind = kind  # review | re_review | merge | address | fix_pipeline | rebase | nudge
         self.status = "running"  # running | done | failed | stopped
         self.result = None
         self.log = []
@@ -1572,8 +1565,6 @@ NUDGE_PROMPT = (
     "tagging the listed reviewers with Slack mentions.\n\n"
 )
 
-_RE_SLACK_DM = re.compile(r"slack_send_message\b")
-
 
 def _load_workflow(path):
     """Read a workflow .md file. Raises FileNotFoundError if missing."""
@@ -2106,9 +2097,9 @@ INDEX_HTML = r"""<!doctype html>
     border-top: none;
   }
   .deployed-branch-select {
-    background: var(--surface);
+    background: var(--card);
     border: 1px solid var(--border);
-    color: var(--fg);
+    color: var(--text);
     border-radius: 4px;
     padding: 3px 6px;
     font-size: 12px;
@@ -2686,7 +2677,7 @@ function setRunning(card, label, kind) {
   } else {
     panel.innerHTML = '';
   }
-  // label and kind are server-controlled strings, escaped before insertion
+  // label and kind are client-supplied literals; escaped defensively before insertion
   const stopBtn = kind
     ? `<button class="btn-stop" data-kind="${escapeHtml(kind)}">Stop</button>`
     : '';
