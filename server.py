@@ -2015,33 +2015,7 @@ function render(prs) {
     for (const p of grouped[g]) html += tab.render(p);
   }
   content.innerHTML = html;
-  for (const btn of document.querySelectorAll('.btn-review')) {
-    btn.addEventListener('click', onReview);
-  }
-  for (const btn of document.querySelectorAll('.btn-re-review')) {
-    btn.addEventListener('click', onReReview);
-  }
-  for (const btn of document.querySelectorAll('.btn-merge')) {
-    btn.addEventListener('click', onMerge);
-  }
-  for (const btn of document.querySelectorAll('.btn-address')) {
-    btn.addEventListener('click', onAddress);
-  }
-  for (const btn of document.querySelectorAll('.btn-nudge')) {
-    btn.addEventListener('click', onNudge);
-  }
-  for (const btn of document.querySelectorAll('.btn-channel')) {
-    btn.addEventListener('click', onChannelPing);
-  }
-  for (const btn of document.querySelectorAll('.btn-deploy')) {
-    btn.addEventListener('click', onDeploy);
-  }
-  for (const btn of document.querySelectorAll('.btn-fix-pipeline')) {
-    btn.addEventListener('click', onFixPipeline);
-  }
-  for (const btn of document.querySelectorAll('.btn-rebase')) {
-    btn.addEventListener('click', onRebase);
-  }
+  // PR-card buttons are handled by the delegated #content listener (see initDelegation).
 }
 
 function renderIncomingPR(p) {
@@ -2141,276 +2115,105 @@ function renderMyPR(p) {
   </div>`;
 }
 
-async function onReview(ev) {
-  const btn = ev.currentTarget;
+// ---- PR-card action handlers ----------------------------------------------
+// Buttons are wired via one delegated listener on #content (see initDelegation),
+// so every handler receives the clicked button and re-rendered buttons (e.g. the
+// "…again" buttons in stopped branches) work without re-attaching listeners.
+
+function cardCtx(btn) {
   const card = btn.closest('.pr');
-  const number = parseInt(card.dataset.number, 10);
-  const repo = card.dataset.repo;
-  const url = card.dataset.url;
-
-  try {
-    const res = await fetch('/api/review', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ number, repo }),
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-  } catch (e) {
-    toast(`Failed to start: ${e.message}`, true);
-    return;
-  }
-
-  setReviewing(card);
-  streamJob(card, 'review', repo, number, url, finishReview);
+  return {
+    card,
+    number: parseInt(card.dataset.number, 10),
+    repo: card.dataset.repo,
+    url: card.dataset.url,
+  };
 }
 
-async function onMerge(ev) {
-  const btn = ev.currentTarget;
-  const card = btn.closest('.pr');
-  const number = parseInt(card.dataset.number, 10);
-  const repo = card.dataset.repo;
-  const url = card.dataset.url;
-  const defaultMergeMethod = card.dataset.method;
-
-  if (!confirm(`Merge ${repo} #${number}?`)) return;
-
+// POST to `endpoint`; on success switch the card to its running state and stream.
+// Shows a toast and bails on failure. Shared by every job-starting handler.
+async function startJob(ctx, endpoint, body, kind, runningLabel, finish) {
   try {
-    const res = await fetch('/api/merge', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ number, repo, defaultMergeMethod }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || ('HTTP ' + res.status));
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.error || ('HTTP ' + res.status));
     }
   } catch (e) {
     toast(`Failed to start: ${e.message}`, true);
     return;
   }
-  setRunning(card, 'Merging…', 'merge');
-  streamJob(card, 'merge', repo, number, url, finishMerge);
+  setRunning(ctx.card, runningLabel, kind);
+  streamJob(ctx.card, kind, ctx.repo, ctx.number, ctx.url, finish);
 }
 
-function finishMerge(card, url, data) {
-  const actions = card.querySelector('.pr-actions');
-  let cls = 'failed', label = '❌ Merge failed';
-  if (data.status === 'done' && data.result === 'merged') {
-    cls = 'merged'; label = '✅ Merged';
-  }
-  actions.innerHTML = `
-    <span class="review-status ${cls}">${escapeHtml(label)}</span>
-    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-  `;
+function onReview(btn) {
+  const ctx = cardCtx(btn);
+  startJob(ctx, '/api/review', { number: ctx.number, repo: ctx.repo },
+    'review', 'Reviewing…', finishReview);
 }
 
-async function onAddress(ev) {
-  const btn = ev.currentTarget;
-  const card = btn.closest('.pr');
-  const number = parseInt(card.dataset.number, 10);
-  const repo = card.dataset.repo;
-  const url = card.dataset.url;
-  const headRefName = card.dataset.head;
-
-  try {
-    const res = await fetch('/api/address', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ number, repo, headRefName }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || ('HTTP ' + res.status));
-    }
-  } catch (e) {
-    toast(`Failed to start: ${e.message}`, true);
-    return;
-  }
-  setRunning(card, 'Addressing…', 'address');
-  streamJob(card, 'address', repo, number, url, finishAddress);
+function onReReview(btn) {
+  const ctx = cardCtx(btn);
+  startJob(ctx, '/api/re-review', { number: ctx.number, repo: ctx.repo },
+    're_review', 'Re-reviewing…', finishReReview);
 }
 
-function finishAddress(card, url, data) {
-  const actions = card.querySelector('.pr-actions');
-  if (data.status === 'stopped') {
-    actions.innerHTML = `
-      <span class="review-status stopped">⏹ Stopped</span>
-      <button class="btn-address" type="button">Address again</button>
-      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-    `;
-    actions.querySelector('.btn-address').addEventListener('click', onAddress);
-    return;
-  }
-  let cls = 'failed', label = '❌ Failed';
-  if (data.status === 'done') {
-    if (data.result === 'No action') {
-      cls = 'commented'; label = 'ℹ No action';
-    } else if (data.result === 'Replied only') {
-      cls = 'commented'; label = '💬 Replied only';
-    } else {
-      cls = 'approved'; label = '✅ ' + data.result;
-    }
-  }
-  actions.innerHTML = `
-    <span class="review-status ${cls}">${escapeHtml(label)}</span>
-    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-  `;
+function onMerge(btn) {
+  const ctx = cardCtx(btn);
+  if (!confirm(`Merge ${ctx.repo} #${ctx.number}?`)) return;
+  startJob(ctx, '/api/merge',
+    { number: ctx.number, repo: ctx.repo, defaultMergeMethod: ctx.card.dataset.method },
+    'merge', 'Merging…', finishMerge);
 }
 
-async function onFixPipeline(ev) {
-  const btn = ev.currentTarget;
-  const card = btn.closest('.pr');
-  const number = parseInt(card.dataset.number, 10);
-  const repo = card.dataset.repo;
-  const url = card.dataset.url;
-  const headRefName = card.dataset.head;
-
-  try {
-    const res = await fetch('/api/fix-pipeline', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ number, repo, headRefName }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || ('HTTP ' + res.status));
-    }
-  } catch (e) {
-    toast(`Failed to start: ${e.message}`, true);
-    return;
-  }
-  setRunning(card, 'Fixing pipeline…', 'fix_pipeline');
-  streamJob(card, 'fix_pipeline', repo, number, url, finishFixPipeline);
+function onAddress(btn) {
+  const ctx = cardCtx(btn);
+  startJob(ctx, '/api/address',
+    { number: ctx.number, repo: ctx.repo, headRefName: ctx.card.dataset.head },
+    'address', 'Addressing…', finishAddress);
 }
 
-function finishFixPipeline(card, url, data) {
-  const actions = card.querySelector('.pr-actions');
-  if (data.status === 'stopped') {
-    actions.innerHTML = `
-      <span class="review-status stopped">⏹ Stopped</span>
-      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-    `;
-    return;
-  }
-  const ok = data.status === 'done';
-  actions.innerHTML = `
-    <span class="review-status ${ok ? 'approved' : 'failed'}">${ok ? '✅ Fix pushed' : '❌ Failed'}</span>
-    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-  `;
+function onFixPipeline(btn) {
+  const ctx = cardCtx(btn);
+  startJob(ctx, '/api/fix-pipeline',
+    { number: ctx.number, repo: ctx.repo, headRefName: ctx.card.dataset.head },
+    'fix_pipeline', 'Fixing pipeline…', finishFixPipeline);
 }
 
-async function onRebase(ev) {
-  const btn = ev.currentTarget;
-  const card = btn.closest('.pr');
-  const number = parseInt(card.dataset.number, 10);
-  const repo = card.dataset.repo;
-  const url = card.dataset.url;
-  const headRefName = card.dataset.head;
-  const baseRefName = card.dataset.base;
-  try {
-    const res = await fetch('/api/rebase', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ number, repo, headRefName, baseRefName }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || 'HTTP ' + res.status);
-    }
-  } catch (e) {
-    toast(`Failed to start: ${e.message}`, true);
-    return;
-  }
-  setRunning(card, 'Rebasing…', 'rebase');
-  streamJob(card, 'rebase', repo, number, url, finishRebase);
+function onRebase(btn) {
+  const ctx = cardCtx(btn);
+  startJob(ctx, '/api/rebase',
+    { number: ctx.number, repo: ctx.repo,
+      headRefName: ctx.card.dataset.head, baseRefName: ctx.card.dataset.base },
+    'rebase', 'Rebasing…', finishRebase);
 }
 
-function finishRebase(card, url, data) {
-  const actions = card.querySelector('.pr-actions');
-  if (data.status === 'stopped') {
-    actions.innerHTML = `
-      <span class="review-status stopped">⏹ Stopped</span>
-      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-    `;
-    return;
-  }
-  const ok = data.status === 'done';
-  actions.innerHTML = `
-    <span class="review-status ${ok ? 'approved' : 'failed'}">${ok ? '✅ Rebased & pushed' : '❌ Rebase failed'}</span>
-    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-  `;
-}
-
-async function onNudge(ev) {
-  const btn = ev.currentTarget;
-  const card = btn.closest('.pr');
-  const number = parseInt(card.dataset.number, 10);
-  const repo = card.dataset.repo;
-  const url = card.dataset.url;
-  const title = card.dataset.title || '';
-  const mode = card.dataset.mode || '';
-  const targets = (card.dataset.targets || '').split(',').map(s => s.trim()).filter(Boolean);
-
+function onNudge(btn) {
+  const ctx = cardCtx(btn);
+  const title = ctx.card.dataset.title || '';
+  const mode = ctx.card.dataset.mode || '';
+  const targets = (ctx.card.dataset.targets || '').split(',').map(s => s.trim()).filter(Boolean);
   if (!mode || !targets.length) {
     toast('No one to nudge — everyone has approved already.');
     return;
   }
-
   const promptLabel = mode === 'fresh'
     ? `Ask ${targets.join(' and ')} on Slack to review this PR?`
     : `Nudge on Slack to re-review: ${targets.join(', ')}?`;
   if (!confirm(promptLabel)) return;
-
-  try {
-    const res = await fetch('/api/nudge', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ number, repo, url, title, reviewers: targets, mode }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || ('HTTP ' + res.status));
-    }
-  } catch (e) {
-    toast(`Failed to start: ${e.message}`, true);
-    return;
-  }
-  setRunning(card, 'Nudging…', 'nudge');
-  streamJob(card, 'nudge', repo, number, url, finishNudge);
+  startJob(ctx, '/api/nudge',
+    { number: ctx.number, repo: ctx.repo, url: ctx.url, title, reviewers: targets, mode },
+    'nudge', 'Nudging…', finishNudge);
 }
 
-function finishNudge(card, url, data) {
-  const actions = card.querySelector('.pr-actions');
-  if (data.status === 'stopped') {
-    actions.innerHTML = `
-      <span class="review-status stopped">⏹ Stopped</span>
-      <button class="btn-nudge" type="button">Nudge again</button>
-      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-    `;
-    actions.querySelector('.btn-nudge').addEventListener('click', onNudge);
-    return;
-  }
-  let cls = 'failed', label = '❌ Failed';
-  if (data.status === 'done') {
-    if (data.result === 'No DMs sent' || data.result === 'Channel post failed') {
-      cls = 'commented'; label = 'ℹ ' + data.result;
-    } else {
-      cls = 'approved'; label = '✅ ' + data.result;
-    }
-  }
-  actions.innerHTML = `
-    <span class="review-status ${cls}">${escapeHtml(label)}</span>
-    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-  `;
-}
-
-async function onChannelPing(ev) {
-  const btn = ev.currentTarget;
-  const card = btn.closest('.pr');
-  const number = parseInt(card.dataset.number, 10);
-  const repo = card.dataset.repo;
-  const url = card.dataset.url;
-  const title = card.dataset.title || '';
+function onChannelPing(btn) {
+  const ctx = cardCtx(btn);
+  const title = ctx.card.dataset.title || '';
   const targets = (CONFIG.fresh_reviewers || []).slice();
   if (!targets.length) {
     toast('No FRESH_REVIEWERS configured — set them in .env.', true);
@@ -2420,29 +2223,13 @@ async function onChannelPing(ev) {
     toast('No TEAM_CHANNEL_ID configured — set it in .env.', true);
     return;
   }
-
   if (!confirm(`Post in team channel tagging ${targets.join(' and ')} to review this PR?`)) return;
-
-  try {
-    const res = await fetch('/api/nudge', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ number, repo, url, title, reviewers: targets, mode: 'channel' }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || ('HTTP ' + res.status));
-    }
-  } catch (e) {
-    toast(`Failed to start: ${e.message}`, true);
-    return;
-  }
-  setRunning(card, 'Posting in channel…', 'nudge');
-  streamJob(card, 'nudge', repo, number, url, finishNudge);
+  startJob(ctx, '/api/nudge',
+    { number: ctx.number, repo: ctx.repo, url: ctx.url, title, reviewers: targets, mode: 'channel' },
+    'nudge', 'Posting in channel…', finishNudge);
 }
 
-async function onDeploy(ev) {
-  const btn = ev.currentTarget;
+async function onDeploy(btn) {
   const card = btn.closest('.pr');
   const repo = card.dataset.repo;
   const headRef = card.dataset.head;
@@ -2459,7 +2246,7 @@ async function onDeploy(ev) {
       body: JSON.stringify({ repo, env, head_ref: headRef }),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+    if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
     btn.textContent = 'Dispatched ✓';
     btn.style.cssText = 'background:#238636;color:#fff;';
     setTimeout(() => { btn.textContent = 'Deploy'; btn.style.cssText = ''; btn.disabled = false; }, 4000);
@@ -2468,6 +2255,97 @@ async function onDeploy(ev) {
     btn.textContent = 'Deploy';
     btn.disabled = false;
   }
+}
+
+// ---- card terminal-state rendering ----------------------------------------
+
+// Final (done/failed) state: a status pill + Open-PR link.
+function setFinalStatus(card, cls, label, url) {
+  card.querySelector('.pr-actions').innerHTML =
+    `<span class="review-status ${cls}">${escapeHtml(label)}</span>`
+    + `<a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>`;
+}
+
+// Stopped state: pill + optional "…again" button (delegation re-wires it) + Open-PR.
+function setStoppedStatus(card, url, againBtn) {
+  card.querySelector('.pr-actions').innerHTML =
+    `<span class="review-status stopped">⏹ Stopped</span>`
+    + (againBtn || '')
+    + `<a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>`;
+}
+
+function finishMerge(card, url, data) {
+  const ok = data.status === 'done' && data.result === 'merged';
+  setFinalStatus(card, ok ? 'merged' : 'failed', ok ? '✅ Merged' : '❌ Merge failed', url);
+}
+
+function finishAddress(card, url, data) {
+  if (data.status === 'stopped') {
+    setStoppedStatus(card, url, `<button class="btn-address" type="button">Address again</button>`);
+    return;
+  }
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
+    if (data.result === 'No action') { cls = 'commented'; label = 'ℹ No action'; }
+    else if (data.result === 'Replied only') { cls = 'commented'; label = '💬 Replied only'; }
+    else { cls = 'approved'; label = '✅ ' + data.result; }
+  }
+  setFinalStatus(card, cls, label, url);
+}
+
+function finishFixPipeline(card, url, data) {
+  if (data.status === 'stopped') { setStoppedStatus(card, url); return; }
+  const ok = data.status === 'done';
+  setFinalStatus(card, ok ? 'approved' : 'failed', ok ? '✅ Fix pushed' : '❌ Failed', url);
+}
+
+function finishRebase(card, url, data) {
+  if (data.status === 'stopped') { setStoppedStatus(card, url); return; }
+  const ok = data.status === 'done';
+  setFinalStatus(card, ok ? 'approved' : 'failed', ok ? '✅ Rebased & pushed' : '❌ Rebase failed', url);
+}
+
+function finishNudge(card, url, data) {
+  if (data.status === 'stopped') {
+    setStoppedStatus(card, url, `<button class="btn-nudge" type="button">Nudge again</button>`);
+    return;
+  }
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
+    if (data.result === 'No DMs sent' || data.result === 'Channel post failed') {
+      cls = 'commented'; label = 'ℹ ' + data.result;
+    } else { cls = 'approved'; label = '✅ ' + data.result; }
+  }
+  setFinalStatus(card, cls, label, url);
+}
+
+// review and re-review share identical terminal logic (only the "again" button differs).
+function finishReviewLike(card, url, data, againBtn) {
+  if (data.status === 'stopped') {
+    setStoppedStatus(card, url, againBtn);
+    return;
+  }
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
+    if (data.result === 'approved') {
+      cls = 'approved'; label = '✅ Approved';
+    } else if ((data.result || '').startsWith('commented:')) {
+      const n = data.result.split(':')[1];
+      cls = 'commented';
+      label = `💬 ${n} pending comment${n === '1' ? '' : 's'} left`;
+    } else {
+      cls = 'commented'; label = 'ℹ Done';
+    }
+  }
+  setFinalStatus(card, cls, label, url);
+}
+
+function finishReview(card, url, data) {
+  finishReviewLike(card, url, data, `<button class="btn-review" type="button">Review again</button>`);
+}
+
+function finishReReview(card, url, data) {
+  finishReviewLike(card, url, data, `<button class="btn-re-review" type="button">Re-review again</button>`);
 }
 
 function setRunning(card, label, kind) {
@@ -2481,16 +2359,13 @@ function setRunning(card, label, kind) {
   } else {
     panel.innerHTML = '';
   }
-  // label and kind are client-supplied literals; escaped defensively before insertion
+  // label and kind are client-supplied literals; escaped defensively before insertion.
+  // The Stop button is wired via the delegated #content listener.
   const stopBtn = kind
     ? `<button class="btn-stop" data-kind="${escapeHtml(kind)}">Stop</button>`
     : '';
   actions.innerHTML = `<span class="review-status running"><span class="spinner"></span>${escapeHtml(label)}</span>${stopBtn}`;
-  const btn = actions.querySelector('.btn-stop');
-  if (btn) btn.addEventListener('click', onStop);
 }
-
-function setReviewing(card) { setRunning(card, 'Reviewing…', 'review'); }
 
 function appendLogLine(card, text, cls) {
   const panel = card.querySelector('.review-log');
@@ -2521,13 +2396,12 @@ function streamJob(card, kind, repo, number, url, finishLabel) {
     es.close();
     const actions = card.querySelector('.pr-actions');
     if (actions && !actions.querySelector('.btn-open')) {
-      actions.innerHTML = `<span class="review-status failed">⚠ Stream lost</span><a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>`;
+      setFinalStatus(card, 'failed', '⚠ Stream lost', url);
     }
   });
 }
 
-async function onStop(ev) {
-  const btn = ev.currentTarget;
+async function onStop(btn) {
   const card = btn.closest('.pr');
   const number = parseInt(card.dataset.number, 10);
   const repo = card.dataset.repo;
@@ -2546,85 +2420,26 @@ async function onStop(ev) {
   }
 }
 
-function finishReview(card, url, data) {
-  const actions = card.querySelector('.pr-actions');
-  if (data.status === 'stopped') {
-    actions.innerHTML = `
-      <span class="review-status stopped">⏹ Stopped</span>
-      <button class="btn-review" type="button">Review again</button>
-      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-    `;
-    actions.querySelector('.btn-review').addEventListener('click', onReview);
-    return;
-  }
-  let cls = 'failed', label = '❌ Failed';
-  if (data.status === 'done') {
-    if (data.result === 'approved') {
-      cls = 'approved'; label = '✅ Approved';
-    } else if ((data.result || '').startsWith('commented:')) {
-      const n = data.result.split(':')[1];
-      cls = 'commented';
-      label = `💬 ${n} pending comment${n === '1' ? '' : 's'} left`;
-    } else {
-      cls = 'commented'; label = 'ℹ Done';
-    }
-  }
-  actions.innerHTML = `
-    <span class="review-status ${cls}">${escapeHtml(label)}</span>
-    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-  `;
-}
+// One delegated click listener for all PR-card buttons (attached once to #content).
+// Class tokens are exact-match, so .btn-review and .btn-re-review never collide.
+const CARD_ACTIONS = {
+  'btn-review': onReview,
+  'btn-re-review': onReReview,
+  'btn-merge': onMerge,
+  'btn-address': onAddress,
+  'btn-fix-pipeline': onFixPipeline,
+  'btn-rebase': onRebase,
+  'btn-nudge': onNudge,
+  'btn-channel': onChannelPing,
+  'btn-deploy': onDeploy,
+  'btn-stop': onStop,
+};
 
-async function onReReview(ev) {
-  const btn = ev.currentTarget;
-  const card = btn.closest('.pr');
-  const number = parseInt(card.dataset.number, 10);
-  const repo = card.dataset.repo;
-  const url = card.dataset.url;
-
-  try {
-    const res = await fetch('/api/re-review', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ number, repo }),
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-  } catch (e) {
-    toast(`Failed to start: ${e.message}`, true);
-    return;
+function onContentClick(ev) {
+  for (const cls in CARD_ACTIONS) {
+    const btn = ev.target.closest('.' + cls);
+    if (btn) { CARD_ACTIONS[cls](btn); return; }
   }
-
-  setRunning(card, 'Re-reviewing…', 're_review');
-  streamJob(card, 're_review', repo, number, url, finishReReview);
-}
-
-function finishReReview(card, url, data) {
-  const actions = card.querySelector('.pr-actions');
-  if (data.status === 'stopped') {
-    actions.innerHTML = `
-      <span class="review-status stopped">⏹ Stopped</span>
-      <button class="btn-re-review" type="button">Re-review again</button>
-      <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-    `;
-    actions.querySelector('.btn-re-review').addEventListener('click', onReReview);
-    return;
-  }
-  let cls = 'failed', label = '❌ Failed';
-  if (data.status === 'done') {
-    if (data.result === 'approved') {
-      cls = 'approved'; label = '✅ Approved';
-    } else if ((data.result || '').startsWith('commented:')) {
-      const n = data.result.split(':')[1];
-      cls = 'commented';
-      label = `💬 ${n} pending comment${n === '1' ? '' : 's'} left`;
-    } else {
-      cls = 'commented'; label = 'ℹ Done';
-    }
-  }
-  actions.innerHTML = `
-    <span class="review-status ${cls}">${escapeHtml(label)}</span>
-    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
-  `;
 }
 
 function toast(msg, error) {
@@ -2985,6 +2800,8 @@ async function load(fresh) {
 }
 
 document.getElementById('refreshBtn').addEventListener('click', () => load(true));
+// Single delegated listener for all PR-card buttons across re-renders.
+document.getElementById('content').addEventListener('click', onContentClick);
 for (const el of document.querySelectorAll('.tab')) {
   el.addEventListener('click', () => {
     if (el.dataset.tab === currentTab) return;
