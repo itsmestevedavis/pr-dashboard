@@ -943,43 +943,40 @@ def derive_result(events, repo, number, me):
     return "no_action"
 
 
-def run_review(job):
-    number = job.number
-    repo = job.repo
+CLAUDE_BASE_ARGS = [
+    "--permission-mode", "bypassPermissions",
+    "--output-format", "stream-json",
+    "--verbose",
+]
+
+
+def _job_log_path(prefix, repo, number):
+    """Build (and ensure the dir for) a per-job log path."""
     os.makedirs(LOG_DIR, exist_ok=True)
-    safe_repo = repo.replace("/", "_")
-    log_path = f"{LOG_DIR}/{safe_repo}-{number}-{int(time.time())}.log"
-    job.log_path = log_path
-    job.append(f"Starting review of #{number} in {repo}")
-    print(f"[review] starting #{number} in {repo} (log: {log_path})", flush=True)
+    return f"{LOG_DIR}/{prefix}{repo_flat(repo)}-{number}-{int(time.time())}.log"
 
-    try:
-        workflow = _load_workflow(REVIEW_WORKFLOW)
-    except FileNotFoundError:
-        job.append(f"Review workflow file not found: {REVIEW_WORKFLOW}")
-        job.append("Use the Status tab to create it.")
-        job.finish("failed", "missing_workflow")
-        return
 
-    prompt = REVIEW_PROMPT.format(number=number, repo=repo) + workflow
+def _stream_claude_job(job, prompt, log_path, *, cwd=None, stop_verb="Stopped."):
+    """Spawn `claude -p`, stream stdout to the log file and job, handle exit.
+
+    Returns the list of parsed JSON events on success (exit 0). Returns None if
+    the job has already been finished here (spawn failure, stream error, stop, or
+    non-zero exit) — callers should return immediately without deriving a result.
+    """
     events = []
     try:
         proc = subprocess.Popen(
-            [
-                "claude", "-p", prompt,
-                "--permission-mode", "bypassPermissions",
-                "--output-format", "stream-json",
-                "--verbose",
-            ],
+            ["claude", "-p", prompt, *CLAUDE_BASE_ARGS],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            cwd=cwd,
         )
     except Exception as e:
         job.append(f"Failed to spawn claude: {e}")
         job.finish("failed", "spawn_error")
-        return
+        return None
 
     job.proc = proc
 
@@ -1003,22 +1000,22 @@ def run_review(job):
     except Exception as e:
         job.append(f"Stream error: {e}")
         job.finish("failed", "stream_error")
-        return
+        return None
 
     if proc.returncode != 0:
         if job._stop_requested:
-            job.append("Review stopped.")
+            job.append(stop_verb)
             job.finish("stopped", "stopped")
         else:
             job.append(f"claude exited with code {proc.returncode}")
             job.finish("failed", f"exit:{proc.returncode}")
-        return
+        return None
 
-    try:
-        me = get_my_login()
-    except Exception:
-        me = None
-    result = derive_result(events, repo, number, me)
+    return events
+
+
+def _review_result_label(result):
+    """Map a derive_result() string to a human label for review/re-review."""
     label = {
         "approved": "Approved PR ✓",
         "no_action": "Finished (no GitHub action taken)",
@@ -1026,97 +1023,52 @@ def run_review(job):
     if label is None and result.startswith("commented:"):
         n = result.split(":", 1)[1]
         label = f"Posted {n} pending comment(s)"
-    job.append(label or f"Finished: {result}")
+    return label
+
+
+def _run_review_job(job, log_prefix, workflow_path, prompt_template, log_tag, stop_verb):
+    """Shared body for review and re-review (identical except labels/paths)."""
+    number, repo = job.number, job.repo
+    log_path = _job_log_path(log_prefix, repo, number)
+    job.log_path = log_path
+    job.append(f"Starting {log_tag} of #{number} in {repo}")
+    print(f"[{log_tag}] starting #{number} in {repo} (log: {log_path})", flush=True)
+
+    try:
+        workflow = _load_workflow(workflow_path)
+    except FileNotFoundError:
+        job.append(f"Workflow file not found: {workflow_path}")
+        job.append("Use the Status tab to create it.")
+        job.finish("failed", "missing_workflow")
+        return
+
+    prompt = prompt_template.format(number=number, repo=repo) + workflow
+    events = _stream_claude_job(job, prompt, log_path, stop_verb=stop_verb)
+    if events is None:
+        return
+
+    try:
+        me = get_my_login()
+    except Exception:
+        me = None
+    result = derive_result(events, repo, number, me)
+    job.append(_review_result_label(result) or f"Finished: {result}")
     job.finish("done", result)
-    print(f"[review] finished #{number} result={result}", flush=True)
+    print(f"[{log_tag}] finished #{number} result={result}", flush=True)
+
+
+def run_review(job):
+    _run_review_job(
+        job, "", REVIEW_WORKFLOW, REVIEW_PROMPT,
+        log_tag="review", stop_verb="Review stopped.",
+    )
 
 
 def run_re_review(job):
-    number = job.number
-    repo = job.repo
-    os.makedirs(LOG_DIR, exist_ok=True)
-    safe_repo = repo.replace("/", "_")
-    log_path = f"{LOG_DIR}/re-review-{safe_repo}-{number}-{int(time.time())}.log"
-    job.log_path = log_path
-    job.append(f"Starting re-review of #{number} in {repo}")
-    print(f"[re-review] starting #{number} in {repo} (log: {log_path})", flush=True)
-
-    try:
-        workflow = _load_workflow(RE_REVIEW_WORKFLOW)
-    except FileNotFoundError:
-        job.append(f"Re-review workflow file not found: {RE_REVIEW_WORKFLOW}")
-        job.append("Use the Status tab to create it.")
-        job.finish("failed", "missing_workflow")
-        return
-
-    prompt = RE_REVIEW_PROMPT.format(number=number, repo=repo) + workflow
-    events = []
-    try:
-        proc = subprocess.Popen(
-            [
-                "claude", "-p", prompt,
-                "--permission-mode", "bypassPermissions",
-                "--output-format", "stream-json",
-                "--verbose",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-    except Exception as e:
-        job.append(f"Failed to spawn claude: {e}")
-        job.finish("failed", "spawn_error")
-        return
-
-    job.proc = proc
-
-    try:
-        with open(log_path, "w") as logf:
-            for line in proc.stdout:
-                logf.write(line)
-                logf.flush()
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                events.append(ev)
-                friendly = format_event(ev)
-                if friendly:
-                    job.append(friendly)
-        proc.wait()
-    except Exception as e:
-        job.append(f"Stream error: {e}")
-        job.finish("failed", "stream_error")
-        return
-
-    if proc.returncode != 0:
-        if job._stop_requested:
-            job.append("Re-review stopped.")
-            job.finish("stopped", "stopped")
-        else:
-            job.append(f"claude exited with code {proc.returncode}")
-            job.finish("failed", f"exit:{proc.returncode}")
-        return
-
-    try:
-        me = get_my_login()
-    except Exception:
-        me = None
-    result = derive_result(events, repo, number, me)
-    label = {
-        "approved": "Approved PR ✓",
-        "no_action": "Finished (no GitHub action taken)",
-    }.get(result)
-    if label is None and result.startswith("commented:"):
-        n = result.split(":", 1)[1]
-        label = f"Posted {n} pending comment(s)"
-    job.append(label or f"Finished: {result}")
-    job.finish("done", result)
-    print(f"[re-review] finished #{number} result={result}", flush=True)
+    _run_review_job(
+        job, "re-review-", RE_REVIEW_WORKFLOW, RE_REVIEW_PROMPT,
+        log_tag="re-review", stop_verb="Re-review stopped.",
+    )
 
 
 # ---- Merge dispatch --------------------------------------------------------
@@ -1287,85 +1239,57 @@ def derive_address_result(events):
     }
 
 
-def run_address(job, head_ref):
-    """Spawn Claude in a worktree to address PR comments."""
-    repo = job.repo
-    number = job.number
+def _run_worktree_job(job, head_ref, *, log_prefix, workflow_path, log_tag, build_prompt):
+    """Shared body for the worktree-based jobs (address / fix-pipeline / rebase).
 
+    Refreshes the per-repo agent clone under its lock, loads the workflow, builds
+    the prompt via build_prompt(local_branch, workflow), and streams claude in the
+    clone. Returns the parsed events on success, or None if the job was already
+    finished here (clone failure, missing workflow, or any _stream_claude_job exit).
+    """
+    repo, number = job.repo, job.number
     with get_repo_lock(repo):
         try:
             clone_path, local_branch = prepare_agent_clone(repo, head_ref)
         except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or "").strip()
-            job.append(f"Agent-clone setup failed: {stderr}")
+            job.append(f"Agent-clone setup failed: {(e.stderr or '').strip()}")
             job.finish("failed", "clone_error")
-            return
+            return None
 
-        os.makedirs(LOG_DIR, exist_ok=True)
-        log_path = f"{LOG_DIR}/address-{repo_flat(repo)}-{number}-{int(time.time())}.log"
+        log_path = _job_log_path(log_prefix, repo, number)
         job.log_path = log_path
         job.append(f"Agent clone ready at {clone_path} (branch: {local_branch})")
-        print(f"[address] starting #{number} in {repo} (clone: {clone_path})", flush=True)
+        print(f"[{log_tag}] starting #{number} in {repo} (clone: {clone_path})", flush=True)
 
         try:
-            workflow = _load_workflow(ADDRESS_WORKFLOW)
+            workflow = _load_workflow(workflow_path)
         except FileNotFoundError:
-            job.append(f"Address workflow file not found: {ADDRESS_WORKFLOW}")
+            job.append(f"Workflow file not found: {workflow_path}")
             job.append("Use the Status tab to create it.")
             job.finish("failed", "missing_workflow")
-            return
+            return None
 
-        prompt = ADDRESS_PROMPT.format(
-            number=number, repo=repo,
+        return _stream_claude_job(
+            job, build_prompt(local_branch, workflow), log_path, cwd=clone_path,
+        )
+
+
+def run_address(job, head_ref):
+    """Spawn Claude in a worktree to address PR comments."""
+    events = _run_worktree_job(
+        job, head_ref,
+        log_prefix="address-", workflow_path=ADDRESS_WORKFLOW, log_tag="address",
+        build_prompt=lambda local_branch, workflow: ADDRESS_PROMPT.format(
+            number=job.number, repo=job.repo,
             head_ref=head_ref, local_branch=local_branch,
-        ) + workflow
-        events = []
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                ["claude", "-p", prompt,
-                 "--permission-mode", "bypassPermissions",
-                 "--output-format", "stream-json",
-                 "--verbose"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-                cwd=clone_path,
-            )
-            job.proc = proc
-            with open(log_path, "w") as logf:
-                for line in proc.stdout:
-                    logf.write(line)
-                    logf.flush()
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    events.append(ev)
-                    friendly = format_event(ev)
-                    if friendly:
-                        job.append(friendly)
-            proc.wait()
-        except Exception as e:
-            job.append(f"Stream error: {e}")
-            job.finish("failed", "stream_error")
-            return
-
-        if proc.returncode != 0:
-            if job._stop_requested:
-                job.append("Stopped.")
-                job.finish("stopped", "stopped")
-            else:
-                job.append(f"claude exited with code {proc.returncode}")
-                job.finish("failed", f"exit:{proc.returncode}")
-            return
-
-        result = derive_address_result(events)
-        job.append(result["label"])
-        job.finish("done", result["label"])
-        print(f"[address] finished #{number} result={result['label']}", flush=True)
+        ) + workflow,
+    )
+    if events is None:
+        return
+    result = derive_address_result(events)
+    job.append(result["label"])
+    job.finish("done", result["label"])
+    print(f"[address] finished #{job.number} result={result['label']}", flush=True)
 
 
 # ---- Fix-pipeline dispatch -------------------------------------------------
@@ -1380,80 +1304,19 @@ FIX_PIPELINE_PROMPT = (
 
 def run_fix_pipeline(job, head_ref: str) -> None:
     """Spawn Claude in a worktree to diagnose and fix failing CI checks."""
-    repo = job.repo
-    number = job.number
-
-    with get_repo_lock(repo):
-        try:
-            clone_path, local_branch = prepare_agent_clone(repo, head_ref)
-        except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or "").strip()
-            job.append(f"Agent-clone setup failed: {stderr}")
-            job.finish("failed", "clone_error")
-            return
-
-        os.makedirs(LOG_DIR, exist_ok=True)
-        log_path = f"{LOG_DIR}/fix-pipeline-{repo_flat(repo)}-{number}-{int(time.time())}.log"
-        job.log_path = log_path
-        job.append(f"Agent clone ready at {clone_path} (branch: {local_branch})")
-        print(f"[fix-pipeline] starting #{number} in {repo} (clone: {clone_path})", flush=True)
-
-        try:
-            workflow = _load_workflow(FIX_PIPELINE_WORKFLOW)
-        except FileNotFoundError:
-            job.append(f"Fix-pipeline workflow file not found: {FIX_PIPELINE_WORKFLOW}")
-            job.append("Use the Status tab to create it.")
-            job.finish("failed", "missing_workflow")
-            return
-
-        prompt = FIX_PIPELINE_PROMPT.format(
-            number=number, repo=repo,
+    events = _run_worktree_job(
+        job, head_ref,
+        log_prefix="fix-pipeline-", workflow_path=FIX_PIPELINE_WORKFLOW, log_tag="fix-pipeline",
+        build_prompt=lambda local_branch, workflow: FIX_PIPELINE_PROMPT.format(
+            number=job.number, repo=job.repo,
             head_ref=head_ref, local_branch=local_branch,
-        ) + workflow
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                ["claude", "-p", prompt,
-                 "--permission-mode", "bypassPermissions",
-                 "--output-format", "stream-json",
-                 "--verbose"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-                cwd=clone_path,
-            )
-            job.proc = proc
-            with open(log_path, "w") as logf:
-                for line in proc.stdout:
-                    logf.write(line)
-                    logf.flush()
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    friendly = format_event(ev)
-                    if friendly:
-                        job.append(friendly)
-            proc.wait()
-        except Exception as e:
-            job.append(f"Stream error: {e}")
-            job.finish("failed", "stream_error")
-            return
-
-        if proc.returncode != 0:
-            if job._stop_requested:
-                job.append("Stopped.")
-                job.finish("stopped", "stopped")
-            else:
-                job.append(f"claude exited with code {proc.returncode}")
-                job.finish("failed", f"exit:{proc.returncode}")
-            return
-
-        job.append("Pipeline fix complete.")
-        job.finish("done", "pipeline_fixed")
-        print(f"[fix-pipeline] finished #{number}", flush=True)
+        ) + workflow,
+    )
+    if events is None:
+        return
+    job.append("Pipeline fix complete.")
+    job.finish("done", "pipeline_fixed")
+    print(f"[fix-pipeline] finished #{job.number}", flush=True)
 
 
 # ---- Rebase dispatch -------------------------------------------------------
@@ -1469,82 +1332,21 @@ REBASE_PROMPT = (
 
 def run_rebase(job, head_ref: str, base_ref: str) -> None:
     """Spawn Claude in a worktree to rebase the PR branch onto its base."""
-    repo = job.repo
-    number = job.number
-
-    with get_repo_lock(repo):
-        try:
-            clone_path, local_branch = prepare_agent_clone(repo, head_ref)
-        except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or "").strip()
-            job.append(f"Agent-clone setup failed: {stderr}")
-            job.finish("failed", "clone_error")
-            return
-
-        os.makedirs(LOG_DIR, exist_ok=True)
-        log_path = f"{LOG_DIR}/rebase-{repo_flat(repo)}-{number}-{int(time.time())}.log"
-        job.log_path = log_path
-        job.append(f"Agent clone ready at {clone_path} (branch: {local_branch})")
-        print(f"[rebase] starting #{number} in {repo} (clone: {clone_path})", flush=True)
-
-        try:
-            workflow = _load_workflow(REBASE_WORKFLOW)
-        except FileNotFoundError:
-            job.append(f"Rebase workflow file not found: {REBASE_WORKFLOW}")
-            job.append("Use the Status tab to create it.")
-            job.finish("failed", "missing_workflow")
-            return
-
-        prompt = REBASE_PROMPT.format(
-            number=number, repo=repo,
+    events = _run_worktree_job(
+        job, head_ref,
+        log_prefix="rebase-", workflow_path=REBASE_WORKFLOW, log_tag="rebase",
+        build_prompt=lambda local_branch, workflow: REBASE_PROMPT.format(
+            number=job.number, repo=job.repo,
             head_ref=head_ref, local_branch=local_branch, base_ref=base_ref,
         ) + workflow.format(
             base_ref=base_ref, head_ref=head_ref, local_branch=local_branch,
-        )
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                ["claude", "-p", prompt,
-                 "--permission-mode", "bypassPermissions",
-                 "--output-format", "stream-json",
-                 "--verbose"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-                cwd=clone_path,
-            )
-            job.proc = proc
-            with open(log_path, "w") as logf:
-                for line in proc.stdout:
-                    logf.write(line)
-                    logf.flush()
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    friendly = format_event(ev)
-                    if friendly:
-                        job.append(friendly)
-            proc.wait()
-        except Exception as e:
-            job.append(f"Stream error: {e}")
-            job.finish("failed", "stream_error")
-            return
-
-        if proc.returncode != 0:
-            if job._stop_requested:
-                job.append("Stopped.")
-                job.finish("stopped", "stopped")
-            else:
-                job.append(f"claude exited with code {proc.returncode}")
-                job.finish("failed", f"exit:{proc.returncode}")
-            return
-
-        job.append("Rebase complete.")
-        job.finish("done", "rebased")
-        print(f"[rebase] finished #{number}", flush=True)
+        ),
+    )
+    if events is None:
+        return
+    job.append("Rebase complete.")
+    job.finish("done", "rebased")
+    print(f"[rebase] finished #{job.number}", flush=True)
 
 
 # ---- Nudge dispatch --------------------------------------------------------
@@ -1597,10 +1399,8 @@ def derive_nudge_result(events, mode="re_review"):
 
 def run_nudge(job, url, title, reviewers, mode):
     """Spawn Claude to DM the reviewers on Slack via the Slack MCP."""
-    repo = job.repo
-    number = job.number
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = f"{LOG_DIR}/nudge-{repo_flat(repo)}-{number}-{int(time.time())}.log"
+    repo, number = job.repo, job.number
+    log_path = _job_log_path("nudge-", repo, number)
     job.log_path = log_path
     venue = (
         f"#channel {TEAM_CHANNEL_ID}" if mode == "channel"
@@ -1621,51 +1421,55 @@ def run_nudge(job, url, title, reviewers, mode):
         url=url, title=title, reviewers=", ".join(reviewers),
         mode=mode, channel=TEAM_CHANNEL_ID,
     ) + "\n" + workflow
-    events = []
-    try:
-        proc = subprocess.Popen(
-            ["claude", "-p", prompt,
-             "--permission-mode", "bypassPermissions",
-             "--output-format", "stream-json",
-             "--verbose"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        job.proc = proc
-        with open(log_path, "w") as logf:
-            for line in proc.stdout:
-                logf.write(line)
-                logf.flush()
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                events.append(ev)
-                friendly = format_event(ev)
-                if friendly:
-                    job.append(friendly)
-        proc.wait()
-    except Exception as e:
-        job.append(f"Stream error: {e}")
-        job.finish("failed", "stream_error")
-        return
-
-    if proc.returncode != 0:
-        if job._stop_requested:
-            job.append("Stopped.")
-            job.finish("stopped", "stopped")
-        else:
-            job.append(f"claude exited with code {proc.returncode}")
-            job.finish("failed", f"exit:{proc.returncode}")
+    events = _stream_claude_job(job, prompt, log_path)
+    if events is None:
         return
 
     result = derive_nudge_result(events, mode=mode)
     job.append(result["label"])
     job.finish("done", result["label"])
     print(f"[nudge] finished #{number} result={result['label']}", flush=True)
+
+
+# ---- Job POST routing ------------------------------------------------------
+
+def _req_ref(data, key):
+    """Pull a required, non-empty ref string from a request body."""
+    val = str(data[key])
+    if not val:
+        raise ValueError(f"{key} required")
+    return val
+
+
+def _extract_merge(d):
+    return (str(d.get("defaultMergeMethod") or "MERGE"),)
+
+
+def _extract_nudge(d):
+    url = str(d["url"])
+    title = str(d.get("title") or "")
+    reviewers = [str(r) for r in (d.get("reviewers") or []) if r]
+    mode = str(d.get("mode") or "re_review")
+    if mode not in ("re_review", "fresh", "channel"):
+        raise ValueError("mode must be re_review, fresh, or channel")
+    if not reviewers:
+        raise ValueError("no reviewers to nudge")
+    return (url, title, reviewers, mode)
+
+
+# path -> (job kind, runner fn, extract-extra-args fn or None).
+# The dispatcher (_dispatch_job_post) handles the shared number/repo parse,
+# job creation, thread spawn, and 202 envelope; `extract` returns the extra
+# positional args each runner needs (and may raise to reject the request).
+_JOB_POST_ROUTES = {
+    "/api/review":       ("review",       run_review,       None),
+    "/api/re-review":    ("re_review",    run_re_review,    None),
+    "/api/merge":        ("merge",        run_merge,        _extract_merge),
+    "/api/address":      ("address",      run_address,      lambda d: (_req_ref(d, "headRefName"),)),
+    "/api/fix-pipeline": ("fix_pipeline", run_fix_pipeline, lambda d: (_req_ref(d, "headRefName"),)),
+    "/api/rebase":       ("rebase",       run_rebase,       lambda d: (_req_ref(d, "headRefName"), _req_ref(d, "baseRefName"))),
+    "/api/nudge":        ("nudge",        run_nudge,        _extract_nudge),
+}
 
 
 # ---- HTTP server -----------------------------------------------------------
@@ -3611,26 +3415,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/api/review":
-            self._handle_review_post()
-            return
-        if parsed.path == "/api/re-review":
-            self._handle_re_review_post()
-            return
-        if parsed.path == "/api/merge":
-            self._handle_merge_post()
-            return
-        if parsed.path == "/api/address":
-            self._handle_address_post()
-            return
-        if parsed.path == "/api/fix-pipeline":
-            self._handle_fix_pipeline_post()
-            return
-        if parsed.path == "/api/rebase":
-            self._handle_rebase_post()
-            return
-        if parsed.path == "/api/nudge":
-            self._handle_nudge_post()
+        route = _JOB_POST_ROUTES.get(parsed.path)
+        if route:
+            self._dispatch_job_post(*route)
             return
         if parsed.path == "/api/job/stop":
             self._handle_stop_post()
@@ -3660,147 +3447,34 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         return json.loads(raw) if raw else {}
 
-    def _handle_review_post(self):
+    def _dispatch_job_post(self, kind, runner, extract):
+        """Shared handler for all job-spawning POST routes (see _JOB_POST_ROUTES).
+
+        Parses the common number/repo fields, runs the route's `extract` for any
+        extra runner args (which may raise to reject), creates/dedupes the job,
+        spawns the runner thread, and returns the standard 202 envelope.
+        """
         try:
             data = self._read_json_body()
             number = int(data["number"])
             repo = str(data["repo"])
             if "/" not in repo:
                 raise ValueError("repo must be owner/name")
+            extra = extract(data) if extract else ()
         except Exception as e:
             self._send_json(400, {"error": f"bad request: {e}"})
             return
-        job, started = get_or_create_job(repo, number, "review")
+        job, started = get_or_create_job(repo, number, kind)
         if started:
             threading.Thread(
-                target=run_review, args=(job,), daemon=True,
+                target=runner, args=(job, *extra), daemon=True,
             ).start()
         self._send_json(202, {
             "started": started,
             "running": True,
             "number": number,
             "repo": repo,
-            "kind": "review",
-        })
-
-    def _handle_re_review_post(self):
-        try:
-            data = self._read_json_body()
-            number = int(data["number"])
-            repo = str(data["repo"])
-            if "/" not in repo:
-                raise ValueError("repo must be owner/name")
-        except Exception as e:
-            self._send_json(400, {"error": f"bad request: {e}"})
-            return
-        job, started = get_or_create_job(repo, number, "re_review")
-        if started:
-            threading.Thread(
-                target=run_re_review, args=(job,), daemon=True,
-            ).start()
-        self._send_json(202, {
-            "started": started,
-            "running": True,
-            "number": number,
-            "repo": repo,
-            "kind": "re_review",
-        })
-
-    def _handle_merge_post(self):
-        try:
-            data = self._read_json_body()
-            number = int(data["number"])
-            repo = str(data["repo"])
-            default_method = str(data.get("defaultMergeMethod") or "MERGE")
-            if "/" not in repo:
-                raise ValueError("repo must be owner/name")
-        except Exception as e:
-            self._send_json(400, {"error": f"bad request: {e}"})
-            return
-        job, started = get_or_create_job(repo, number, "merge")
-        if started:
-            threading.Thread(
-                target=run_merge, args=(job, default_method), daemon=True,
-            ).start()
-        self._send_json(202, {
-            "started": started,
-            "running": True,
-            "number": number,
-            "repo": repo,
-            "kind": "merge",
-        })
-
-    def _handle_address_post(self):
-        try:
-            data = self._read_json_body()
-            number = int(data["number"])
-            repo = str(data["repo"])
-            head_ref = str(data["headRefName"])
-            if "/" not in repo or not head_ref:
-                raise ValueError("repo must be owner/name and headRefName required")
-        except Exception as e:
-            self._send_json(400, {"error": f"bad request: {e}"})
-            return
-        job, started = get_or_create_job(repo, number, "address")
-        if started:
-            threading.Thread(
-                target=run_address, args=(job, head_ref), daemon=True,
-            ).start()
-        self._send_json(202, {
-            "started": started,
-            "running": True,
-            "number": number,
-            "repo": repo,
-            "kind": "address",
-        })
-
-    def _handle_fix_pipeline_post(self):
-        try:
-            data = self._read_json_body()
-            number = int(data["number"])
-            repo = str(data["repo"])
-            head_ref = str(data["headRefName"])
-            if "/" not in repo or not head_ref:
-                raise ValueError("repo must be owner/name and headRefName required")
-        except Exception as e:
-            self._send_json(400, {"error": f"bad request: {e}"})
-            return
-        job, started = get_or_create_job(repo, number, "fix_pipeline")
-        if started:
-            threading.Thread(
-                target=run_fix_pipeline, args=(job, head_ref), daemon=True,
-            ).start()
-        self._send_json(202, {
-            "started": started,
-            "running": True,
-            "number": number,
-            "repo": repo,
-            "kind": "fix_pipeline",
-        })
-
-    def _handle_rebase_post(self):
-        try:
-            data = self._read_json_body()
-            number = int(data["number"])
-            repo = str(data["repo"])
-            head_ref = str(data["headRefName"])
-            base_ref = str(data["baseRefName"])
-            if "/" not in repo or not head_ref or not base_ref:
-                raise ValueError("repo, headRefName, and baseRefName are required")
-        except Exception as e:
-            self._send_json(400, {"error": f"bad request: {e}"})
-            return
-        job, started = get_or_create_job(repo, number, "rebase")
-        if started:
-            threading.Thread(
-                target=run_rebase, args=(job, head_ref, base_ref), daemon=True,
-            ).start()
-        self._send_json(202, {
-            "started": started,
-            "running": True,
-            "number": number,
-            "repo": repo,
-            "kind": "rebase",
+            "kind": kind,
         })
 
     def _handle_stop_post(self):
@@ -3978,39 +3652,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         print(f"[deploy] dispatched '{workflow_name}' on {repo}@{head_ref} for {env}", flush=True)
         self._send_json(200, {"ok": True})
-
-    def _handle_nudge_post(self):
-        try:
-            data = self._read_json_body()
-            number = int(data["number"])
-            repo = str(data["repo"])
-            url = str(data["url"])
-            title = str(data.get("title") or "")
-            reviewers = data.get("reviewers") or []
-            mode = str(data.get("mode") or "re_review")
-            if "/" not in repo:
-                raise ValueError("repo must be owner/name")
-            if mode not in ("re_review", "fresh", "channel"):
-                raise ValueError("mode must be re_review, fresh, or channel")
-            reviewers = [str(r) for r in reviewers if r]
-            if not reviewers:
-                raise ValueError("no reviewers to nudge")
-        except Exception as e:
-            self._send_json(400, {"error": f"bad request: {e}"})
-            return
-        job, started = get_or_create_job(repo, number, "nudge")
-        if started:
-            threading.Thread(
-                target=run_nudge, args=(job, url, title, reviewers, mode), daemon=True,
-            ).start()
-        self._send_json(202, {
-            "started": started,
-            "running": True,
-            "number": number,
-            "repo": repo,
-            "kind": "nudge",
-        })
-
 
 def main():
     try:
