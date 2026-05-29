@@ -281,6 +281,14 @@ query($q: String!) {
             commit {
               statusCheckRollup {
                 state
+                contexts(first: 100) {
+                  totalCount
+                  nodes {
+                    __typename
+                    ... on CheckRun { name conclusion status detailsUrl }
+                    ... on StatusContext { context state targetUrl }
+                  }
+                }
               }
             }
           }
@@ -290,6 +298,52 @@ query($q: String!) {
   }
 }
 """
+
+
+_CHECK_PASSED = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+_CHECK_FAILED = {
+    "FAILURE", "ERROR", "TIMED_OUT", "CANCELLED",
+    "ACTION_REQUIRED", "STARTUP_FAILURE",
+}
+
+
+def summarize_checks(rollup: dict) -> dict:
+    """Bucket a statusCheckRollup's contexts into passed/pending/failed.
+
+    Normalizes both node types: CheckRun (GitHub Actions etc.) uses
+    status/conclusion, while the legacy StatusContext uses a single state.
+    Returns {passed: int, pending: [{name,url}], failed: [{name,url}], truncated: bool}.
+    Greens are counted (not named); pending/failed are named with a details URL.
+    """
+    contexts = (rollup.get("contexts") or {})
+    nodes = contexts.get("nodes") or []
+    passed = 0
+    pending: list = []
+    failed: list = []
+    for node in nodes:
+        if node.get("__typename") == "CheckRun":
+            name = node.get("name") or "check"
+            url = node.get("detailsUrl") or ""
+            # An incomplete CheckRun has no conclusion yet -> pending.
+            verdict = node.get("conclusion") if node.get("status") == "COMPLETED" else None
+        else:  # StatusContext (legacy commit status)
+            name = node.get("context") or "check"
+            url = node.get("targetUrl") or ""
+            verdict = node.get("state")
+        verdict = (verdict or "").upper()
+        if verdict in _CHECK_PASSED:
+            passed += 1
+        elif verdict in _CHECK_FAILED:
+            failed.append({"name": name, "url": url})
+        else:
+            pending.append({"name": name, "url": url})
+    total = contexts.get("totalCount") or len(nodes)
+    return {
+        "passed": passed,
+        "pending": pending,
+        "failed": failed,
+        "truncated": total > len(nodes),
+    }
 
 
 def list_my_prs():
@@ -334,6 +388,7 @@ def list_my_prs():
             ),
             "review_decision": pr.get("reviewDecision") or "",
             "check_state": rollup.get("state") or "",
+            "checks": summarize_checks(rollup),
             "merge_state_status": pr.get("mergeStateStatus") or "",
             **status,
         })
@@ -1554,6 +1609,13 @@ INDEX_HTML = r"""<!doctype html>
   .pr-title a:hover { color: var(--blue); }
   .pr-sub { color: var(--muted); font-size: 12px; }
   .pr-detail { color: var(--muted); font-size: 12px; margin-top: 4px; font-style: italic; }
+  .pr-checks { font-size: 12px; margin-top: 4px; display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
+  .pr-checks .chk { white-space: normal; }
+  .pr-checks .chk-pass { color: var(--muted); }
+  .pr-checks .chk-pending { color: #d29922; }
+  .pr-checks .chk-fail { color: #f85149; }
+  .pr-checks .chk-name { color: inherit; text-decoration: none; border-bottom: 1px dotted currentColor; }
+  .pr-checks .chk-name:hover { text-decoration: none; opacity: 0.85; }
   .badge {
     display: inline-block;
     padding: 2px 8px;
@@ -2056,6 +2118,24 @@ function renderIncomingPR(p) {
   </div>`;
 }
 
+// Compact per-check summary line: greens collapse to a count; pending/failed
+// checks are named and linked to their logs. Returns '' when there are no checks.
+function renderChecks(p) {
+  const c = p.checks;
+  if (!c) return '';
+  const total = c.passed + (c.pending || []).length + (c.failed || []).length;
+  if (!total) return '';
+  const linkNames = (list) => list.map(ck => ck.url
+    ? `<a class="chk-name" href="${escapeHtml(ck.url)}" target="_blank" rel="noopener">${escapeHtml(ck.name)}</a>`
+    : `<span class="chk-name">${escapeHtml(ck.name)}</span>`).join(', ');
+  const parts = [];
+  if (c.passed) parts.push(`<span class="chk chk-pass">✅ ${c.passed}</span>`);
+  if ((c.pending || []).length) parts.push(`<span class="chk chk-pending">🔄 ${linkNames(c.pending)}</span>`);
+  if ((c.failed || []).length) parts.push(`<span class="chk chk-fail">❌ ${linkNames(c.failed)}</span>`);
+  if (c.truncated) parts.push(`<span class="chk">…</span>`);
+  return `<div class="pr-checks">${parts.join(' · ')}</div>`;
+}
+
 function renderMyPR(p) {
   const commenters = p.active_commenters && p.active_commenters.length
     ? `<div class="pr-detail">From: ${escapeHtml(p.active_commenters.join(', '))}</div>`
@@ -2130,6 +2210,7 @@ function renderMyPR(p) {
       <div class="pr-meta">${escapeHtml(p.repository)} · #${p.number}<span class="badge badge-${p.status}">${escapeHtml(p.status_label)}</span>${needsRebase ? '<span class="badge-warning">⚠ Needs rebase</span>' : hasConflicts ? '<span class="badge-warning">⚠ Has conflicts</span>' : ''}</div>
       <div class="pr-title"><a href="${escapeHtml(p.url)}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
       <div class="pr-sub">updated ${relativeTime(p.updatedAt)}</div>
+      ${renderChecks(p)}
       ${commenters}
     </div>
     <div class="pr-actions">
