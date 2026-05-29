@@ -2116,12 +2116,12 @@ function renderIncomingPR(p) {
   <div class="pr" data-number="${p.number}" data-repo="${escapeHtml(p.repository)}" data-url="${escapeHtml(p.url)}">
     <div class="pr-main">
       <div class="pr-meta">${escapeHtml(p.repository)} · #${p.number}<span class="badge badge-${p.status}">${escapeHtml(p.status_label)}</span></div>
-      <div class="pr-title"><a href="${escapeHtml(p.url)}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
+      <div class="pr-title"><a href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
       <div class="pr-sub">by ${escapeHtml(p.author)} · updated ${relativeTime(p.updatedAt)}</div>
       ${detail}
     </div>
     <div class="pr-actions">
-      <a class="btn-open" href="${escapeHtml(p.url)}" target="_blank" rel="noopener">Open ↗</a>
+      <a class="btn-open" href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">Open ↗</a>
       ${actionBtn}
     </div>
   </div>`;
@@ -2220,13 +2220,13 @@ function renderMyPR(p) {
        data-mode="${escapeHtml(mode)}">
     <div class="pr-main">
       <div class="pr-meta">${escapeHtml(p.repository)} · #${p.number}<span class="badge badge-${p.status}">${escapeHtml(p.status_label)}</span>${needsRebase ? '<span class="badge-warning">⚠ Needs rebase</span>' : hasConflicts ? '<span class="badge-warning">⚠ Has conflicts</span>' : ''}</div>
-      <div class="pr-title"><a href="${escapeHtml(p.url)}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
+      <div class="pr-title"><a href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
       <div class="pr-sub">updated ${relativeTime(p.updatedAt)}</div>
       ${renderChecks(p)}
       ${commenters}
     </div>
     <div class="pr-actions">
-      <a class="btn-open" href="${escapeHtml(p.url)}" target="_blank" rel="noopener">Open ↗</a>
+      <a class="btn-open" href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">Open ↗</a>
       ${deployControls}
       ${channelBtn}
       ${nudgeBtn}
@@ -2383,7 +2383,7 @@ async function onDeploy(btn) {
 function setFinalStatus(card, cls, label, url) {
   card.querySelector('.pr-actions').innerHTML =
     `<span class="review-status ${cls}">${escapeHtml(label)}</span>`
-    + `<a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>`;
+    + `<a class="btn-open" href="${escapeHtml(safeUrl(url))}" target="_blank" rel="noopener">Open PR ↗</a>`;
 }
 
 // Stopped state: pill + optional "…again" button (delegation re-wires it) + Open-PR.
@@ -2391,7 +2391,7 @@ function setStoppedStatus(card, url, againBtn) {
   card.querySelector('.pr-actions').innerHTML =
     `<span class="review-status stopped">⏹ Stopped</span>`
     + (againBtn || '')
-    + `<a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>`;
+    + `<a class="btn-open" href="${escapeHtml(safeUrl(url))}" target="_blank" rel="noopener">Open PR ↗</a>`;
 }
 
 function finishMerge(card, url, data) {
