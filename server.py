@@ -44,6 +44,10 @@ def _load_dotenv(path):
 
 
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+# Serializes .env rewrites and the config globals (FRESH_REVIEWERS, DEPLOY_TARGET,
+# etc.) that settings POSTs reassign while job threads / status GETs read them.
+# Reentrant so a handler can hold it across both write_env_var and the global update.
+_env_lock = threading.RLock()
 _load_dotenv(_ENV_PATH)
 
 
@@ -956,6 +960,18 @@ def _job_log_path(prefix, repo, number):
     return f"{LOG_DIR}/{prefix}{repo_flat(repo)}-{number}-{int(time.time())}.log"
 
 
+def _fill_refs(text, **refs):
+    """Substitute {key} placeholders in a user-editable workflow body.
+
+    Unlike str.format, this only touches the named keys via literal replace, so
+    stray braces in the file (JSON snippets, shell ${VAR}, etc.) pass through
+    untouched instead of raising KeyError/ValueError and killing the job.
+    """
+    for key, val in refs.items():
+        text = text.replace("{" + key + "}", val)
+    return text
+
+
 def _stream_claude_job(job, prompt, log_path, *, cwd=None, stop_verb="Stopped."):
     """Spawn `claude -p`, stream stdout to the log file and job, handle exit.
 
@@ -1338,8 +1354,8 @@ def run_rebase(job, head_ref: str, base_ref: str) -> None:
         build_prompt=lambda local_branch, workflow: REBASE_PROMPT.format(
             number=job.number, repo=job.repo,
             head_ref=head_ref, local_branch=local_branch, base_ref=base_ref,
-        ) + workflow.format(
-            base_ref=base_ref, head_ref=head_ref, local_branch=local_branch,
+        ) + _fill_refs(
+            workflow, base_ref=base_ref, head_ref=head_ref, local_branch=local_branch,
         ),
     )
     if events is None:
@@ -2818,25 +2834,30 @@ load(false);
 
 
 def write_env_var(key, value):
-    """Update or append key=value in the .env file and os.environ."""
-    try:
-        with open(_ENV_PATH) as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        lines = []
-    updated = False
-    new_lines = []
-    for line in lines:
-        if re.match(rf"^\s*{re.escape(key)}\s*=", line):
+    """Update or append key=value in the .env file and os.environ.
+
+    Holds _env_lock so concurrent settings saves can't interleave their
+    read-modify-write and corrupt the file.
+    """
+    with _env_lock:
+        try:
+            with open(_ENV_PATH) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            lines = []
+        updated = False
+        new_lines = []
+        for line in lines:
+            if re.match(rf"^\s*{re.escape(key)}\s*=", line):
+                new_lines.append(f"{key}={value}\n")
+                updated = True
+            else:
+                new_lines.append(line)
+        if not updated:
             new_lines.append(f"{key}={value}\n")
-            updated = True
-        else:
-            new_lines.append(line)
-    if not updated:
-        new_lines.append(f"{key}={value}\n")
-    with open(_ENV_PATH, "w") as f:
-        f.writelines(new_lines)
-    os.environ[key] = value
+        with open(_ENV_PATH, "w") as f:
+            f.writelines(new_lines)
+        os.environ[key] = value
 
 
 def get_status():
@@ -3110,11 +3131,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status, payload):
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected mid-response (e.g. closed a tab); nothing to do.
+            pass
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -3347,16 +3372,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "value required"})
             return
         try:
-            write_env_var(key, value)
+            with _env_lock:
+                write_env_var(key, value)
+                if key == "FRESH_REVIEWERS":
+                    FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
+                elif key == "TEAM_CHANNEL_ID":
+                    TEAM_CHANNEL_ID = value
+                elif key == "DEPLOY_TARGET":
+                    DEPLOY_TARGET = value
         except Exception as e:
             self._send_json(500, {"error": str(e)})
             return
-        if key == "FRESH_REVIEWERS":
-            FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
-        elif key == "TEAM_CHANNEL_ID":
-            TEAM_CHANNEL_ID = value
-        elif key == "DEPLOY_TARGET":
-            DEPLOY_TARGET = value
         self._send_json(200, {"ok": True})
 
     def _handle_settings_post(self):
@@ -3375,28 +3401,29 @@ class Handler(BaseHTTPRequestHandler):
         if unknown:
             self._send_json(403, {"error": f"unknown keys: {', '.join(sorted(unknown))}"})
             return
-        for key, value in settings.items():
-            value = str(value).strip()
-            if not value:
-                continue
-            try:
-                write_env_var(key, value)
-            except Exception as e:
-                self._send_json(500, {"error": f"failed to write {key}: {e}"})
-                return
-            if key == "FRESH_REVIEWERS":
-                FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
-            elif key == "TEAM_CHANNEL_ID":
-                TEAM_CHANNEL_ID = value
-            elif key == "DEPLOY_TARGET":
-                DEPLOY_TARGET = value
-            elif key == "CACHE_TTL":
+        with _env_lock:
+            for key, value in settings.items():
+                value = str(value).strip()
+                if not value:
+                    continue
                 try:
-                    CACHE_TTL = int(value)
-                except ValueError:
-                    pass
-            elif key == "EDITOR_CMD":
-                EDITOR_CMD = value
+                    write_env_var(key, value)
+                except Exception as e:
+                    self._send_json(500, {"error": f"failed to write {key}: {e}"})
+                    return
+                if key == "FRESH_REVIEWERS":
+                    FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
+                elif key == "TEAM_CHANNEL_ID":
+                    TEAM_CHANNEL_ID = value
+                elif key == "DEPLOY_TARGET":
+                    DEPLOY_TARGET = value
+                elif key == "CACHE_TTL":
+                    try:
+                        CACHE_TTL = int(value)
+                    except ValueError:
+                        pass
+                elif key == "EDITOR_CMD":
+                    EDITOR_CMD = value
         self._send_json(200, {"ok": True})
 
     def _handle_open_dir_post(self):
