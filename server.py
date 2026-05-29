@@ -2059,6 +2059,15 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// Only allow http(s) in hrefs. escapeHtml does NOT stop a javascript:/data: scheme,
+// and check URLs come from GitHub commit-status targetUrl (settable by CI/collaborators).
+function safeUrl(u) {
+  try {
+    const p = new URL(u);
+    return (p.protocol === 'https:' || p.protocol === 'http:') ? u : '';
+  } catch { return ''; }
+}
+
 function relativeTime(iso) {
   const t = new Date(iso).getTime();
   if (!t) return '';
@@ -2125,9 +2134,12 @@ function renderChecks(p) {
   if (!c) return '';
   const total = c.passed + (c.pending || []).length + (c.failed || []).length;
   if (!total) return '';
-  const linkNames = (list) => list.map(ck => ck.url
-    ? `<a class="chk-name" href="${escapeHtml(ck.url)}" target="_blank" rel="noopener">${escapeHtml(ck.name)}</a>`
-    : `<span class="chk-name">${escapeHtml(ck.name)}</span>`).join(', ');
+  const linkNames = (list) => list.map(ck => {
+    const href = safeUrl(ck.url);
+    return href
+      ? `<a class="chk-name" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(ck.name)}</a>`
+      : `<span class="chk-name">${escapeHtml(ck.name)}</span>`;
+  }).join(', ');
   const parts = [];
   if (c.passed) parts.push(`<span class="chk chk-pass">✅ ${c.passed}</span>`);
   if ((c.pending || []).length) parts.push(`<span class="chk chk-pending">🔄 ${linkNames(c.pending)}</span>`);
