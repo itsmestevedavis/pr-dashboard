@@ -2064,10 +2064,23 @@ function renderMyPR(p) {
   const mode = p.nudge_mode || '';
   const needsRebase = p.merge_state_status === 'BEHIND';
   const hasConflicts = p.merge_state_status === 'DIRTY';
+  const ciBlocked = ['FAILURE', 'ERROR'].includes(p.check_state);
+  const reviewBlocked = p.review_decision === 'CHANGES_REQUESTED';
+
+  // The infra-fix button surfaces whenever the branch is behind/conflicted or CI
+  // is failing — independent of review status, so a PR that also has comments
+  // still offers a way to fix the pipeline. Rebase takes precedence: a behind or
+  // conflicted branch must be rebased before its CI result means anything.
+  let infraFixBtn = '';
+  if (needsRebase || hasConflicts) {
+    const why = needsRebase ? 'Needs rebase' : 'Has conflicts';
+    infraFixBtn = `<button class="btn-rebase" type="button" title="Fix: ${escapeHtml(why)}">Rebase</button>`;
+  } else if (ciBlocked) {
+    infraFixBtn = `<button class="btn-fix-pipeline" type="button" title="Fix: CI failing">Fix pipeline</button>`;
+  }
+
   let actionBtn = '';
   if (p.status === 'approved') {
-    const ciBlocked = ['FAILURE', 'ERROR'].includes(p.check_state);
-    const reviewBlocked = p.review_decision === 'CHANGES_REQUESTED';
     const blocked = ciBlocked || reviewBlocked || needsRebase || hasConflicts;
     const reasons = [
       ciBlocked && 'CI failing',
@@ -2077,14 +2090,12 @@ function renderMyPR(p) {
     ].filter(Boolean);
     const blockReason = reasons.join(' · ');
     const mergeBtn = `<button class="btn-merge${blocked ? ' btn-merge-blocked' : ''}" type="button" ${blocked ? `disabled title="${escapeHtml(blockReason)}"` : ''}>Merge</button>`;
-    const fixClass = needsRebase || hasConflicts ? 'btn-rebase'
-      : ciBlocked ? 'btn-fix-pipeline' : 'btn-address';
-    const fixBtn = blocked
-      ? `<button class="${fixClass}" type="button" title="Fix: ${escapeHtml(blockReason)}">Fix</button>`
-      : '';
-    actionBtn = fixBtn + mergeBtn;
+    actionBtn = infraFixBtn + mergeBtn;
   } else if (p.status === 'has_comments') {
-    actionBtn = `<button class="btn-address" type="button">Address</button>`;
+    actionBtn = infraFixBtn + `<button class="btn-address" type="button">Address</button>`;
+  } else {
+    // not_reviewed_yet etc. — still expose an infra fix if the pipeline/branch is broken.
+    actionBtn = infraFixBtn;
   }
   const nudgeTargetNames = (p.nudge_targets || []).join(' and ') || 'reviewers';
   const channelTargetNames = (CONFIG.fresh_reviewers || []).join(' and ') || 'reviewers';
