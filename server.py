@@ -17,6 +17,10 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+import base64
+import urllib.error
+import urllib.parse
+import urllib.request
 
 # ---- Configuration ---------------------------------------------------------
 
@@ -105,6 +109,31 @@ DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
 
 # Editor command for opening the config folder. Empty = auto-detect (code → open/xdg-open).
 EDITOR_CMD = os.environ.get("EDITOR_CMD", "")
+
+# ---- Jira (assigned tickets) ----------------------------------------------
+def _normalize_jira_site(raw):
+    """Accept a Jira site as a bare host or a full URL; return just the host.
+
+    Users routinely paste "https://org.atlassian.net/"; the API URL is built as
+    https://{site}{path}, so a scheme/trailing slash here yields an unresolvable
+    host. Strip them at the boundary so both forms work.
+    """
+    return re.sub(r"^https?://", "", (raw or "").strip(), flags=re.IGNORECASE).rstrip("/")
+
+
+# Atlassian site host (e.g. "cognota.atlassian.net"), account email, and an API
+# token from id.atlassian.com. All three empty = Tickets tab shows a config hint.
+JIRA_SITE = _normalize_jira_site(os.environ.get("JIRA_SITE", ""))
+JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
+JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
+# Status names to show on the Tickets tab (comma list in .env). Empty = show all.
+JIRA_STATUS_FILTER = _env_list("JIRA_STATUS_FILTER")
+
+# Tickets assigned to me that are not finished, most-recently-updated first.
+JIRA_JQL = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+
+# Jira issue keys look like ABC-123 — validate before interpolating into API paths.
+_JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 
 
 def _is_human_author(author):
@@ -430,6 +459,111 @@ def get_my_login():
         data = gh_json(["api", "user"])
         _me = data["login"]
     return _me
+
+
+# ---- Jira helpers ----------------------------------------------------------
+
+def jira_configured():
+    """True only when all three Jira credentials are present."""
+    return bool(JIRA_SITE and JIRA_EMAIL and JIRA_API_TOKEN)
+
+
+def jira_request(method, path, params=None, body=None):
+    """Call the Jira Cloud REST API. Returns parsed JSON (None for empty body).
+
+    Raises RuntimeError with a readable message on any non-2xx or transport error.
+    """
+    url = f"https://{JIRA_SITE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    token = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Basic {token}")
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"Jira {method} {path} failed (HTTP {e.code}): {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Jira {method} {path} failed: {e.reason}")
+    return json.loads(raw) if raw.strip() else None
+
+
+def parse_ticket(issue, site):
+    """Map one Jira issue JSON object into the dashboard's ticket dict.
+
+    `status` carries the Jira statusCategory key ("new" | "indeterminate"),
+    which the frontend's group-by-status render() uses as the column key.
+    """
+    fields = issue.get("fields") or {}
+    status = fields.get("status") or {}
+    category = (status.get("statusCategory") or {}).get("key") or "new"
+    priority = fields.get("priority") or {}
+    issuetype = fields.get("issuetype") or {}
+    key = issue.get("key", "")
+    return {
+        "key": key,
+        "summary": fields.get("summary") or "",
+        "status": category,
+        "status_label": status.get("name") or "",
+        "status_category": category,
+        "priority": priority.get("name"),
+        "type": issuetype.get("name") or "",
+        "url": f"https://{site}/browse/{key}",
+        "updatedAt": fields.get("updated") or "",
+    }
+
+
+def jira_search():
+    """Return assigned, not-done tickets as a list of ticket dicts."""
+    data = jira_request("GET", "/rest/api/3/search/jql", params={
+        "jql": JIRA_JQL,
+        "fields": "summary,status,priority,issuetype,updated",
+        "maxResults": "100",
+    })
+    issues = (data or {}).get("issues") or []
+    return [parse_ticket(i, JIRA_SITE) for i in issues]
+
+
+def jira_transitions(key):
+    """Available workflow transitions for an issue: [{id, name}]."""
+    data = jira_request("GET", f"/rest/api/3/issue/{key}/transitions")
+    return [
+        {"id": t["id"], "name": t["name"]}
+        for t in (data or {}).get("transitions") or []
+    ]
+
+
+def jira_do_transition(key, transition_id):
+    """Move an issue through the given transition id."""
+    jira_request(
+        "POST", f"/rest/api/3/issue/{key}/transitions",
+        body={"transition": {"id": str(transition_id)}},
+    )
+
+
+def jira_statuses():
+    """Distinct, non-Done status names available in Jira.
+
+    Sorted by category (To Do before In Progress) then name. Done-category
+    statuses are dropped since the Tickets JQL never returns them.
+    """
+    data = jira_request("GET", "/rest/api/3/status")
+    cat_by_name = {}
+    for s in data or []:
+        category = (s.get("statusCategory") or {}).get("key") or "new"
+        if category == "done":
+            continue
+        name = s.get("name") or ""
+        if name and name not in cat_by_name:
+            cat_by_name[name] = category
+    rank = {"new": 0, "indeterminate": 1}
+    return sorted(cat_by_name, key=lambda n: (rank.get(cat_by_name[n], 2), n.lower()))
 
 
 # ---- PR enrichment ---------------------------------------------------------
@@ -1635,6 +1769,14 @@ INDEX_HTML = r"""<!doctype html>
   .badge-has_comments { background: #fb8500; color: #fff; }
   .badge-not_reviewed_yet { background: #30363d; color: var(--text); }
   .badge-warning { background: #7d4e00; color: #f0a93a; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+  .badge-new { background: #30363d; color: var(--text); }
+  .badge-indeterminate { background: #1f6feb; color: #fff; }
+  .badge-meta { background: #21262d; color: #8b949e; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+  select.ticket-move { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+  .btn-fetch-statuses { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; margin-top: 6px; }
+  .btn-fetch-statuses:hover:not(:disabled) { border-color: var(--blue); }
+  .status-checks { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; }
+  .status-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
   .btn-merge {
     background: var(--green);
     color: #fff;
@@ -2014,6 +2156,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="tabs">
     <button class="tab" data-tab="incoming">Awaiting my review</button>
     <button class="tab" data-tab="mine">My PRs</button>
+    <button class="tab" data-tab="tickets">Tickets</button>
     <button class="tab" data-tab="deployed">Deployed</button>
     <button class="tab" data-tab="status">Status</button>
     <button class="tab" data-tab="settings">Settings</button>
@@ -2049,10 +2192,19 @@ const TABS = {
     },
     render: renderMyPR,
   },
+  tickets: {
+    title: '🎫 My Jira tickets',
+    endpoint: '/api/tickets',
+    // groups/headers are set dynamically in load() (one column per status).
+    groups: [],
+    headers: {},
+    groupKey: 'status_label',
+    render: renderTicket,
+  },
 };
 
 const _tab = (new URLSearchParams(location.search)).get('tab');
-let currentTab = ['mine', 'deployed', 'status', 'settings'].includes(_tab) ? _tab : 'incoming';
+let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets'].includes(_tab) ? _tab : 'incoming';
 let deployedState = {};  // environments map from /api/deployed, populated when mine tab loads
 
 function escapeHtml(s) {
@@ -2083,17 +2235,17 @@ function render(prs) {
   const content = document.getElementById('content');
   const tab = TABS[currentTab];
   if (!prs.length) {
-    content.innerHTML = '<div class="empty">' + (
-      currentTab === 'mine'
-        ? '🎉 No open PRs.'
-        : '🎉 No PRs waiting. Inbox zero.'
-    ) + '</div>';
+    const emptyMsg = currentTab === 'mine' ? '🎉 No open PRs.'
+      : currentTab === 'tickets' ? '🎉 No open tickets.'
+      : '🎉 No PRs waiting. Inbox zero.';
+    content.innerHTML = '<div class="empty">' + emptyMsg + '</div>';
     return;
   }
+  const gk = tab.groupKey || 'status';
   const grouped = {};
   for (const g of tab.groups) grouped[g] = [];
   for (const p of prs) {
-    if (grouped[p.status]) grouped[p.status].push(p);
+    if (grouped[p[gk]]) grouped[p[gk]].push(p);
   }
   let html = '';
   for (const g of tab.groups) {
@@ -2231,6 +2383,33 @@ function renderMyPR(p) {
       ${channelBtn}
       ${nudgeBtn}
       ${actionBtn}
+    </div>
+  </div>`;
+}
+
+// Distinct status names present, ordered by category (To Do before In Progress)
+// then alphabetically — used as the Tickets columns when no filter is saved.
+function ticketStatusOrder(tickets) {
+  const catByName = {};
+  for (const t of tickets) catByName[t.status_label] = t.status_category;
+  const rank = { new: 0, indeterminate: 1 };
+  return Object.keys(catByName).sort((a, b) =>
+    ((rank[catByName[a]] ?? 2) - (rank[catByName[b]] ?? 2)) || a.localeCompare(b));
+}
+
+function renderTicket(t) {
+  const priority = t.priority ? `<span class="badge-meta">${escapeHtml(t.priority)}</span>` : '';
+  const type = t.type ? `<span class="badge-meta">${escapeHtml(t.type)}</span>` : '';
+  return `
+  <div class="pr" data-key="${escapeHtml(t.key)}" data-url="${escapeHtml(t.url)}">
+    <div class="pr-main">
+      <div class="pr-meta">${escapeHtml(t.key)}<span class="badge badge-${escapeHtml(t.status_category)}">${escapeHtml(t.status_label)}</span>${type}${priority}</div>
+      <div class="pr-title"><a href="${escapeHtml(safeUrl(t.url))}" target="_blank" rel="noopener">${escapeHtml(t.summary)}</a></div>
+      <div class="pr-sub">updated ${relativeTime(t.updatedAt)}</div>
+    </div>
+    <div class="pr-actions">
+      <a class="btn-open" href="${escapeHtml(safeUrl(t.url))}" target="_blank" rel="noopener">Open ↗</a>
+      <button class="btn-move" type="button" title="Move to another status">Move ▾</button>
     </div>
   </div>`;
 }
@@ -2540,6 +2719,59 @@ async function onStop(btn) {
   }
 }
 
+// Tickets: fetch the issue's available transitions, swap the Move button for a
+// <select>, and POST the chosen transition. Refreshes the list on success.
+async function onMove(btn) {
+  const card = btn.closest('.pr');
+  const key = card.dataset.key;
+  btn.disabled = true;
+  let transitions;
+  try {
+    const res = await fetch('/api/tickets/transitions?key=' + encodeURIComponent(key));
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    transitions = (await res.json()).transitions || [];
+  } catch (e) {
+    toast('Failed to load transitions: ' + e.message, true);
+    btn.disabled = false;
+    return;
+  }
+  if (!transitions.length) {
+    toast('No transitions available', true);
+    btn.disabled = false;
+    return;
+  }
+  const sel = document.createElement('select');
+  sel.className = 'ticket-move';
+  sel.innerHTML = '<option value="" disabled selected>Move to…</option>'
+    + transitions.map(t => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)}</option>`).join('');
+  let submitting = false;
+  sel.addEventListener('change', async () => {
+    const transitionId = sel.value;
+    if (!transitionId || submitting) return;
+    submitting = true;
+    sel.disabled = true;
+    try {
+      const res = await fetch('/api/tickets/transition', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ key, transitionId }),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        throw new Error(b.error || ('HTTP ' + res.status));
+      }
+    } catch (e) {
+      toast('Transition failed: ' + e.message, true);
+      submitting = false;
+      sel.disabled = false;
+      return;
+    }
+    toast('Moved ' + key);
+    load(true);
+  });
+  btn.replaceWith(sel);
+}
+
 // One delegated click listener for all PR-card buttons (attached once to #content).
 // Class tokens are exact-match, so .btn-review and .btn-re-review never collide.
 const CARD_ACTIONS = {
@@ -2553,6 +2785,7 @@ const CARD_ACTIONS = {
   'btn-channel': onChannelPing,
   'btn-deploy': onDeploy,
   'btn-stop': onStop,
+  'btn-move': onMove,
 };
 
 function onContentClick(ev) {
@@ -2570,7 +2803,7 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
-const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings' };
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets' };
 
 function setActiveTab(tab) {
   currentTab = tab;
@@ -2698,6 +2931,16 @@ function renderSettings() {
     { key: 'DEPLOY_TARGET', label: 'Deploy target environment', type: 'text',
       desc: 'Default environment for the Deploy button on each PR card (e.g. csi-3).',
       value: c.deploy_target || '' },
+    { key: 'JIRA_SITE', label: 'Jira site', type: 'text',
+      desc: 'Atlassian site host for the Tickets tab, e.g. your-org.atlassian.net.',
+      value: c.jira_site || '' },
+    { key: 'JIRA_EMAIL', label: 'Jira email', type: 'text',
+      desc: 'Atlassian account email used with the API token for the Tickets tab.',
+      value: c.jira_email || '' },
+    { key: 'JIRA_API_TOKEN', label: 'Jira API token', type: 'password',
+      desc: 'API token from id.atlassian.com/manage-profile/security/api-tokens. '
+        + (c.jira_token_set ? 'Currently set — leave blank to keep it.' : 'Not set.'),
+      value: '' },
     { key: 'CACHE_TTL', label: 'Cache TTL (seconds)', type: 'number',
       desc: 'How long per-PR detail data is cached before a background refresh.',
       value: c.cache_ttl ?? 30 },
@@ -2722,9 +2965,55 @@ function renderSettings() {
   document.getElementById('content').innerHTML = `
     <div class="settings-form">
       ${rows}
+      <div class="settings-row">
+        <label class="settings-label">Tickets: visible statuses</label>
+        <div class="settings-desc">Only these statuses show on the Tickets tab (one column each). None checked = show all. Fetch the list from Jira, then check the ones you want.</div>
+        <button class="btn-fetch-statuses" id="fetchStatusesBtn" type="button">Fetch statuses from Jira</button>
+        <div id="statusChecks" class="status-checks"></div>
+      </div>
       <div><button class="btn-settings-save" id="settingsSaveBtn">Save &amp; Reload</button></div>
     </div>`;
+  // Pre-render the saved selection (all checked) so it shows without fetching.
+  renderStatusChecks(c.jira_status_filter || [], c.jira_status_filter || []);
+  document.getElementById('fetchStatusesBtn').addEventListener('click', fetchStatuses);
   document.getElementById('settingsSaveBtn').addEventListener('click', saveSettings);
+}
+
+// Render a checkbox per status name; `checked` is the subset that starts ticked.
+function renderStatusChecks(names, checked) {
+  const on = new Set(checked);
+  const el = document.getElementById('statusChecks');
+  if (!el) return;
+  if (!names.length) {
+    el.innerHTML = '<div class="settings-desc">No statuses yet — click “Fetch statuses from Jira”.</div>';
+    return;
+  }
+  el.innerHTML = names.map(n => `
+    <label class="status-check">
+      <input type="checkbox" value="${escapeHtml(n)}" ${on.has(n) ? 'checked' : ''}>
+      ${escapeHtml(n)}
+    </label>`).join('');
+}
+
+async function fetchStatuses() {
+  const btn = document.getElementById('fetchStatusesBtn');
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = 'Fetching…';
+  try {
+    const res = await fetch('/api/jira/statuses');
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+    // Keep whatever is currently ticked checked in the refreshed list.
+    const stillChecked = [...document.querySelectorAll('#statusChecks input:checked')].map(b => b.value);
+    const saved = CONFIG.jira_status_filter || [];
+    renderStatusChecks(body.statuses || [], stillChecked.length ? stillChecked : saved);
+  } catch (e) {
+    toast('Failed to fetch statuses: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev;
+  }
 }
 
 async function saveSettings() {
@@ -2734,6 +3023,14 @@ async function saveSettings() {
   const settings = {};
   for (const input of document.querySelectorAll('.settings-input')) {
     settings[input.dataset.key] = input.value.trim();
+  }
+  // Status filter: serialize the checked boxes. Only send the key when boxes are
+  // present, so an unfetched/empty list never clobbers a saved filter — but an
+  // explicit "none checked" (boxes present, none ticked) clears it.
+  const statusBoxes = document.querySelectorAll('#statusChecks input[type=checkbox]');
+  if (statusBoxes.length) {
+    settings['JIRA_STATUS_FILTER'] =
+      [...statusBoxes].filter(b => b.checked).map(b => b.value).join(',');
   }
   try {
     const res = await fetch('/api/settings', {
@@ -2897,6 +3194,27 @@ async function load(fresh) {
       const res = await fetch('/api/deployed');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       renderDeployed(await res.json());
+    } else if (currentTab === 'tickets') {
+      const res = await fetch('/api/tickets' + (fresh ? '?fresh=1' : ''));
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!data.configured) {
+        document.getElementById('content').innerHTML =
+          '<div class="empty">Configure Jira in <code>.env</code>: set JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN, then refresh.</div>';
+        return;
+      }
+      const filter = CONFIG.jira_status_filter || [];
+      let tickets = data.tickets;
+      if (filter.length) {
+        const allow = new Set(filter);
+        tickets = tickets.filter(t => allow.has(t.status_label));
+      }
+      // One column per status: saved-filter order if set, else statuses present
+      // ordered by category (To Do before In Progress) then name.
+      const order = filter.length ? filter.slice() : ticketStatusOrder(tickets);
+      TABS.tickets.groups = order;
+      TABS.tickets.headers = Object.fromEntries(order.map(s => [s, s]));
+      render(tickets);
     } else {
       const tab = TABS[currentTab];
       const url = tab.endpoint + (fresh ? '?fresh=1' : '');
@@ -3054,6 +3372,11 @@ def get_status():
           bool(DEPLOY_TARGET),
           f"Target: {DEPLOY_TARGET}" if DEPLOY_TARGET else "Not set — add DEPLOY_TARGET=csi-3 to .env to show Deploy buttons",
           fix={"action": "set_env", "key": "DEPLOY_TARGET", "placeholder": "csi-3"})
+
+    check("JIRA", "Jira credentials for the Tickets tab (.env)",
+          jira_configured(),
+          f"Configured: {JIRA_EMAIL} @ {JIRA_SITE}" if jira_configured()
+          else "Not set — add JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN on the Settings tab")
 
     return checks
 
@@ -3258,6 +3581,11 @@ class Handler(BaseHTTPRequestHandler):
                 "port": PORT,
                 "workflow_dir": _WORKFLOW_DIR,
                 "editor_cmd": EDITOR_CMD,
+                "jira_site": JIRA_SITE,
+                "jira_email": JIRA_EMAIL,
+                # Never echo the token itself to the browser — only whether it is set.
+                "jira_token_set": bool(JIRA_API_TOKEN),
+                "jira_status_filter": JIRA_STATUS_FILTER,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -3305,6 +3633,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
                 return
             self._send_json(200, prs)
+            return
+        if parsed.path == "/api/tickets":
+            if not jira_configured():
+                self._send_json(200, {"configured": False, "tickets": []})
+                return
+            try:
+                self._send_json(200, {"configured": True, "tickets": jira_search()})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if parsed.path == "/api/tickets/transitions":
+            if not jira_configured():
+                self._send_json(503, {"error": "Jira not configured"})
+                return
+            qs = parse_qs(parsed.query or "")
+            key = qs.get("key", [""])[0]
+            if not _JIRA_KEY_RE.match(key):
+                self._send_json(400, {"error": "invalid issue key"})
+                return
+            try:
+                self._send_json(200, {"transitions": jira_transitions(key)})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if parsed.path == "/api/jira/statuses":
+            if not jira_configured():
+                self._send_json(503, {"error": "Jira not configured"})
+                return
+            try:
+                self._send_json(200, {"statuses": jira_statuses()})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
             return
         if parsed.path in ("/api/job/stream", "/api/review/stream"):
             qs = parse_qs(parsed.query or "")
@@ -3382,6 +3742,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/settings":
             self._handle_settings_post()
+            return
+        if parsed.path == "/api/tickets/transition":
+            self._handle_ticket_transition_post()
             return
         if parsed.path == "/api/open-dir":
             self._handle_open_dir_post()
@@ -3491,8 +3854,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_settings_post(self):
         global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
+        global JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_STATUS_FILTER
         _allowed = {"FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "DEPLOY_TARGET",
-                    "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD"}
+                    "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
+                    "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
+                    "JIRA_STATUS_FILTER"}
         try:
             data = self._read_json_body()
             settings = data.get("settings", {})
@@ -3508,7 +3874,11 @@ class Handler(BaseHTTPRequestHandler):
         with _env_lock:
             for key, value in settings.items():
                 value = str(value).strip()
-                if not value:
+                if key == "JIRA_SITE":
+                    value = _normalize_jira_site(value)
+                # JIRA_STATUS_FILTER may be written empty (clears the filter);
+                # every other key keeps its current value when blank.
+                if not value and key != "JIRA_STATUS_FILTER":
                     continue
                 try:
                     write_env_var(key, value)
@@ -3528,6 +3898,14 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 elif key == "EDITOR_CMD":
                     EDITOR_CMD = value
+                elif key == "JIRA_SITE":
+                    JIRA_SITE = value
+                elif key == "JIRA_EMAIL":
+                    JIRA_EMAIL = value
+                elif key == "JIRA_API_TOKEN":
+                    JIRA_API_TOKEN = value
+                elif key == "JIRA_STATUS_FILTER":
+                    JIRA_STATUS_FILTER = _env_list("JIRA_STATUS_FILTER")
         self._send_json(200, {"ok": True})
 
     def _handle_open_dir_post(self):
@@ -3600,6 +3978,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         print(f"[deploy] dispatched '{workflow_name}' on {repo}@{head_ref} for {env}", flush=True)
         self._send_json(200, {"ok": True})
+
+    def _handle_ticket_transition_post(self):
+        if not jira_configured():
+            self._send_json(503, {"error": "Jira not configured"})
+            return
+        try:
+            data = self._read_json_body()
+            key = str(data["key"])
+            transition_id = str(data["transitionId"])
+            if not _JIRA_KEY_RE.match(key):
+                raise ValueError("invalid issue key")
+            if not re.match(r"^\d+$", transition_id):
+                raise ValueError("invalid transition id")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        try:
+            jira_do_transition(key, transition_id)
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+            return
+        print(f"[tickets] transitioned {key} via {transition_id}", flush=True)
+        self._send_json(200, {"ok": True})
+
 
 def main():
     try:
