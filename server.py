@@ -111,11 +111,23 @@ DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
 EDITOR_CMD = os.environ.get("EDITOR_CMD", "")
 
 # ---- Jira (assigned tickets) ----------------------------------------------
+def _normalize_jira_site(raw):
+    """Accept a Jira site as a bare host or a full URL; return just the host.
+
+    Users routinely paste "https://org.atlassian.net/"; the API URL is built as
+    https://{site}{path}, so a scheme/trailing slash here yields an unresolvable
+    host. Strip them at the boundary so both forms work.
+    """
+    return re.sub(r"^https?://", "", (raw or "").strip(), flags=re.IGNORECASE).rstrip("/")
+
+
 # Atlassian site host (e.g. "cognota.atlassian.net"), account email, and an API
 # token from id.atlassian.com. All three empty = Tickets tab shows a config hint.
-JIRA_SITE = os.environ.get("JIRA_SITE", "")
+JIRA_SITE = _normalize_jira_site(os.environ.get("JIRA_SITE", ""))
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
+# Status names to show on the Tickets tab (comma list in .env). Empty = show all.
+JIRA_STATUS_FILTER = _env_list("JIRA_STATUS_FILTER")
 
 # Tickets assigned to me that are not finished, most-recently-updated first.
 JIRA_JQL = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
@@ -533,6 +545,25 @@ def jira_do_transition(key, transition_id):
         "POST", f"/rest/api/3/issue/{key}/transitions",
         body={"transition": {"id": str(transition_id)}},
     )
+
+
+def jira_statuses():
+    """Distinct, non-Done status names available in Jira.
+
+    Sorted by category (To Do before In Progress) then name. Done-category
+    statuses are dropped since the Tickets JQL never returns them.
+    """
+    data = jira_request("GET", "/rest/api/3/status")
+    cat_by_name = {}
+    for s in data or []:
+        category = (s.get("statusCategory") or {}).get("key") or "new"
+        if category == "done":
+            continue
+        name = s.get("name") or ""
+        if name and name not in cat_by_name:
+            cat_by_name[name] = category
+    rank = {"new": 0, "indeterminate": 1}
+    return sorted(cat_by_name, key=lambda n: (rank.get(cat_by_name[n], 2), n.lower()))
 
 
 # ---- PR enrichment ---------------------------------------------------------
@@ -1742,6 +1773,10 @@ INDEX_HTML = r"""<!doctype html>
   .badge-indeterminate { background: #1f6feb; color: #fff; }
   .badge-meta { background: #21262d; color: #8b949e; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
   select.ticket-move { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+  .btn-fetch-statuses { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; margin-top: 6px; }
+  .btn-fetch-statuses:hover:not(:disabled) { border-color: var(--blue); }
+  .status-checks { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; }
+  .status-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
   .btn-merge {
     background: var(--green);
     color: #fff;
@@ -2160,8 +2195,10 @@ const TABS = {
   tickets: {
     title: '🎫 My Jira tickets',
     endpoint: '/api/tickets',
-    groups: ['new', 'indeterminate'],
-    headers: { new: 'To Do', indeterminate: 'In Progress' },
+    // groups/headers are set dynamically in load() (one column per status).
+    groups: [],
+    headers: {},
+    groupKey: 'status_label',
     render: renderTicket,
   },
 };
@@ -2204,10 +2241,11 @@ function render(prs) {
     content.innerHTML = '<div class="empty">' + emptyMsg + '</div>';
     return;
   }
+  const gk = tab.groupKey || 'status';
   const grouped = {};
   for (const g of tab.groups) grouped[g] = [];
   for (const p of prs) {
-    if (grouped[p.status]) grouped[p.status].push(p);
+    if (grouped[p[gk]]) grouped[p[gk]].push(p);
   }
   let html = '';
   for (const g of tab.groups) {
@@ -2349,13 +2387,23 @@ function renderMyPR(p) {
   </div>`;
 }
 
+// Distinct status names present, ordered by category (To Do before In Progress)
+// then alphabetically — used as the Tickets columns when no filter is saved.
+function ticketStatusOrder(tickets) {
+  const catByName = {};
+  for (const t of tickets) catByName[t.status_label] = t.status_category;
+  const rank = { new: 0, indeterminate: 1 };
+  return Object.keys(catByName).sort((a, b) =>
+    ((rank[catByName[a]] ?? 2) - (rank[catByName[b]] ?? 2)) || a.localeCompare(b));
+}
+
 function renderTicket(t) {
   const priority = t.priority ? `<span class="badge-meta">${escapeHtml(t.priority)}</span>` : '';
   const type = t.type ? `<span class="badge-meta">${escapeHtml(t.type)}</span>` : '';
   return `
   <div class="pr" data-key="${escapeHtml(t.key)}" data-url="${escapeHtml(t.url)}">
     <div class="pr-main">
-      <div class="pr-meta">${escapeHtml(t.key)}<span class="badge badge-${escapeHtml(t.status)}">${escapeHtml(t.status_label)}</span>${type}${priority}</div>
+      <div class="pr-meta">${escapeHtml(t.key)}<span class="badge badge-${escapeHtml(t.status_category)}">${escapeHtml(t.status_label)}</span>${type}${priority}</div>
       <div class="pr-title"><a href="${escapeHtml(safeUrl(t.url))}" target="_blank" rel="noopener">${escapeHtml(t.summary)}</a></div>
       <div class="pr-sub">updated ${relativeTime(t.updatedAt)}</div>
     </div>
@@ -2883,6 +2931,16 @@ function renderSettings() {
     { key: 'DEPLOY_TARGET', label: 'Deploy target environment', type: 'text',
       desc: 'Default environment for the Deploy button on each PR card (e.g. csi-3).',
       value: c.deploy_target || '' },
+    { key: 'JIRA_SITE', label: 'Jira site', type: 'text',
+      desc: 'Atlassian site host for the Tickets tab, e.g. your-org.atlassian.net.',
+      value: c.jira_site || '' },
+    { key: 'JIRA_EMAIL', label: 'Jira email', type: 'text',
+      desc: 'Atlassian account email used with the API token for the Tickets tab.',
+      value: c.jira_email || '' },
+    { key: 'JIRA_API_TOKEN', label: 'Jira API token', type: 'password',
+      desc: 'API token from id.atlassian.com/manage-profile/security/api-tokens. '
+        + (c.jira_token_set ? 'Currently set — leave blank to keep it.' : 'Not set.'),
+      value: '' },
     { key: 'CACHE_TTL', label: 'Cache TTL (seconds)', type: 'number',
       desc: 'How long per-PR detail data is cached before a background refresh.',
       value: c.cache_ttl ?? 30 },
@@ -2907,9 +2965,55 @@ function renderSettings() {
   document.getElementById('content').innerHTML = `
     <div class="settings-form">
       ${rows}
+      <div class="settings-row">
+        <label class="settings-label">Tickets: visible statuses</label>
+        <div class="settings-desc">Only these statuses show on the Tickets tab (one column each). None checked = show all. Fetch the list from Jira, then check the ones you want.</div>
+        <button class="btn-fetch-statuses" id="fetchStatusesBtn" type="button">Fetch statuses from Jira</button>
+        <div id="statusChecks" class="status-checks"></div>
+      </div>
       <div><button class="btn-settings-save" id="settingsSaveBtn">Save &amp; Reload</button></div>
     </div>`;
+  // Pre-render the saved selection (all checked) so it shows without fetching.
+  renderStatusChecks(c.jira_status_filter || [], c.jira_status_filter || []);
+  document.getElementById('fetchStatusesBtn').addEventListener('click', fetchStatuses);
   document.getElementById('settingsSaveBtn').addEventListener('click', saveSettings);
+}
+
+// Render a checkbox per status name; `checked` is the subset that starts ticked.
+function renderStatusChecks(names, checked) {
+  const on = new Set(checked);
+  const el = document.getElementById('statusChecks');
+  if (!el) return;
+  if (!names.length) {
+    el.innerHTML = '<div class="settings-desc">No statuses yet — click “Fetch statuses from Jira”.</div>';
+    return;
+  }
+  el.innerHTML = names.map(n => `
+    <label class="status-check">
+      <input type="checkbox" value="${escapeHtml(n)}" ${on.has(n) ? 'checked' : ''}>
+      ${escapeHtml(n)}
+    </label>`).join('');
+}
+
+async function fetchStatuses() {
+  const btn = document.getElementById('fetchStatusesBtn');
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = 'Fetching…';
+  try {
+    const res = await fetch('/api/jira/statuses');
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+    // Keep whatever is currently ticked checked in the refreshed list.
+    const stillChecked = [...document.querySelectorAll('#statusChecks input:checked')].map(b => b.value);
+    const saved = CONFIG.jira_status_filter || [];
+    renderStatusChecks(body.statuses || [], stillChecked.length ? stillChecked : saved);
+  } catch (e) {
+    toast('Failed to fetch statuses: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev;
+  }
 }
 
 async function saveSettings() {
@@ -2919,6 +3023,14 @@ async function saveSettings() {
   const settings = {};
   for (const input of document.querySelectorAll('.settings-input')) {
     settings[input.dataset.key] = input.value.trim();
+  }
+  // Status filter: serialize the checked boxes. Only send the key when boxes are
+  // present, so an unfetched/empty list never clobbers a saved filter — but an
+  // explicit "none checked" (boxes present, none ticked) clears it.
+  const statusBoxes = document.querySelectorAll('#statusChecks input[type=checkbox]');
+  if (statusBoxes.length) {
+    settings['JIRA_STATUS_FILTER'] =
+      [...statusBoxes].filter(b => b.checked).map(b => b.value).join(',');
   }
   try {
     const res = await fetch('/api/settings', {
@@ -3091,7 +3203,18 @@ async function load(fresh) {
           '<div class="empty">Configure Jira in <code>.env</code>: set JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN, then refresh.</div>';
         return;
       }
-      render(data.tickets);
+      const filter = CONFIG.jira_status_filter || [];
+      let tickets = data.tickets;
+      if (filter.length) {
+        const allow = new Set(filter);
+        tickets = tickets.filter(t => allow.has(t.status_label));
+      }
+      // One column per status: saved-filter order if set, else statuses present
+      // ordered by category (To Do before In Progress) then name.
+      const order = filter.length ? filter.slice() : ticketStatusOrder(tickets);
+      TABS.tickets.groups = order;
+      TABS.tickets.headers = Object.fromEntries(order.map(s => [s, s]));
+      render(tickets);
     } else {
       const tab = TABS[currentTab];
       const url = tab.endpoint + (fresh ? '?fresh=1' : '');
@@ -3249,6 +3372,11 @@ def get_status():
           bool(DEPLOY_TARGET),
           f"Target: {DEPLOY_TARGET}" if DEPLOY_TARGET else "Not set — add DEPLOY_TARGET=csi-3 to .env to show Deploy buttons",
           fix={"action": "set_env", "key": "DEPLOY_TARGET", "placeholder": "csi-3"})
+
+    check("JIRA", "Jira credentials for the Tickets tab (.env)",
+          jira_configured(),
+          f"Configured: {JIRA_EMAIL} @ {JIRA_SITE}" if jira_configured()
+          else "Not set — add JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN on the Settings tab")
 
     return checks
 
@@ -3453,6 +3581,11 @@ class Handler(BaseHTTPRequestHandler):
                 "port": PORT,
                 "workflow_dir": _WORKFLOW_DIR,
                 "editor_cmd": EDITOR_CMD,
+                "jira_site": JIRA_SITE,
+                "jira_email": JIRA_EMAIL,
+                # Never echo the token itself to the browser — only whether it is set.
+                "jira_token_set": bool(JIRA_API_TOKEN),
+                "jira_status_filter": JIRA_STATUS_FILTER,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -3521,6 +3654,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 self._send_json(200, {"transitions": jira_transitions(key)})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if parsed.path == "/api/jira/statuses":
+            if not jira_configured():
+                self._send_json(503, {"error": "Jira not configured"})
+                return
+            try:
+                self._send_json(200, {"statuses": jira_statuses()})
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
@@ -3712,8 +3854,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_settings_post(self):
         global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
+        global JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_STATUS_FILTER
         _allowed = {"FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "DEPLOY_TARGET",
-                    "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD"}
+                    "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
+                    "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
+                    "JIRA_STATUS_FILTER"}
         try:
             data = self._read_json_body()
             settings = data.get("settings", {})
@@ -3729,7 +3874,11 @@ class Handler(BaseHTTPRequestHandler):
         with _env_lock:
             for key, value in settings.items():
                 value = str(value).strip()
-                if not value:
+                if key == "JIRA_SITE":
+                    value = _normalize_jira_site(value)
+                # JIRA_STATUS_FILTER may be written empty (clears the filter);
+                # every other key keeps its current value when blank.
+                if not value and key != "JIRA_STATUS_FILTER":
                     continue
                 try:
                     write_env_var(key, value)
@@ -3749,6 +3898,14 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 elif key == "EDITOR_CMD":
                     EDITOR_CMD = value
+                elif key == "JIRA_SITE":
+                    JIRA_SITE = value
+                elif key == "JIRA_EMAIL":
+                    JIRA_EMAIL = value
+                elif key == "JIRA_API_TOKEN":
+                    JIRA_API_TOKEN = value
+                elif key == "JIRA_STATUS_FILTER":
+                    JIRA_STATUS_FILTER = _env_list("JIRA_STATUS_FILTER")
         self._send_json(200, {"ok": True})
 
     def _handle_open_dir_post(self):

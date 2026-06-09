@@ -111,5 +111,45 @@ class JiraConfiguredTest(unittest.TestCase):
         self.assertTrue(server.jira_configured())
 
 
+class NormalizeSiteTest(unittest.TestCase):
+    def test_strips_https_scheme(self):
+        self.assertEqual(
+            server._normalize_jira_site("https://cognota.atlassian.net"),
+            "cognota.atlassian.net",
+        )
+
+    def test_strips_http_scheme_and_trailing_slash(self):
+        self.assertEqual(
+            server._normalize_jira_site("http://ex.atlassian.net/"),
+            "ex.atlassian.net",
+        )
+
+    def test_passes_bare_host_through(self):
+        self.assertEqual(
+            server._normalize_jira_site("ex.atlassian.net"),
+            "ex.atlassian.net",
+        )
+
+    def test_handles_empty_and_whitespace(self):
+        self.assertEqual(server._normalize_jira_site(""), "")
+        self.assertEqual(server._normalize_jira_site("  "), "")
+
+
+class JiraStatusesTest(unittest.TestCase):
+    @mock.patch("server.jira_request")
+    def test_dedupes_drops_done_and_sorts(self, jr):
+        jr.return_value = [
+            {"name": "In Progress", "statusCategory": {"key": "indeterminate"}},
+            {"name": "To Do", "statusCategory": {"key": "new"}},
+            {"name": "In Progress", "statusCategory": {"key": "indeterminate"}},  # dup
+            {"name": "Done", "statusCategory": {"key": "done"}},                  # dropped
+            {"name": "In Review", "statusCategory": {"key": "indeterminate"}},
+        ]
+        out = server.jira_statuses()
+        # new-category first (To Do), then indeterminate sorted by name
+        self.assertEqual(out, ["To Do", "In Progress", "In Review"])
+        self.assertEqual(jr.call_args[0], ("GET", "/rest/api/3/status"))
+
+
 if __name__ == "__main__":
     unittest.main()
