@@ -28,5 +28,19 @@ class JiraRequestTest(unittest.TestCase):
         self.assertTrue(req.get_header("Authorization").startswith("Basic "))
 
 
+class JiraConfiguredTest(unittest.TestCase):
+    @mock.patch.object(server, "JIRA_API_TOKEN", "")
+    @mock.patch.object(server, "JIRA_EMAIL", "me@example.com")
+    @mock.patch.object(server, "JIRA_SITE", "ex.atlassian.net")
+    def test_false_when_token_missing(self):
+        self.assertFalse(server.jira_configured())
+
+    @mock.patch.object(server, "JIRA_API_TOKEN", "tok")
+    @mock.patch.object(server, "JIRA_EMAIL", "me@example.com")
+    @mock.patch.object(server, "JIRA_SITE", "ex.atlassian.net")
+    def test_true_when_all_present(self):
+        self.assertTrue(server.jira_configured())
+
+
 if __name__ == "__main__":
     unittest.main()
