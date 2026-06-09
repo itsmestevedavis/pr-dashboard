@@ -1738,6 +1738,10 @@ INDEX_HTML = r"""<!doctype html>
   .badge-has_comments { background: #fb8500; color: #fff; }
   .badge-not_reviewed_yet { background: #30363d; color: var(--text); }
   .badge-warning { background: #7d4e00; color: #f0a93a; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+  .badge-new { background: #30363d; color: var(--text); }
+  .badge-indeterminate { background: #1f6feb; color: #fff; }
+  .badge-meta { background: #21262d; color: #8b949e; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+  select.ticket-move { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 13px; }
   .btn-merge {
     background: var(--green);
     color: #fff;
@@ -2117,6 +2121,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="tabs">
     <button class="tab" data-tab="incoming">Awaiting my review</button>
     <button class="tab" data-tab="mine">My PRs</button>
+    <button class="tab" data-tab="tickets">Tickets</button>
     <button class="tab" data-tab="deployed">Deployed</button>
     <button class="tab" data-tab="status">Status</button>
     <button class="tab" data-tab="settings">Settings</button>
@@ -2152,10 +2157,17 @@ const TABS = {
     },
     render: renderMyPR,
   },
+  tickets: {
+    title: '🎫 My Jira tickets',
+    endpoint: '/api/tickets',
+    groups: ['new', 'indeterminate'],
+    headers: { new: 'To Do', indeterminate: 'In Progress' },
+    render: renderTicket,
+  },
 };
 
 const _tab = (new URLSearchParams(location.search)).get('tab');
-let currentTab = ['mine', 'deployed', 'status', 'settings'].includes(_tab) ? _tab : 'incoming';
+let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets'].includes(_tab) ? _tab : 'incoming';
 let deployedState = {};  // environments map from /api/deployed, populated when mine tab loads
 
 function escapeHtml(s) {
@@ -2673,7 +2685,7 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
-const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings' };
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets' };
 
 function setActiveTab(tab) {
   currentTab = tab;
