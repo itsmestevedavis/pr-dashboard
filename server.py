@@ -3406,6 +3406,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, prs)
             return
+        if parsed.path == "/api/tickets":
+            if not jira_configured():
+                self._send_json(200, {"configured": False, "tickets": []})
+                return
+            try:
+                self._send_json(200, {"configured": True, "tickets": jira_search()})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if parsed.path == "/api/tickets/transitions":
+            qs = parse_qs(parsed.query or "")
+            key = qs.get("key", [""])[0]
+            if not key:
+                self._send_json(400, {"error": "key required"})
+                return
+            try:
+                self._send_json(200, {"transitions": jira_transitions(key)})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
         if parsed.path in ("/api/job/stream", "/api/review/stream"):
             qs = parse_qs(parsed.query or "")
             repo = qs.get("repo", [""])[0]
