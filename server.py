@@ -3503,6 +3503,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/settings":
             self._handle_settings_post()
             return
+        if parsed.path == "/api/tickets/transition":
+            self._handle_ticket_transition_post()
+            return
         if parsed.path == "/api/open-dir":
             self._handle_open_dir_post()
             return
@@ -3719,6 +3722,24 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": err})
             return
         print(f"[deploy] dispatched '{workflow_name}' on {repo}@{head_ref} for {env}", flush=True)
+        self._send_json(200, {"ok": True})
+
+    def _handle_ticket_transition_post(self):
+        try:
+            data = self._read_json_body()
+            key = str(data["key"])
+            transition_id = str(data["transitionId"])
+            if not key or not transition_id:
+                raise ValueError("key and transitionId required")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        try:
+            jira_do_transition(key, transition_id)
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+            return
+        print(f"[tickets] transitioned {key} via {transition_id}", flush=True)
         self._send_json(200, {"ok": True})
 
 def main():
