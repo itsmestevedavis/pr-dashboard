@@ -479,6 +479,59 @@ def jira_request(method, path, params=None, body=None):
     return json.loads(raw) if raw.strip() else None
 
 
+def parse_ticket(issue, site):
+    """Map one Jira issue JSON object into the dashboard's ticket dict.
+
+    `status` carries the Jira statusCategory key ("new" | "indeterminate"),
+    which the frontend's group-by-status render() uses as the column key.
+    """
+    fields = issue.get("fields") or {}
+    status = fields.get("status") or {}
+    category = (status.get("statusCategory") or {}).get("key") or "new"
+    priority = fields.get("priority") or {}
+    issuetype = fields.get("issuetype") or {}
+    key = issue.get("key", "")
+    return {
+        "key": key,
+        "summary": fields.get("summary") or "",
+        "status": category,
+        "status_label": status.get("name") or "",
+        "status_category": category,
+        "priority": priority.get("name"),
+        "type": issuetype.get("name") or "",
+        "url": f"https://{site}/browse/{key}",
+        "updatedAt": fields.get("updated") or "",
+    }
+
+
+def jira_search():
+    """Return assigned, not-done tickets as a list of ticket dicts."""
+    data = jira_request("GET", "/rest/api/3/search/jql", params={
+        "jql": JIRA_JQL,
+        "fields": "summary,status,priority,issuetype,updated",
+        "maxResults": "100",
+    })
+    issues = (data or {}).get("issues") or []
+    return [parse_ticket(i, JIRA_SITE) for i in issues]
+
+
+def jira_transitions(key):
+    """Available workflow transitions for an issue: [{id, name}]."""
+    data = jira_request("GET", f"/rest/api/3/issue/{key}/transitions")
+    return [
+        {"id": t["id"], "name": t["name"]}
+        for t in (data or {}).get("transitions") or []
+    ]
+
+
+def jira_do_transition(key, transition_id):
+    """Move an issue through the given transition id."""
+    jira_request(
+        "POST", f"/rest/api/3/issue/{key}/transitions",
+        body={"transition": {"id": str(transition_id)}},
+    )
+
+
 # ---- PR enrichment ---------------------------------------------------------
 
 def fetch_detail(repo, number, fresh=False):
