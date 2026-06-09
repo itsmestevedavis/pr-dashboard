@@ -120,6 +120,9 @@ JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 # Tickets assigned to me that are not finished, most-recently-updated first.
 JIRA_JQL = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
 
+# Jira issue keys look like ABC-123 — validate before interpolating into API paths.
+_JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+
 
 def _is_human_author(author):
     """True if the GraphQL author node is a real user (not a Bot, etc)."""
@@ -3416,10 +3419,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
             return
         if parsed.path == "/api/tickets/transitions":
+            if not jira_configured():
+                self._send_json(503, {"error": "Jira not configured"})
+                return
             qs = parse_qs(parsed.query or "")
             key = qs.get("key", [""])[0]
-            if not key:
-                self._send_json(400, {"error": "key required"})
+            if not _JIRA_KEY_RE.match(key):
+                self._send_json(400, {"error": "invalid issue key"})
                 return
             try:
                 self._send_json(200, {"transitions": jira_transitions(key)})
@@ -3725,12 +3731,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_ticket_transition_post(self):
+        if not jira_configured():
+            self._send_json(503, {"error": "Jira not configured"})
+            return
         try:
             data = self._read_json_body()
             key = str(data["key"])
             transition_id = str(data["transitionId"])
-            if not key or not transition_id:
-                raise ValueError("key and transitionId required")
+            if not _JIRA_KEY_RE.match(key):
+                raise ValueError("invalid issue key")
+            if not re.match(r"^\d+$", transition_id):
+                raise ValueError("invalid transition id")
         except Exception as e:
             self._send_json(400, {"error": f"bad request: {e}"})
             return
@@ -3741,6 +3752,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         print(f"[tickets] transitioned {key} via {transition_id}", flush=True)
         self._send_json(200, {"ok": True})
+
 
 def main():
     try:

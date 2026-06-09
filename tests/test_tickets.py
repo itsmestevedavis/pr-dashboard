@@ -92,7 +92,7 @@ class TransitionsTest(unittest.TestCase):
 
     @mock.patch("server.jira_request")
     def test_do_transition_posts_body(self, jr):
-        server.jira_do_transition("CSI-1", "21")
+        server.jira_do_transition("CSI-1", 21)
         self.assertEqual(jr.call_args[0], ("POST", "/rest/api/3/issue/CSI-1/transitions"))
         self.assertEqual(jr.call_args[1]["body"], {"transition": {"id": "21"}})
 
