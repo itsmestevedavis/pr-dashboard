@@ -446,6 +446,39 @@ def get_my_login():
     return _me
 
 
+# ---- Jira helpers ----------------------------------------------------------
+
+def jira_configured():
+    """True only when all three Jira credentials are present."""
+    return bool(JIRA_SITE and JIRA_EMAIL and JIRA_API_TOKEN)
+
+
+def jira_request(method, path, params=None, body=None):
+    """Call the Jira Cloud REST API. Returns parsed JSON (None for empty body).
+
+    Raises RuntimeError with a readable message on any non-2xx or transport error.
+    """
+    url = f"https://{JIRA_SITE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    token = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Basic {token}")
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"Jira {method} {path} failed (HTTP {e.code}): {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Jira {method} {path} failed: {e.reason}")
+    return json.loads(raw) if raw.strip() else None
+
+
 # ---- PR enrichment ---------------------------------------------------------
 
 def fetch_detail(repo, number, fresh=False):
