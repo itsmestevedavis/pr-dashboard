@@ -2198,11 +2198,10 @@ function render(prs) {
   const content = document.getElementById('content');
   const tab = TABS[currentTab];
   if (!prs.length) {
-    content.innerHTML = '<div class="empty">' + (
-      currentTab === 'mine'
-        ? '🎉 No open PRs.'
-        : '🎉 No PRs waiting. Inbox zero.'
-    ) + '</div>';
+    const emptyMsg = currentTab === 'mine' ? '🎉 No open PRs.'
+      : currentTab === 'tickets' ? '🎉 No open tickets.'
+      : '🎉 No PRs waiting. Inbox zero.';
+    content.innerHTML = '<div class="empty">' + emptyMsg + '</div>';
     return;
   }
   const grouped = {};
@@ -2346,6 +2345,23 @@ function renderMyPR(p) {
       ${channelBtn}
       ${nudgeBtn}
       ${actionBtn}
+    </div>
+  </div>`;
+}
+
+function renderTicket(t) {
+  const priority = t.priority ? `<span class="badge-meta">${escapeHtml(t.priority)}</span>` : '';
+  const type = t.type ? `<span class="badge-meta">${escapeHtml(t.type)}</span>` : '';
+  return `
+  <div class="pr" data-key="${escapeHtml(t.key)}" data-url="${escapeHtml(t.url)}">
+    <div class="pr-main">
+      <div class="pr-meta">${escapeHtml(t.key)}<span class="badge badge-${escapeHtml(t.status)}">${escapeHtml(t.status_label)}</span>${type}${priority}</div>
+      <div class="pr-title"><a href="${escapeHtml(safeUrl(t.url))}" target="_blank" rel="noopener">${escapeHtml(t.summary)}</a></div>
+      <div class="pr-sub">updated ${relativeTime(t.updatedAt)}</div>
+    </div>
+    <div class="pr-actions">
+      <a class="btn-open" href="${escapeHtml(safeUrl(t.url))}" target="_blank" rel="noopener">Open ↗</a>
+      <button class="btn-move" type="button" title="Move to another status">Move ▾</button>
     </div>
   </div>`;
 }
@@ -3012,6 +3028,16 @@ async function load(fresh) {
       const res = await fetch('/api/deployed');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       renderDeployed(await res.json());
+    } else if (currentTab === 'tickets') {
+      const res = await fetch('/api/tickets');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!data.configured) {
+        document.getElementById('content').innerHTML =
+          '<div class="empty">Configure Jira in <code>.env</code>: set JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN, then refresh.</div>';
+        return;
+      }
+      render(data.tickets);
     } else {
       const tab = TABS[currentTab];
       const url = tab.endpoint + (fresh ? '?fresh=1' : '');
