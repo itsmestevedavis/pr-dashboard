@@ -76,6 +76,27 @@ class JiraSearchTest(unittest.TestCase):
         self.assertEqual(jr.call_args[0][1], "/rest/api/3/search/jql")
 
 
+class TransitionsTest(unittest.TestCase):
+    @mock.patch("server.jira_request")
+    def test_lists_transitions(self, jr):
+        jr.return_value = {"transitions": [
+            {"id": "11", "name": "To Do", "extra": "ignored"},
+            {"id": "21", "name": "In Progress"},
+        ]}
+        out = server.jira_transitions("CSI-1")
+        self.assertEqual(out, [
+            {"id": "11", "name": "To Do"},
+            {"id": "21", "name": "In Progress"},
+        ])
+        self.assertEqual(jr.call_args[0], ("GET", "/rest/api/3/issue/CSI-1/transitions"))
+
+    @mock.patch("server.jira_request")
+    def test_do_transition_posts_body(self, jr):
+        server.jira_do_transition("CSI-1", "21")
+        self.assertEqual(jr.call_args[0], ("POST", "/rest/api/3/issue/CSI-1/transitions"))
+        self.assertEqual(jr.call_args[1]["body"], {"transition": {"id": "21"}})
+
+
 class JiraConfiguredTest(unittest.TestCase):
     @mock.patch.object(server, "JIRA_API_TOKEN", "")
     @mock.patch.object(server, "JIRA_EMAIL", "me@example.com")
