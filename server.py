@@ -17,6 +17,10 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+import base64
+import urllib.error
+import urllib.parse
+import urllib.request
 
 # ---- Configuration ---------------------------------------------------------
 
@@ -105,6 +109,16 @@ DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
 
 # Editor command for opening the config folder. Empty = auto-detect (code → open/xdg-open).
 EDITOR_CMD = os.environ.get("EDITOR_CMD", "")
+
+# ---- Jira (assigned tickets) ----------------------------------------------
+# Atlassian site host (e.g. "cognota.atlassian.net"), account email, and an API
+# token from id.atlassian.com. All three empty = Tickets tab shows a config hint.
+JIRA_SITE = os.environ.get("JIRA_SITE", "")
+JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
+JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
+
+# Tickets assigned to me that are not finished, most-recently-updated first.
+JIRA_JQL = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
 
 
 def _is_human_author(author):
