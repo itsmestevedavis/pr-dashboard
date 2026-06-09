@@ -2696,9 +2696,11 @@ async function onMove(btn) {
   sel.className = 'ticket-move';
   sel.innerHTML = '<option value="" disabled selected>Move to…</option>'
     + transitions.map(t => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)}</option>`).join('');
+  let submitting = false;
   sel.addEventListener('change', async () => {
     const transitionId = sel.value;
-    if (!transitionId) return;
+    if (!transitionId || submitting) return;
+    submitting = true;
     sel.disabled = true;
     try {
       const res = await fetch('/api/tickets/transition', {
@@ -2712,6 +2714,7 @@ async function onMove(btn) {
       }
     } catch (e) {
       toast('Transition failed: ' + e.message, true);
+      submitting = false;
       sel.disabled = false;
       return;
     }
@@ -3080,7 +3083,7 @@ async function load(fresh) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       renderDeployed(await res.json());
     } else if (currentTab === 'tickets') {
-      const res = await fetch('/api/tickets');
+      const res = await fetch('/api/tickets' + (fresh ? '?fresh=1' : ''));
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       if (!data.configured) {
