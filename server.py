@@ -2671,6 +2671,56 @@ async function onStop(btn) {
   }
 }
 
+// Tickets: fetch the issue's available transitions, swap the Move button for a
+// <select>, and POST the chosen transition. Refreshes the list on success.
+async function onMove(btn) {
+  const card = btn.closest('.pr');
+  const key = card.dataset.key;
+  btn.disabled = true;
+  let transitions;
+  try {
+    const res = await fetch('/api/tickets/transitions?key=' + encodeURIComponent(key));
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    transitions = (await res.json()).transitions || [];
+  } catch (e) {
+    toast('Failed to load transitions: ' + e.message, true);
+    btn.disabled = false;
+    return;
+  }
+  if (!transitions.length) {
+    toast('No transitions available', true);
+    btn.disabled = false;
+    return;
+  }
+  const sel = document.createElement('select');
+  sel.className = 'ticket-move';
+  sel.innerHTML = '<option value="" disabled selected>Move to…</option>'
+    + transitions.map(t => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)}</option>`).join('');
+  sel.addEventListener('change', async () => {
+    const transitionId = sel.value;
+    if (!transitionId) return;
+    sel.disabled = true;
+    try {
+      const res = await fetch('/api/tickets/transition', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ key, transitionId }),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        throw new Error(b.error || ('HTTP ' + res.status));
+      }
+    } catch (e) {
+      toast('Transition failed: ' + e.message, true);
+      sel.disabled = false;
+      return;
+    }
+    toast('Moved ' + key);
+    load(true);
+  });
+  btn.replaceWith(sel);
+}
+
 // One delegated click listener for all PR-card buttons (attached once to #content).
 // Class tokens are exact-match, so .btn-review and .btn-re-review never collide.
 const CARD_ACTIONS = {
@@ -2684,6 +2734,7 @@ const CARD_ACTIONS = {
   'btn-channel': onChannelPing,
   'btn-deploy': onDeploy,
   'btn-stop': onStop,
+  'btn-move': onMove,
 };
 
 function onContentClick(ev) {
