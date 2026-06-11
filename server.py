@@ -22,6 +22,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import cleanup
+
 # ---- Configuration ---------------------------------------------------------
 
 def _load_dotenv(path):
@@ -109,6 +111,14 @@ DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
 
 # Editor command for opening the config folder. Empty = auto-detect (code → open/xdg-open).
 EDITOR_CMD = os.environ.get("EDITOR_CMD", "")
+
+# Local repo paths the Cleanup tab scans for stale branches/worktrees (comma list,
+# ~ expanded). The agent-clone cache is always scanned in addition to these.
+CLEANUP_REPOS = _env_list("CLEANUP_REPOS")
+
+# "Me" for the Cleanup tab's authored-by-me filter. Empty = use each repo's
+# `git config user.email`.
+CLEANUP_AUTHOR_EMAIL = os.environ.get("CLEANUP_AUTHOR_EMAIL", "")
 
 # ---- Jira (assigned tickets) ----------------------------------------------
 def _normalize_jira_site(raw):
@@ -1378,6 +1388,52 @@ def prepare_agent_clone(repo_full, head_ref):
     return path, head_ref
 
 
+# ---- Cleanup (stale branches / worktrees) ----------------------------------
+
+def _git_runner(args, cwd):
+    """Runner injected into cleanup.py: run `git -C cwd <args>` -> (code, out, err)."""
+    proc = subprocess.run(
+        ["git", "-C", cwd, *args], capture_output=True, text=True
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def cleanup_repo_targets():
+    """(path, label, kind) tuples to scan: configured repos + each agent clone."""
+    targets = []
+    for raw in CLEANUP_REPOS:
+        targets.append((os.path.abspath(os.path.expanduser(raw)), raw, "configured"))
+    if os.path.isdir(AGENT_CLONES_DIR):
+        for name in sorted(os.listdir(AGENT_CLONES_DIR)):
+            full = os.path.join(AGENT_CLONES_DIR, name)
+            if os.path.isdir(os.path.join(full, ".git")):
+                targets.append((full, name, "clone"))
+    return targets
+
+
+def scan_cleanup(fresh=False):
+    """Scan all target repos. Returns {"repos": [{path,label,kind,ok,error?,candidates}]}."""
+    repos = []
+    for path, label, kind in cleanup_repo_targets():
+        entry = {"path": path, "label": label, "kind": kind, "ok": True, "candidates": []}
+        if not os.path.isdir(os.path.join(path, ".git")):
+            entry["ok"] = False
+            entry["error"] = "not a git repo"
+            repos.append(entry)
+            continue
+        try:
+            if fresh:
+                _git_runner(["fetch", "--prune"], path)
+            entry["candidates"] = cleanup.scan_repo(
+                _git_runner, path, author_email=CLEANUP_AUTHOR_EMAIL or None
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            entry["ok"] = False
+            entry["error"] = str(e)
+        repos.append(entry)
+    return {"repos": repos}
+
+
 # ---- Address dispatch ------------------------------------------------------
 
 ADDRESS_PROMPT = (
@@ -1771,12 +1827,27 @@ INDEX_HTML = r"""<!doctype html>
   .badge-warning { background: #7d4e00; color: #f0a93a; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
   .badge-new { background: #30363d; color: var(--text); }
   .badge-indeterminate { background: #1f6feb; color: #fff; }
-  .badge-meta { background: #21262d; color: #8b949e; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+  .badge-meta { background: #21262d; color: #8b949e; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
   select.ticket-move { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 13px; }
   .btn-fetch-statuses { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; margin-top: 6px; }
   .btn-fetch-statuses:hover:not(:disabled) { border-color: var(--blue); }
   .status-checks { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; }
   .status-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+  .cl-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .cl-hint { color: #8b949e; font-size: 13px; }
+  .cl-repo { margin-bottom: 18px; }
+  .cl-note { color: #8b949e; font-size: 13px; padding: 4px 0 8px; }
+  .cl-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .cl-main { display: flex; align-items: center; gap: 8px; flex: 1; cursor: pointer; min-width: 0; }
+  .cl-name { font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cl-reason { color: #8b949e; font-size: 12px; white-space: nowrap; }
+  .cl-force { display: none; align-items: center; gap: 4px; font-size: 12px; color: #f0a93a; cursor: pointer; white-space: nowrap; }
+  .cl-force.cl-force-show { display: inline-flex; }
+  .cl-result { font-size: 12px; color: #8b949e; }
+  .cl-result:not(:empty) { flex-basis: 100%; }
+  .cl-done { opacity: 0.5; }
+  .cleanup.mine-only .cl-row[data-mine="0"] { display: none; }
+  .cleanup.mine-only .cl-repo:not(:has(.cl-row[data-mine="1"])) { display: none; }
   .btn-merge {
     background: var(--green);
     color: #fff;
@@ -2159,6 +2230,7 @@ INDEX_HTML = r"""<!doctype html>
     <button class="tab" data-tab="tickets">Tickets</button>
     <button class="tab" data-tab="deployed">Deployed</button>
     <button class="tab" data-tab="status">Status</button>
+    <button class="tab" data-tab="cleanup">Cleanup</button>
     <button class="tab" data-tab="settings">Settings</button>
   </div>
   <main id="content">Loading…</main>
@@ -2204,7 +2276,7 @@ const TABS = {
 };
 
 const _tab = (new URLSearchParams(location.search)).get('tab');
-let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets'].includes(_tab) ? _tab : 'incoming';
+let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets', 'cleanup'].includes(_tab) ? _tab : 'incoming';
 let deployedState = {};  // environments map from /api/deployed, populated when mine tab loads
 
 function escapeHtml(s) {
@@ -2803,7 +2875,7 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
-const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets' };
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets', cleanup: '🧹 Branch cleanup' };
 
 function setActiveTab(tab) {
   currentTab = tab;
@@ -2919,6 +2991,136 @@ async function onFix(ev) {
   }
 }
 
+const CLEANUP_KIND_LABEL = {
+  local_gone: 'local · upstream gone',
+  local_merged: 'local · merged',
+  worktree: 'worktree',
+  remote_merged: 'remote · merged',
+};
+
+function renderCleanup(data) {
+  const content = document.getElementById('content');
+  const repos = (data && data.repos) || [];
+  if (!repos.length) {
+    content.innerHTML = '<div class="empty">No repos to scan. Add paths in <code>CLEANUP_REPOS</code> on the Settings tab (the agent-clone cache is scanned automatically).</div>';
+    return;
+  }
+  let total = 0;
+  let body = '';
+  for (const repo of repos) {
+    body += `<div class="cl-repo"><div class="group-header">${escapeHtml(repo.label)} <span class="badge-meta">${escapeHtml(repo.kind)}</span></div>`;
+    if (!repo.ok) {
+      body += `<div class="cl-note">${escapeHtml(repo.error || 'scan failed')}</div></div>`;
+      continue;
+    }
+    if (!repo.candidates.length) {
+      body += '<div class="cl-note">Nothing to clean up. 🎉</div></div>';
+      continue;
+    }
+    for (const c of repo.candidates) {
+      total++;
+      const key = repo.path + '|' + c.kind + '|' + c.name;
+      const forceable = c.kind !== 'remote_merged';
+      body += `
+        <div class="cl-row" data-key="${escapeHtml(key)}" data-mine="${c.mine ? '1' : '0'}">
+          <label class="cl-main">
+            <input type="checkbox" class="cl-pick"
+              data-repo="${escapeHtml(repo.path)}" data-kind="${escapeHtml(c.kind)}"
+              data-name="${escapeHtml(c.name)}" data-wt="${escapeHtml(c.worktree_path || '')}"
+              data-remote="${c.kind === 'remote_merged' ? '1' : ''}">
+            <span class="cl-name">${escapeHtml(c.name)}</span>
+            <span class="badge-meta">${escapeHtml(CLEANUP_KIND_LABEL[c.kind] || c.kind)}</span>
+            <span class="cl-reason">${escapeHtml(c.reason || '')}${c.author && !c.mine ? ' · ' + escapeHtml(c.author) : ''}</span>
+          </label>
+          ${forceable ? '<label class="cl-force" title="Force: override git safety refusal — may discard unmerged work"><input type="checkbox" class="cl-forcebox"> force</label>' : ''}
+          <span class="cl-result"></span>
+        </div>`;
+    }
+    body += '</div>';
+  }
+  content.innerHTML = `
+    <div class="cl-bar">
+      <button class="btn-settings-save" id="cleanupDeleteBtn">Delete selected</button>
+      <label class="status-check"><input type="checkbox" id="cleanupMineOnly" checked> Only my branches</label>
+      <span class="cl-hint">${total} candidate${total === 1 ? '' : 's'}. Tick items, then Delete. Use Refresh (top-right) to fetch &amp; prune first.</span>
+    </div>
+    <div class="cleanup mine-only" id="cleanupList">${body}</div>`;
+  const btn = document.getElementById('cleanupDeleteBtn');
+  if (btn) btn.addEventListener('click', onCleanupDelete);
+  const mineOnly = document.getElementById('cleanupMineOnly');
+  if (mineOnly) mineOnly.addEventListener('change', e => {
+    document.getElementById('cleanupList').classList.toggle('mine-only', e.target.checked);
+  });
+}
+
+// Map git's (often very verbose) stderr to a short row message; full text -> title.
+function cleanupShortError(err) {
+  if (!err) return 'failed';
+  if (/not fully merged/i.test(err)) return 'not fully merged — tick Force to delete';
+  if (/not clean|is dirty|contains modified|locked working tree|use .*--force/i.test(err)) return 'worktree not clean — tick Force';
+  if (/protected branch/i.test(err)) return 'protected branch';
+  if (/not a current cleanup candidate/i.test(err)) return 'no longer a candidate — Refresh';
+  return err.length > 80 ? err.slice(0, 80) + '…' : err;
+}
+
+async function onCleanupDelete() {
+  const picks = [...document.querySelectorAll('.cl-pick:checked')];
+  if (!picks.length) { toast('Nothing selected', true); return; }
+  const actions = picks.map(p => {
+    const row = p.closest('.cl-row');
+    return {
+      repo_path: p.dataset.repo, kind: p.dataset.kind, name: p.dataset.name,
+      worktree_path: p.dataset.wt || undefined,
+      force: !!row.querySelector('.cl-forcebox:checked'),
+      remote: p.dataset.remote === '1',
+    };
+  });
+  const remoteCount = actions.filter(a => a.remote).length;
+  const forceCount = actions.filter(a => a.force).length;
+  let msg = `Delete ${actions.length} item${actions.length === 1 ? '' : 's'}?`;
+  if (remoteCount) msg += `\n• ${remoteCount} REMOTE branch deletion(s) — pushed to origin, not easily undone.`;
+  if (forceCount) msg += `\n• ${forceCount} forced deletion(s) — may discard unmerged work.`;
+  if (!confirm(msg)) return;
+  const btn = document.getElementById('cleanupDeleteBtn');
+  btn.disabled = true; btn.textContent = 'Deleting…';
+  let results;
+  try {
+    const res = await fetch('/api/cleanup/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actions: actions.map(({ remote, ...a }) => a) }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(json.error || 'HTTP ' + res.status);
+    results = json.results || [];
+  } catch (e) {
+    toast('Delete failed: ' + e.message, true);
+    btn.disabled = false; btn.textContent = 'Delete selected';
+    return;
+  }
+  const rowsByKey = {};
+  for (const row of document.querySelectorAll('.cl-row')) rowsByKey[row.dataset.key] = row;
+  let okCount = 0;
+  for (const r of results) {
+    const row = rowsByKey[r.repo_path + '|' + r.kind + '|' + r.name];
+    if (!row) continue;
+    const out = row.querySelector('.cl-result');
+    const pick = row.querySelector('.cl-pick');
+    if (r.ok) {
+      okCount++;
+      row.classList.add('cl-done');
+      if (pick) { pick.checked = false; pick.disabled = true; }
+      if (out) out.textContent = '✓ removed';
+    } else {
+      if (out) { out.textContent = '✗ ' + cleanupShortError(r.error); out.title = r.error || ''; }
+      // Reveal the force toggle so the user can retry a refused safe delete.
+      const fb = row.querySelector('.cl-force');
+      if (fb) fb.classList.add('cl-force-show');
+    }
+  }
+  btn.disabled = false; btn.textContent = 'Delete selected';
+  toast(`${okCount}/${results.length} removed`);
+}
+
 function renderSettings() {
   const c = CONFIG;
   const fields = [
@@ -2944,6 +3146,12 @@ function renderSettings() {
     { key: 'CACHE_TTL', label: 'Cache TTL (seconds)', type: 'number',
       desc: 'How long per-PR detail data is cached before a background refresh.',
       value: c.cache_ttl ?? 30 },
+    { key: 'CLEANUP_REPOS', label: 'Cleanup repo paths', type: 'text',
+      desc: 'Local repo paths the Cleanup tab scans (comma-separated, e.g. ~/git/app,~/git/api). The agent-clone cache is always scanned too.',
+      value: (c.cleanup_repos || []).join(',') },
+    { key: 'CLEANUP_AUTHOR_EMAIL', label: 'Cleanup: my email', type: 'text',
+      desc: "Email treated as \"me\" for the Cleanup tab's \"Only my branches\" filter. Leave blank to use each repo's git config user.email.",
+      value: c.cleanup_author_email || '' },
     { key: 'EDITOR_CMD', label: 'Editor command', type: 'text',
       desc: 'Command used by "Open config folder ↗" on the Status tab. E.g. "code", "cursor", "subl". Leave blank to auto-detect (VS Code → system default).',
       value: c.editor_cmd || '' },
@@ -3194,6 +3402,10 @@ async function load(fresh) {
       const res = await fetch('/api/deployed');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       renderDeployed(await res.json());
+    } else if (currentTab === 'cleanup') {
+      const res = await fetch('/api/cleanup' + (fresh ? '?fresh=1' : ''));
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      renderCleanup(await res.json());
     } else if (currentTab === 'tickets') {
       const res = await fetch('/api/tickets' + (fresh ? '?fresh=1' : ''));
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -3586,6 +3798,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Never echo the token itself to the browser — only whether it is set.
                 "jira_token_set": bool(JIRA_API_TOKEN),
                 "jira_status_filter": JIRA_STATUS_FILTER,
+                "cleanup_repos": CLEANUP_REPOS,
+                "cleanup_author_email": CLEANUP_AUTHOR_EMAIL,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -3663,6 +3877,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 self._send_json(200, {"statuses": jira_statuses()})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if parsed.path == "/api/cleanup":
+            qs = parse_qs(parsed.query or "")
+            fresh = qs.get("fresh", ["0"])[0] in ("1", "true", "yes")
+            try:
+                self._send_json(200, scan_cleanup(fresh=fresh))
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
@@ -3745,6 +3967,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/tickets/transition":
             self._handle_ticket_transition_post()
+            return
+        if parsed.path == "/api/cleanup/delete":
+            self._handle_cleanup_delete_post()
             return
         if parsed.path == "/api/open-dir":
             self._handle_open_dir_post()
@@ -3855,10 +4080,11 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_settings_post(self):
         global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
         global JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_STATUS_FILTER
+        global CLEANUP_REPOS, CLEANUP_AUTHOR_EMAIL
         _allowed = {"FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "DEPLOY_TARGET",
                     "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
                     "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
-                    "JIRA_STATUS_FILTER"}
+                    "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL"}
         try:
             data = self._read_json_body()
             settings = data.get("settings", {})
@@ -3876,9 +4102,11 @@ class Handler(BaseHTTPRequestHandler):
                 value = str(value).strip()
                 if key == "JIRA_SITE":
                     value = _normalize_jira_site(value)
-                # JIRA_STATUS_FILTER may be written empty (clears the filter);
-                # every other key keeps its current value when blank.
-                if not value and key != "JIRA_STATUS_FILTER":
+                # These keys may be written empty (clears them); every other key
+                # keeps its current value when blank.
+                if not value and key not in (
+                    "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL"
+                ):
                     continue
                 try:
                     write_env_var(key, value)
@@ -3906,6 +4134,10 @@ class Handler(BaseHTTPRequestHandler):
                     JIRA_API_TOKEN = value
                 elif key == "JIRA_STATUS_FILTER":
                     JIRA_STATUS_FILTER = _env_list("JIRA_STATUS_FILTER")
+                elif key == "CLEANUP_REPOS":
+                    CLEANUP_REPOS = _env_list("CLEANUP_REPOS")
+                elif key == "CLEANUP_AUTHOR_EMAIL":
+                    CLEANUP_AUTHOR_EMAIL = value
         self._send_json(200, {"ok": True})
 
     def _handle_open_dir_post(self):
@@ -4001,6 +4233,54 @@ class Handler(BaseHTTPRequestHandler):
             return
         print(f"[tickets] transitioned {key} via {transition_id}", flush=True)
         self._send_json(200, {"ok": True})
+
+    def _handle_cleanup_delete_post(self):
+        try:
+            data = self._read_json_body()
+            actions = data.get("actions") or []
+            if not isinstance(actions, list):
+                raise ValueError("actions must be a list")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        allowed = {path for path, _label, _kind in cleanup_repo_targets()}
+        # Per-repo set of (kind, name, worktree_path) the scan actually surfaced.
+        # A client may only delete candidates the server itself flagged — this
+        # blocks crafted actions (e.g. deleting the default branch, or any branch
+        # the scan never offered) and subsumes the default/current-branch guard.
+        surfaced = {}
+
+        def _surfaced_for(path):
+            if path not in surfaced:
+                try:
+                    cands = cleanup.scan_repo(_git_runner, path)
+                except Exception:
+                    cands = []
+                surfaced[path] = {
+                    (c["kind"], c["name"], c.get("worktree_path") or "") for c in cands
+                }
+            return surfaced[path]
+
+        results = []
+        for action in actions:
+            result = dict(action)
+            repo_path = str(action.get("repo_path") or "")
+            if repo_path not in allowed:
+                result.update(ok=False, error="repo not allowed")
+                results.append(result)
+                continue
+            triple = (action.get("kind"), action.get("name"),
+                      str(action.get("worktree_path") or ""))
+            if triple not in _surfaced_for(repo_path):
+                result.update(ok=False, error="not a current cleanup candidate")
+                results.append(result)
+                continue
+            ok, err = cleanup.delete_candidate(_git_runner, action)
+            result.update(ok=ok, error=err)
+            print(f"[cleanup] {action.get('kind')} {action.get('name')} "
+                  f"in {repo_path} -> {'ok' if ok else err}", flush=True)
+            results.append(result)
+        self._send_json(200, {"results": results})
 
 
 def main():
