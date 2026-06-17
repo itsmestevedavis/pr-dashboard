@@ -1782,6 +1782,25 @@ INDEX_HTML = r"""<!doctype html>
     margin: 24px 0 8px;
   }
   .group-header:first-child { margin-top: 0; }
+  .ticket-group {
+    border-left: 2px solid var(--blue);
+    padding-left: 12px;
+    margin-bottom: 8px;
+  }
+  .ticket-header {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text);
+    margin: 4px 0 6px;
+  }
+  .ticket-header .ticket-count {
+    font-weight: 500;
+    font-size: 11px;
+    color: var(--muted);
+    margin-left: 6px;
+  }
+  .ticket-header .ticket-link { color: var(--blue); text-decoration: none; }
+  .ticket-group .pr:last-child { margin-bottom: 0; }
   .pr {
     background: var(--card);
     border: 1px solid var(--border);
@@ -2263,6 +2282,7 @@ const TABS = {
       not_reviewed_yet: 'Not reviewed yet',
     },
     render: renderMyPR,
+    subgroup: ticketKey,
   },
   tickets: {
     title: '🎫 My Jira tickets',
@@ -2303,6 +2323,14 @@ function relativeTime(iso) {
   return new Date(iso).toLocaleDateString();
 }
 
+// Extract a Jira ticket slug (e.g. "CGP-96") so PRs for the same ticket can be
+// grouped. The slug lives in the branch name by convention; fall back to the
+// title. Returns '' when no ticket is present so such PRs render ungrouped.
+function ticketKey(p) {
+  const m = /\b([A-Z][A-Z0-9]+-\d+)\b/.exec(`${p.headRefName || ''} ${p.title || ''}`);
+  return m ? m[1] : '';
+}
+
 function render(prs) {
   const content = document.getElementById('content');
   const tab = TABS[currentTab];
@@ -2323,10 +2351,45 @@ function render(prs) {
   for (const g of tab.groups) {
     if (!grouped[g].length) continue;
     html += `<div class="group-header">${escapeHtml(tab.headers[g])}</div>`;
-    for (const p of grouped[g]) html += tab.render(p);
+    html += renderGroupBody(grouped[g], tab);
   }
   content.innerHTML = html;
   // PR-card buttons are handled by the delegated #content listener (see initDelegation).
+}
+
+// Render the cards within one status group. When the tab opts into subgrouping
+// (tab.subgroup), PRs sharing a key (e.g. a Jira ticket) are clustered under a
+// sub-header. Clusters appear at the position of their first member, preserving
+// the backend ordering; singletons and keyless PRs render inline as before.
+function renderGroupBody(prs, tab) {
+  if (!tab.subgroup) return prs.map(tab.render).join('');
+  const counts = {};
+  for (const p of prs) {
+    const k = tab.subgroup(p);
+    if (k) counts[k] = (counts[k] || 0) + 1;
+  }
+  const rendered = new Set();
+  let html = '';
+  for (const p of prs) {
+    const k = tab.subgroup(p);
+    if (!k || counts[k] < 2) { html += tab.render(p); continue; }
+    if (rendered.has(k)) continue;
+    rendered.add(k);
+    const members = prs.filter(q => tab.subgroup(q) === k);
+    html += `<div class="ticket-group">`
+      + `<div class="ticket-header">${escapeHtml(k)}${ticketLink(k)} <span class="ticket-count">${members.length} PRs</span></div>`
+      + members.map(tab.render).join('')
+      + `</div>`;
+  }
+  return html;
+}
+
+// Link a Jira ticket key to its issue when a Jira site is configured.
+function ticketLink(key) {
+  const site = CONFIG.jira_site || '';
+  if (!site) return '';
+  const url = safeUrl(`https://${site}/browse/${key}`);
+  return url ? ` <a class="ticket-link" href="${escapeHtml(url)}" target="_blank" rel="noopener">↗</a>` : '';
 }
 
 function renderIncomingPR(p) {
