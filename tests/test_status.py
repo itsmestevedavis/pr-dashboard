@@ -31,10 +31,16 @@ def review(login, state, submitted_at="2026-05-01T00:00:00Z", typename="User"):
     }
 
 
-def thread(login, resolved=False, typename="User"):
+def thread(login, resolved=False, typename="User", outdated=False, last_author=None):
+    # `login` owns the thread (first comment). `last_author` is whoever commented
+    # last; defaults to the owner for a single-comment thread.
     return {
         "isResolved": resolved,
+        "isOutdated": outdated,
         "comments": {"nodes": [{"author": {"login": login, "__typename": typename}}]},
+        "lastComment": {
+            "nodes": [{"author": {"login": last_author or login, "__typename": "User"}}]
+        },
     }
 
 
@@ -84,6 +90,46 @@ class DetermineMyPrStatus(unittest.TestCase):
             self.me,
         )
         self.assertEqual(out["status"], "approved")
+
+    def test_thread_addressed_when_author_replied_last(self):
+        # Reviewer opened a thread; I replied last. Nothing left for me to
+        # address — the ball is in the reviewer's court.
+        out = determine_my_pr_status(
+            pr(review_decision="CHANGES_REQUESTED",
+               review_threads=[thread("alice", resolved=False, last_author=self.me)]),
+            self.me,
+        )
+        self.assertEqual(out["status"], "not_reviewed_yet")
+        self.assertEqual(out["active_commenters"], [])
+
+    def test_author_replied_last_nudges_reviewer_for_re_review(self):
+        out = determine_my_pr_status(
+            pr(review_decision="CHANGES_REQUESTED",
+               review_threads=[thread("alice", resolved=False, last_author=self.me)]),
+            self.me,
+        )
+        self.assertEqual(out["stale_reviewers"], ["alice"])
+        self.assertEqual(out["nudge_mode"], "re_review")
+        self.assertEqual(out["nudge_targets"], ["alice"])
+
+    def test_reviewer_replied_after_me_still_active(self):
+        # Back-and-forth where the reviewer got the last word → still my court.
+        out = determine_my_pr_status(
+            pr(review_decision="CHANGES_REQUESTED",
+               review_threads=[thread("alice", resolved=False, last_author="alice")]),
+            self.me,
+        )
+        self.assertEqual(out["status"], "has_comments")
+        self.assertEqual(out["active_commenters"], ["alice"])
+
+    def test_outdated_thread_doesnt_count(self):
+        out = determine_my_pr_status(
+            pr(review_decision="CHANGES_REQUESTED",
+               review_threads=[thread("alice", resolved=False, outdated=True)]),
+            self.me,
+        )
+        self.assertEqual(out["status"], "not_reviewed_yet")
+        self.assertEqual(out["active_commenters"], [])
 
     def test_changes_requested_review_body(self):
         out = determine_my_pr_status(

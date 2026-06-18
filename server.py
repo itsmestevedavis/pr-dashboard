@@ -191,10 +191,16 @@ def determine_my_pr_status(pr, me):
         if not login:
             continue
         reviewer_has_any_thread[login] = True
-        # A thread is "active" only if it is neither resolved nor outdated.
-        # Outdated means the code changed under the comment — the change was
-        # addressed by new commits, so it's no longer something I need to fix.
-        if not t.get("isResolved") and not t.get("isOutdated"):
+        # Whoever commented last decides whose court the ball is in. If I (the PR
+        # author) replied last, I've already addressed it — even if the thread is
+        # still open — so it shouldn't keep the PR in "has comments to address".
+        last_nodes = (t.get("lastComment") or {}).get("nodes") or []
+        last_author = (last_nodes[0].get("author") or {}).get("login") if last_nodes else None
+        author_replied_last = last_author == me
+        # A thread is "active" only if it is neither resolved nor outdated and I
+        # haven't already replied. Outdated means the code changed under the
+        # comment — addressed by new commits, so no longer something I need to fix.
+        if not t.get("isResolved") and not t.get("isOutdated") and not author_replied_last:
             reviewer_has_active_thread[login] = True
 
     unresolved_inline_authors = {
@@ -245,6 +251,16 @@ def determine_my_pr_status(pr, me):
         if login and login != me:
             stale_reviewers.add(login)
 
+    # Reviewers who left inline threads that I've since addressed (none still
+    # active) are waiting to take another look — nudge them for re-review, the
+    # same as a stale formal review. A reviewer with a still-active thread is
+    # left out: the ball is in my court, not theirs.
+    addressed_thread_reviewers = {
+        login for login in reviewer_has_any_thread
+        if login != me and login not in reviewer_has_active_thread
+    }
+    stale_reviewers |= addressed_thread_reviewers
+
     if review_decision == "APPROVED" and not active:
         status = "approved"
     elif active:
@@ -252,7 +268,9 @@ def determine_my_pr_status(pr, me):
     else:
         status = "not_reviewed_yet"
 
-    any_human_review = any(
+    # Inline review threads count as a human review even when the formal
+    # latestReviews list is empty (e.g. a dismissed/superseded review).
+    any_human_review = bool(reviewer_has_any_thread) or any(
         _is_human_author(r.get("author")) for r in latest_reviews
     )
     if stale_reviewers:
@@ -304,7 +322,11 @@ query($q: String!) {
         reviewThreads(first: 50) {
           nodes {
             isResolved
+            isOutdated
             comments(first: 1) {
+              nodes { author { login __typename } }
+            }
+            lastComment: comments(last: 1) {
               nodes { author { login __typename } }
             }
           }
