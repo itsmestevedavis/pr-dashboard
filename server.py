@@ -50,8 +50,8 @@ def _load_dotenv(path):
 
 
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-# Serializes .env rewrites and the config globals (FRESH_REVIEWERS, DEPLOY_TARGET,
-# etc.) that settings POSTs reassign while job threads / status GETs read them.
+# Serializes .env rewrites and the config globals (DEPLOY_TARGET, etc.) that
+# settings POSTs reassign while job threads / status GETs read them.
 # Reentrant so a handler can hold it across both write_env_var and the global update.
 _env_lock = threading.RLock()
 _load_dotenv(_ENV_PATH)
@@ -99,9 +99,6 @@ MY_STATUS_LABELS = {
     "has_comments": "Has comments",
     "not_reviewed_yet": "Not reviewed yet",
 }
-
-# Default reviewers to ping when a PR has no reviews yet.
-FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
 
 # Default deploy environment for all PRs (e.g. "csi-3"). Empty = no Deploy button shown.
 DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
@@ -237,27 +234,6 @@ def determine_my_pr_status(pr, me):
         unresolved_inline_authors | review_body_authors | general_comment_authors
     )
 
-    stale_reviewers = set()
-    for r in latest_reviews:
-        if r.get("state") not in ("CHANGES_REQUESTED", "COMMENTED"):
-            continue
-        author = r.get("author") or {}
-        if not _is_human_author(author):
-            continue
-        login = author.get("login")
-        if login and login != me:
-            stale_reviewers.add(login)
-
-    # Reviewers who left inline threads that I've since addressed (none still
-    # active) are waiting to take another look — nudge them for re-review, the
-    # same as a stale formal review. A reviewer with a still-active thread is
-    # left out: the ball is in my court, not theirs.
-    addressed_thread_reviewers = {
-        login for login in reviewer_has_any_thread
-        if login != me and login not in reviewer_has_active_thread
-    }
-    stale_reviewers |= addressed_thread_reviewers
-
     if review_decision == "APPROVED" and not active:
         status = "approved"
     elif active:
@@ -265,28 +241,10 @@ def determine_my_pr_status(pr, me):
     else:
         status = "not_reviewed_yet"
 
-    # Inline review threads count as a human review even when the formal
-    # latestReviews list is empty (e.g. a dismissed/superseded review).
-    any_human_review = bool(reviewer_has_any_thread) or any(
-        _is_human_author(r.get("author")) for r in latest_reviews
-    )
-    if stale_reviewers:
-        nudge_mode = "re_review"
-        nudge_targets = sorted(stale_reviewers)
-    elif not any_human_review:
-        nudge_mode = "fresh"
-        nudge_targets = list(FRESH_REVIEWERS)
-    else:
-        nudge_mode = None
-        nudge_targets = []
-
     return {
         "status": status,
         "status_label": MY_STATUS_LABELS[status],
         "active_commenters": sorted(active),
-        "stale_reviewers": sorted(stale_reviewers),
-        "nudge_mode": nudge_mode,
-        "nudge_targets": nudge_targets,
     }
 
 
@@ -792,7 +750,6 @@ LOG_DIR = "/tmp/pr-reviewer"
 _WORKFLOW_DIR = os.path.expanduser("~/.config/pr-dashboard")
 REVIEW_WORKFLOW        = os.path.join(_WORKFLOW_DIR, "review_workflow.md")
 ADDRESS_WORKFLOW       = os.path.join(_WORKFLOW_DIR, "address_workflow.md")
-NUDGE_WORKFLOW         = os.path.join(_WORKFLOW_DIR, "nudge_workflow.md")
 FIX_PIPELINE_WORKFLOW  = os.path.join(_WORKFLOW_DIR, "fix_pipeline_workflow.md")
 REBASE_WORKFLOW        = os.path.join(_WORKFLOW_DIR, "rebase_workflow.md")
 RE_REVIEW_WORKFLOW     = os.path.join(_WORKFLOW_DIR, "re_review_workflow.md")
@@ -844,18 +801,6 @@ After all threads are addressed:
    `gh api repos/{repo}/pulls/{number}/requested_reviewers --method POST -f "reviewers[]=<login>"`
 
 Do not ask questions. Do not open new PRs. Only modify files referenced in the comments.
-"""
-
-_DEFAULT_NUDGE_WORKFLOW = """\
-## Nudge steps
-
-1. For each GitHub login in the reviewers list, use the Slack MCP to find their Slack user ID by searching for their display name.
-
-2. Based on mode, send the appropriate message:
-   - `fresh`: DM each reviewer asking them to review the PR for the first time.
-   - `re_review`: DM each reviewer saying you have addressed their comments and asking them to take another look.
-
-3. Keep messages brief and friendly. Always include the PR title and URL.
 """
 
 _DEFAULT_FIX_PIPELINE_WORKFLOW = """\
@@ -983,7 +928,7 @@ class Job:
     def __init__(self, repo, number, kind):
         self.repo = repo
         self.number = number
-        self.kind = kind  # review | re_review | merge | address | fix_pipeline | rebase | nudge
+        self.kind = kind  # review | re_review | merge | address | fix_pipeline | rebase
         self.status = "running"  # running | done | failed | stopped
         self.result = None
         self.log = []
@@ -1626,72 +1571,10 @@ def run_rebase(job, head_ref: str, base_ref: str) -> None:
     print(f"[rebase] finished #{job.number}", flush=True)
 
 
-# ---- Nudge dispatch --------------------------------------------------------
-
-NUDGE_PROMPT = (
-    "I want to nudge these GitHub reviewers on Slack about my open PR:\n"
-    "  PR: {url}\n"
-    "  Title: {title}\n"
-    "  Reviewers (GitHub logins): {reviewers}\n"
-    "  Mode: {mode}\n\n"
-    "Mode meanings:\n"
-    "  - re_review: I've addressed their previous review comments; "
-    "DM each one asking them to take another look.\n"
-    "  - fresh: nobody has reviewed this PR yet; "
-    "DM each one asking them to review it for the first time.\n\n"
-)
-
-
 def _load_workflow(path):
     """Read a workflow .md file. Raises FileNotFoundError if missing."""
     with open(path) as f:
         return f.read().strip()
-
-
-def derive_nudge_result(events):
-    sent = 0
-    for ev in events:
-        if ev.get("type") != "assistant":
-            continue
-        for c in ev.get("message", {}).get("content", []):
-            if c.get("type") != "tool_use":
-                continue
-            name = c.get("name") or ""
-            if "slack_send_message" in name and "draft" not in name:
-                sent += 1
-    if sent == 0:
-        return {"sent": 0, "label": "No DMs sent"}
-    return {"sent": sent, "label": f"DM'd {sent} reviewer{'s' if sent != 1 else ''}"}
-
-
-def run_nudge(job, url, title, reviewers, mode):
-    """Spawn Claude to DM the reviewers on Slack via the Slack MCP."""
-    repo, number = job.repo, job.number
-    log_path = _job_log_path("nudge-", repo, number)
-    job.log_path = log_path
-    job.append(f"Nudging on Slack ({mode}, {len(reviewers)} DM(s)): {', '.join(reviewers)}")
-    print(f"[nudge] starting #{number} in {repo} mode={mode} reviewers={reviewers}", flush=True)
-
-    try:
-        workflow = _load_workflow(NUDGE_WORKFLOW)
-    except FileNotFoundError:
-        job.append(f"Nudge workflow file not found: {NUDGE_WORKFLOW}")
-        job.append("Use the Status tab to create it.")
-        job.finish("failed", "missing_workflow")
-        return
-
-    prompt = NUDGE_PROMPT.format(
-        url=url, title=title, reviewers=", ".join(reviewers),
-        mode=mode,
-    ) + "\n" + workflow
-    events = _stream_claude_job(job, prompt, log_path)
-    if events is None:
-        return
-
-    result = derive_nudge_result(events)
-    job.append(result["label"])
-    job.finish("done", result["label"])
-    print(f"[nudge] finished #{number} result={result['label']}", flush=True)
 
 
 # ---- Job POST routing ------------------------------------------------------
@@ -1708,18 +1591,6 @@ def _extract_merge(d):
     return (str(d.get("defaultMergeMethod") or "MERGE"),)
 
 
-def _extract_nudge(d):
-    url = str(d["url"])
-    title = str(d.get("title") or "")
-    reviewers = [str(r) for r in (d.get("reviewers") or []) if r]
-    mode = str(d.get("mode") or "re_review")
-    if mode not in ("re_review", "fresh"):
-        raise ValueError("mode must be re_review or fresh")
-    if not reviewers:
-        raise ValueError("no reviewers to nudge")
-    return (url, title, reviewers, mode)
-
-
 # path -> (job kind, runner fn, extract-extra-args fn or None).
 # The dispatcher (_dispatch_job_post) handles the shared number/repo parse,
 # job creation, thread spawn, and 202 envelope; `extract` returns the extra
@@ -1731,7 +1602,6 @@ _JOB_POST_ROUTES = {
     "/api/address":      ("address",      run_address,      lambda d: (_req_ref(d, "headRefName"),)),
     "/api/fix-pipeline": ("fix_pipeline", run_fix_pipeline, lambda d: (_req_ref(d, "headRefName"),)),
     "/api/rebase":       ("rebase",       run_rebase,       lambda d: (_req_ref(d, "headRefName"), _req_ref(d, "baseRefName"))),
-    "/api/nudge":        ("nudge",        run_nudge,        _extract_nudge),
 }
 
 
@@ -1900,18 +1770,6 @@ INDEX_HTML = r"""<!doctype html>
   .btn-fix-pipeline:disabled,
   .btn-rebase:disabled,
   .btn-address:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
-  .btn-nudge {
-    background: #6e40c9;
-    color: #fff;
-    border: none;
-    padding: 6px 14px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 500;
-  }
-  .btn-nudge:hover:not(:disabled) { background: #8957e5; }
-  .btn-nudge:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
   .btn-deploy {
     background: #0d1117;
     color: #3fb950;
@@ -2429,8 +2287,6 @@ function renderMyPR(p) {
   const commenters = p.active_commenters && p.active_commenters.length
     ? `<div class="pr-detail">From: ${escapeHtml(p.active_commenters.join(', '))}</div>`
     : '';
-  const targets = (p.nudge_targets || []).join(',');
-  const mode = p.nudge_mode || '';
   const needsRebase = p.merge_state_status === 'BEHIND';
   const hasConflicts = p.merge_state_status === 'DIRTY';
   const ciBlocked = ['FAILURE', 'ERROR'].includes(p.check_state);
@@ -2466,13 +2322,6 @@ function renderMyPR(p) {
     // not_reviewed_yet etc. — still expose an infra fix if the pipeline/branch is broken.
     actionBtn = infraFixBtn;
   }
-  const nudgeTargetNames = (p.nudge_targets || []).join(' and ') || 'reviewers';
-  const nudgeTitle = mode === 'fresh'
-    ? `DM ${nudgeTargetNames} to ask for first review`
-    : (mode === 're_review'
-        ? `DM ${nudgeTargetNames} asking them to take another look`
-        : 'No one to nudge');
-  const nudgeBtn = `<button class="btn-nudge" type="button" title="${escapeHtml(nudgeTitle)}">Nudge</button>`;
   const deployTarget = CONFIG.deploy_target || '';
   const deployWorkflow = deployTarget && (CONFIG.deploy_targets || {})[p.repository]?.[deployTarget];
   const alreadyDeployed = deployTarget && (deployedState[deployTarget] || [])
@@ -2490,9 +2339,7 @@ function renderMyPR(p) {
        data-title="${escapeHtml(p.title)}"
        data-head="${escapeHtml(p.headRefName)}"
        data-base="${escapeHtml(p.baseRefName)}"
-       data-method="${escapeHtml(p.defaultMergeMethod)}"
-       data-targets="${escapeHtml(targets)}"
-       data-mode="${escapeHtml(mode)}">
+       data-method="${escapeHtml(p.defaultMergeMethod)}">
     <div class="pr-main">
       <div class="pr-meta">${escapeHtml(p.repository)} · #${p.number}<span class="badge badge-${p.status}">${escapeHtml(p.status_label)}</span>${needsRebase ? '<span class="badge-warning">⚠ Needs rebase</span>' : hasConflicts ? '<span class="badge-warning">⚠ Has conflicts</span>' : ''}</div>
       <div class="pr-title"><a href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
@@ -2503,7 +2350,6 @@ function renderMyPR(p) {
     <div class="pr-actions">
       <a class="btn-open" href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">Open ↗</a>
       ${deployControls}
-      ${nudgeBtn}
       ${actionBtn}
     </div>
   </div>`;
@@ -2614,24 +2460,6 @@ function onRebase(btn) {
     'rebase', 'Rebasing…', finishRebase);
 }
 
-function onNudge(btn) {
-  const ctx = cardCtx(btn);
-  const title = ctx.card.dataset.title || '';
-  const mode = ctx.card.dataset.mode || '';
-  const targets = (ctx.card.dataset.targets || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (!mode || !targets.length) {
-    toast('No one to nudge — everyone has approved already.');
-    return;
-  }
-  const promptLabel = mode === 'fresh'
-    ? `Ask ${targets.join(' and ')} on Slack to review this PR?`
-    : `Nudge on Slack to re-review: ${targets.join(', ')}?`;
-  if (!confirm(promptLabel)) return;
-  startJob(ctx, '/api/nudge',
-    { number: ctx.number, repo: ctx.repo, url: ctx.url, title, reviewers: targets, mode },
-    'nudge', 'Nudging…', finishNudge);
-}
-
 async function onDeploy(btn) {
   const card = btn.closest('.pr');
   const repo = card.dataset.repo;
@@ -2706,20 +2534,6 @@ function finishRebase(card, url, data) {
   if (data.status === 'stopped') { setStoppedStatus(card, url); return; }
   const ok = data.status === 'done';
   setFinalStatus(card, ok ? 'approved' : 'failed', ok ? '✅ Rebased & pushed' : '❌ Rebase failed', url);
-}
-
-function finishNudge(card, url, data) {
-  if (data.status === 'stopped') {
-    setStoppedStatus(card, url, `<button class="btn-nudge" type="button">Nudge again</button>`);
-    return;
-  }
-  let cls = 'failed', label = '❌ Failed';
-  if (data.status === 'done') {
-    if (data.result === 'No DMs sent') {
-      cls = 'commented'; label = 'ℹ ' + data.result;
-    } else { cls = 'approved'; label = '✅ ' + data.result; }
-  }
-  setFinalStatus(card, cls, label, url);
 }
 
 // review and re-review share identical terminal logic (only the "again" button differs).
@@ -2885,7 +2699,6 @@ const CARD_ACTIONS = {
   'btn-address': onAddress,
   'btn-fix-pipeline': onFixPipeline,
   'btn-rebase': onRebase,
-  'btn-nudge': onNudge,
   'btn-deploy': onDeploy,
   'btn-stop': onStop,
   'btn-move': onMove,
@@ -3155,9 +2968,6 @@ async function onCleanupDelete() {
 function renderSettings() {
   const c = CONFIG;
   const fields = [
-    { key: 'FRESH_REVIEWERS', label: 'Fresh reviewers', type: 'text',
-      desc: 'GitHub logins to DM on Slack when nobody has reviewed your PR yet (comma-separated).',
-      value: (c.fresh_reviewers || []).join(',') },
     { key: 'DEPLOY_TARGET', label: 'Deploy target environment', type: 'text',
       desc: 'Default environment for the Deploy button on each PR card (e.g. csi-3).',
       value: c.deploy_target || '' },
@@ -3562,7 +3372,6 @@ def get_status():
         (REVIEW_WORKFLOW,       "review_workflow.md",       "Review workflow instructions"),
         (RE_REVIEW_WORKFLOW,    "re_review_workflow.md",    "Re-review workflow instructions"),
         (ADDRESS_WORKFLOW,      "address_workflow.md",      "Address workflow instructions"),
-        (NUDGE_WORKFLOW,        "nudge_workflow.md",        "Nudge workflow instructions"),
         (FIX_PIPELINE_WORKFLOW, "fix_pipeline_workflow.md", "Fix pipeline workflow instructions"),
         (REBASE_WORKFLOW,       "rebase_workflow.md",       "Rebase workflow instructions"),
         (DEPLOY_TARGETS_PATH,   "deploy_targets.json",
@@ -3597,11 +3406,6 @@ def get_status():
     check("gh", "gh CLI authenticated",
           gh_result.returncode == 0,
           gh_output[:500] if gh_output else "No output from gh auth status")
-
-    check("FRESH_REVIEWERS", "Slack nudge targets (.env)",
-          bool(FRESH_REVIEWERS),
-          "Logins: " + ", ".join(FRESH_REVIEWERS) if FRESH_REVIEWERS else "Not set — add FRESH_REVIEWERS=login1,login2 to .env",
-          fix={"action": "set_env", "key": "FRESH_REVIEWERS", "placeholder": "login1,login2"})
 
     check("DEPLOY_TARGET", "Default deploy environment (.env)",
           bool(DEPLOY_TARGET),
@@ -3807,7 +3611,6 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             config_json = json.dumps({
-                "fresh_reviewers": FRESH_REVIEWERS,
                 "deploy_targets": DEPLOY_TARGETS,
                 "deploy_target": DEPLOY_TARGET,
                 "cache_ttl": CACHE_TTL,
@@ -3919,7 +3722,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, "bad number")
                 return
             kind = qs.get("kind", ["review"])[0]
-            if kind not in ("review", "re_review", "merge", "address", "nudge", "fix_pipeline", "rebase"):
+            if kind not in ("review", "re_review", "merge", "address", "fix_pipeline", "rebase"):
                 self.send_error(400, "bad kind")
                 return
             if "/" not in repo or number <= 0:
@@ -4071,7 +3874,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_set_env_post(self):
-        global FRESH_REVIEWERS, DEPLOY_TARGET
+        global DEPLOY_TARGET
         try:
             data = self._read_json_body()
             key = str(data["key"])
@@ -4079,7 +3882,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": f"bad request: {e}"})
             return
-        if key not in ("FRESH_REVIEWERS", "DEPLOY_TARGET"):
+        if key not in ("DEPLOY_TARGET",):
             self._send_json(403, {"error": "key not allowed"})
             return
         if not value:
@@ -4088,9 +3891,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with _env_lock:
                 write_env_var(key, value)
-                if key == "FRESH_REVIEWERS":
-                    FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
-                elif key == "DEPLOY_TARGET":
+                if key == "DEPLOY_TARGET":
                     DEPLOY_TARGET = value
         except Exception as e:
             self._send_json(500, {"error": str(e)})
@@ -4098,10 +3899,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_settings_post(self):
-        global FRESH_REVIEWERS, DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
+        global DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
         global JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_STATUS_FILTER
         global CLEANUP_REPOS, CLEANUP_AUTHOR_EMAIL
-        _allowed = {"FRESH_REVIEWERS", "DEPLOY_TARGET",
+        _allowed = {"DEPLOY_TARGET",
                     "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
                     "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
                     "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL"}
@@ -4133,9 +3934,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._send_json(500, {"error": f"failed to write {key}: {e}"})
                     return
-                if key == "FRESH_REVIEWERS":
-                    FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
-                elif key == "DEPLOY_TARGET":
+                if key == "DEPLOY_TARGET":
                     DEPLOY_TARGET = value
                 elif key == "CACHE_TTL":
                     try:
@@ -4180,7 +3979,6 @@ class Handler(BaseHTTPRequestHandler):
             os.path.realpath(REVIEW_WORKFLOW):    _DEFAULT_REVIEW_WORKFLOW,
             os.path.realpath(RE_REVIEW_WORKFLOW): _DEFAULT_RE_REVIEW_WORKFLOW,
             os.path.realpath(ADDRESS_WORKFLOW):   _DEFAULT_ADDRESS_WORKFLOW,
-            os.path.realpath(NUDGE_WORKFLOW):         _DEFAULT_NUDGE_WORKFLOW,
             os.path.realpath(FIX_PIPELINE_WORKFLOW):  _DEFAULT_FIX_PIPELINE_WORKFLOW,
             os.path.realpath(REBASE_WORKFLOW):         _DEFAULT_REBASE_WORKFLOW,
             os.path.realpath(DEPLOY_TARGETS_PATH): json.dumps(

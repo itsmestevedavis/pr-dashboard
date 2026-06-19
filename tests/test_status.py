@@ -4,7 +4,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from server import determine_my_pr_status, FRESH_REVIEWERS
+from server import determine_my_pr_status
 
 
 def pr(
@@ -102,15 +102,16 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["status"], "not_reviewed_yet")
         self.assertEqual(out["active_commenters"], [])
 
-    def test_author_replied_last_nudges_reviewer_for_re_review(self):
+    def test_author_replied_last_thread_inactive(self):
+        # Author got the last word on an unresolved thread → not my-court, no
+        # active commenter, status falls back to not_reviewed_yet.
         out = determine_my_pr_status(
             pr(review_decision="CHANGES_REQUESTED",
                review_threads=[thread("alice", resolved=False, last_author=self.me)]),
             self.me,
         )
-        self.assertEqual(out["stale_reviewers"], ["alice"])
-        self.assertEqual(out["nudge_mode"], "re_review")
-        self.assertEqual(out["nudge_targets"], ["alice"])
+        self.assertEqual(out["status"], "not_reviewed_yet")
+        self.assertEqual(out["active_commenters"], [])
 
     def test_reviewer_replied_after_me_still_active(self):
         # Back-and-forth where the reviewer got the last word → still my court.
@@ -198,94 +199,6 @@ class DetermineMyPrStatus(unittest.TestCase):
         )
         self.assertEqual(out["status"], "has_comments")
         self.assertEqual(out["active_commenters"], ["alice"])
-
-    def test_stale_reviewers_changes_requested(self):
-        out = determine_my_pr_status(
-            pr(review_decision="CHANGES_REQUESTED",
-               latest_reviews=[review("alice", "CHANGES_REQUESTED")]),
-            self.me,
-        )
-        self.assertEqual(out["stale_reviewers"], ["alice"])
-
-    def test_stale_reviewers_commented_only(self):
-        out = determine_my_pr_status(
-            pr(review_decision="REVIEW_REQUIRED",
-               latest_reviews=[review("alice", "COMMENTED")]),
-            self.me,
-        )
-        self.assertEqual(out["stale_reviewers"], ["alice"])
-
-    def test_stale_reviewers_excludes_approvers(self):
-        out = determine_my_pr_status(
-            pr(review_decision="APPROVED",
-               latest_reviews=[review("alice", "APPROVED")]),
-            self.me,
-        )
-        self.assertEqual(out["stale_reviewers"], [])
-
-    def test_stale_reviewers_excludes_bots(self):
-        out = determine_my_pr_status(
-            pr(review_decision="CHANGES_REQUESTED",
-               latest_reviews=[review("codacy-production", "CHANGES_REQUESTED",
-                                      typename="Bot")]),
-            self.me,
-        )
-        self.assertEqual(out["stale_reviewers"], [])
-
-    def test_stale_reviewers_when_no_reviews(self):
-        out = determine_my_pr_status(
-            pr(review_decision="REVIEW_REQUIRED"),
-            self.me,
-        )
-        self.assertEqual(out["stale_reviewers"], [])
-
-    def test_stale_reviewers_mixed_states(self):
-        out = determine_my_pr_status(
-            pr(review_decision="CHANGES_REQUESTED",
-               latest_reviews=[
-                   review("alice", "CHANGES_REQUESTED"),
-                   review("bob", "APPROVED"),
-                   review("carol", "COMMENTED"),
-               ]),
-            self.me,
-        )
-        self.assertEqual(out["stale_reviewers"], ["alice", "carol"])
-
-    def test_nudge_re_review_when_stale_reviewers_exist(self):
-        out = determine_my_pr_status(
-            pr(review_decision="CHANGES_REQUESTED",
-               latest_reviews=[review("alice", "CHANGES_REQUESTED")]),
-            self.me,
-        )
-        self.assertEqual(out["nudge_mode"], "re_review")
-        self.assertEqual(out["nudge_targets"], ["alice"])
-
-    def test_nudge_fresh_when_no_human_reviews(self):
-        out = determine_my_pr_status(
-            pr(review_decision="REVIEW_REQUIRED"),
-            self.me,
-        )
-        self.assertEqual(out["nudge_mode"], "fresh")
-        self.assertEqual(out["nudge_targets"], list(FRESH_REVIEWERS))
-
-    def test_nudge_fresh_ignores_bot_reviews(self):
-        out = determine_my_pr_status(
-            pr(review_decision="REVIEW_REQUIRED",
-               latest_reviews=[review("codacy-production", "COMMENTED",
-                                      typename="Bot")]),
-            self.me,
-        )
-        self.assertEqual(out["nudge_mode"], "fresh")
-        self.assertEqual(out["nudge_targets"], list(FRESH_REVIEWERS))
-
-    def test_nudge_idle_when_everyone_approved(self):
-        out = determine_my_pr_status(
-            pr(review_decision="APPROVED",
-               latest_reviews=[review("alice", "APPROVED")]),
-            self.me,
-        )
-        self.assertIsNone(out["nudge_mode"])
-        self.assertEqual(out["nudge_targets"], [])
 
 
 if __name__ == "__main__":
