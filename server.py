@@ -100,6 +100,64 @@ MY_STATUS_LABELS = {
     "not_reviewed_yet": "Not reviewed yet",
 }
 
+# Default reviewers to ping when a PR has no reviews yet.
+FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
+
+# Team Slack channel for broadcast-style review requests.
+TEAM_CHANNEL_ID = os.environ.get("TEAM_CHANNEL_ID", "")
+
+# Extra named teams selectable from the Channel / Nudge dropdowns.
+# Format: JSON array of {name, channel_id, reviewers: [...]} objects.
+def _parse_teams():
+    raw = os.environ.get("TEAMS", "").strip()
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            raise ValueError("TEAMS must be a JSON array")
+        out = []
+        for i in items:
+            name = (i.get("name") or "").strip()
+            chan = (i.get("channel_id") or "").strip()
+            if not name or not chan:
+                print(f"[config] WARNING: skipping TEAMS entry with missing name/channel_id: {i!r}", flush=True)
+                continue
+            out.append({
+                "name": name,
+                "channel_id": chan,
+                "reviewers": [str(r) for r in i.get("reviewers", [])],
+            })
+        return out
+    except Exception as e:
+        print(f"[config] WARNING: failed to parse TEAMS: {e}", flush=True)
+        return []
+
+TEAMS = _parse_teams()
+
+# Maps GitHub logins to Slack member IDs (e.g. {"alice": "U01ABCDEF"}).
+# Used in run_nudge() to pass IDs directly, bypassing slack_search_users.
+def _parse_slack_ids():
+    raw = os.environ.get("SLACK_IDS", "").strip()
+    if not raw:
+        return {}
+    result = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            print(f"[config] WARNING: SLACK_IDS pair missing ':' — {pair!r}", flush=True)
+            continue
+        login, slack_id = (s.strip() for s in pair.split(":", 1))
+        if not login or not slack_id.startswith("U"):
+            print(f"[config] WARNING: invalid SLACK_IDS pair — {pair!r}", flush=True)
+            continue
+        result[login] = slack_id
+    return result
+
+SLACK_ID_MAP = _parse_slack_ids()
+
 # Default deploy environment for all PRs (e.g. "csi-3"). Empty = no Deploy button shown.
 DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
 
@@ -234,6 +292,17 @@ def determine_my_pr_status(pr, me):
         unresolved_inline_authors | review_body_authors | general_comment_authors
     )
 
+    stale_reviewers = set()
+    for r in latest_reviews:
+        if r.get("state") not in ("CHANGES_REQUESTED", "COMMENTED"):
+            continue
+        author = r.get("author") or {}
+        if not _is_human_author(author):
+            continue
+        login = author.get("login")
+        if login and login != me:
+            stale_reviewers.add(login)
+
     if review_decision == "APPROVED" and not active:
         status = "approved"
     elif active:
@@ -241,10 +310,24 @@ def determine_my_pr_status(pr, me):
     else:
         status = "not_reviewed_yet"
 
+    any_human_review = any(_is_human_author(r.get("author")) for r in latest_reviews)
+    if stale_reviewers:
+        nudge_mode = "re_review"
+        nudge_targets = sorted(stale_reviewers)
+    elif not any_human_review:
+        nudge_mode = "fresh"
+        nudge_targets = list(FRESH_REVIEWERS)
+    else:
+        nudge_mode = None
+        nudge_targets = []
+
     return {
         "status": status,
         "status_label": MY_STATUS_LABELS[status],
         "active_commenters": sorted(active),
+        "stale_reviewers": sorted(stale_reviewers),
+        "nudge_mode": nudge_mode,
+        "nudge_targets": nudge_targets,
     }
 
 
@@ -1541,6 +1624,79 @@ def run_fix_pipeline(job, head_ref: str) -> None:
     print(f"[fix-pipeline] finished #{job.number}", flush=True)
 
 
+# ---- Nudge dispatch --------------------------------------------------------
+
+NUDGE_PROMPT = (
+    "I want to nudge these GitHub reviewers on Slack about my open PR:\n"
+    "  PR: {url}\n"
+    "  Title: {title}\n"
+    "  Reviewers (GitHub logins or Slack member IDs): {reviewers}\n"
+    "  Mode: {mode}\n"
+    "  Channel ID: {channel}\n\n"
+    "Mode meanings:\n"
+    "  - re_review: I've addressed their previous review comments; "
+    "DM each one asking them to take another look.\n"
+    "  - fresh: nobody has reviewed this PR yet; "
+    "DM each one asking them to review it for the first time.\n"
+    "  - channel: post ONE message in the team channel (the Channel ID above) "
+    "using `<!here>` (do NOT tag the listed reviewers individually).\n\n"
+    "Follow the 'Nudging reviewers on Slack' workflow in your CLAUDE.md "
+    "exactly. Pick the message template that matches the mode. Do not deviate."
+)
+
+
+def count_slack_sends(events):
+    """Count `slack_send_message` tool calls in a Claude stream (excluding drafts)."""
+    sent = 0
+    for ev in events:
+        if ev.get("type") != "assistant":
+            continue
+        for c in ev.get("message", {}).get("content", []):
+            if c.get("type") != "tool_use":
+                continue
+            name = c.get("name") or ""
+            if "slack_send_message" in name and "draft" not in name:
+                sent += 1
+    return sent
+
+
+def derive_nudge_result(events, mode="re_review"):
+    sent = count_slack_sends(events)
+    if sent == 0:
+        return {
+            "sent": 0,
+            "label": "Channel post failed" if mode == "channel" else "No DMs sent",
+        }
+    if mode == "channel":
+        label = "Posted in team channel"
+    else:
+        label = f"DM'd {sent} reviewer{'s' if sent != 1 else ''}"
+    return {"sent": sent, "label": label}
+
+
+def run_nudge(job, url, title, reviewers, mode, channel_id=None):
+    """Spawn Claude to DM the reviewers on Slack via the Slack MCP."""
+    if channel_id is None:
+        channel_id = TEAM_CHANNEL_ID
+    resolved_reviewers = [SLACK_ID_MAP.get(r, r) for r in reviewers]
+    log_path = _job_log_path("nudge-", job.repo, job.number)
+    job.log_path = log_path
+    venue = f"#channel {channel_id}" if mode == "channel" else f"{len(resolved_reviewers)} DM(s)"
+    job.append(f"Nudging on Slack ({mode}, {venue}): {', '.join(reviewers)}")
+    print(f"[nudge] starting #{job.number} in {job.repo} mode={mode} reviewers={reviewers}", flush=True)
+    prompt = NUDGE_PROMPT.format(
+        url=url, title=title, reviewers=", ".join(resolved_reviewers),
+        mode=mode, channel=channel_id,
+    )
+    events = _stream_claude_job(job, prompt, log_path, stop_verb="Nudge stopped.")
+    if events is None:
+        return
+    result = derive_nudge_result(events, mode=mode)
+    job.append(result["label"])
+    job.finish("done", result["label"])
+    print(f"[nudge] finished #{job.number} result={result['label']}", flush=True)
+
+
 # ---- Rebase dispatch -------------------------------------------------------
 
 REBASE_PROMPT = (
@@ -1823,6 +1979,171 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-re-review:hover:not(:disabled) { background: #d97706; }
   .btn-re-review:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .btn-nudge {
+    background: #6e40c9;
+    color: #fff;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .btn-nudge:hover:not(:disabled) { background: #8957e5; }
+  .btn-nudge:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .nudge-split { position: relative; display: inline-flex; }
+  .nudge-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 220px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 8px;
+    z-index: 10;
+  }
+  .nudge-menu .nudge-template {
+    display: flex;
+    gap: 4px;
+    padding: 2px 2px 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 6px;
+  }
+  .nudge-menu .nudge-template button {
+    flex: 1;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .nudge-menu .nudge-template button[aria-pressed="true"] {
+    background: #6e40c9;
+    border-color: #6e40c9;
+    color: #fff;
+  }
+  .nudge-menu .nudge-section-label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 4px 4px;
+  }
+  .nudge-menu .btn-nudge-target {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .nudge-menu .btn-nudge-target:hover { background: #1c2128; }
+  .nudge-menu .btn-nudge-all {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    margin-top: 4px;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+  }
+  .nudge-menu .btn-nudge-all:hover { background: #1c2128; }
+  .btn-channel {
+    background: #d97706;
+    color: #fff;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .btn-channel:hover:not(:disabled) { background: #f59e0b; }
+  .btn-channel:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .nudge-teams-split { position: relative; display: inline-flex; }
+  .btn-nudge-teams-caret {
+    background: #6e40c9;
+    color: #fff;
+    border: none;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1;
+  }
+  .btn-nudge-teams-caret:hover:not(:disabled) { background: #8957e5; }
+  .nudge-teams-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 160px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 4px;
+    z-index: 10;
+  }
+  .nudge-teams-menu .menu-item,
+  .channel-menu .menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .nudge-teams-menu .menu-item:hover,
+  .channel-menu .menu-item:hover { background: #1c2128; }
+  .channel-split { position: relative; display: inline-flex; }
+  .channel-split .btn-channel {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .btn-channel-caret {
+    background: #d97706;
+    color: #fff;
+    border: none;
+    border-left: 1px solid rgba(0,0,0,0.25);
+    padding: 6px 8px;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1;
+  }
+  .btn-channel-caret:hover:not(:disabled) { background: #f59e0b; }
+  .channel-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 160px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 4px;
+  }
   .empty { text-align: center; color: var(--muted); padding: 48px; font-size: 16px; }
   .toast {
     position: fixed;
@@ -2331,6 +2652,73 @@ function renderMyPR(p) {
         ? `<button class="btn-deploy btn-deploy-live" type="button" data-env="${escapeHtml(deployTarget)}" title="Branch ${escapeHtml(p.headRefName)} is live — click to re-deploy">✅ ${escapeHtml(deployTarget.toUpperCase())}</button>`
         : `<button class="btn-deploy" type="button" data-env="${escapeHtml(deployTarget)}">Deploy to ${escapeHtml(deployTarget.toUpperCase())}</button>`)
     : '';
+
+  // Nudge / #Channel buttons
+  const mode = p.nudge_mode || '';
+  const pickable = (CONFIG.fresh_reviewers || []);
+  const defaultTemplate = mode === 're_review' ? 're_review' : 'fresh';
+  const allTargets = (mode === 're_review' && (p.nudge_targets || []).length)
+    ? p.nudge_targets
+    : pickable;
+  const templateBtns = `
+    <div class="nudge-template" role="group" aria-label="Slack template">
+      <button type="button" class="nudge-template-btn" data-template="fresh"
+        aria-pressed="${defaultTemplate === 'fresh'}"
+        title="Friendly first-look DM: could you take a look">Fresh</button>
+      <button type="button" class="nudge-template-btn" data-template="re_review"
+        aria-pressed="${defaultTemplate === 're_review'}"
+        title="Re-review DM: I've addressed your comments">Re-review</button>
+    </div>`;
+  const targetBtns = pickable.length
+    ? pickable.map(u => `<button class="btn-nudge-target" type="button" data-user="${escapeHtml(u)}">${escapeHtml(u)}</button>`).join('')
+    : `<div class="nudge-section-label">No FRESH_REVIEWERS configured</div>`;
+  const allBtn = allTargets.length
+    ? `<button class="btn-nudge-all" type="button" data-targets="${escapeHtml(allTargets.join(','))}">DM all (${allTargets.length})</button>`
+    : '';
+  const nudgeBtn = `
+    <div class="nudge-split">
+      <button class="btn-nudge" type="button" aria-haspopup="true" aria-expanded="false" title="Pick who to DM on Slack">Nudge</button>
+      <div class="nudge-menu" hidden>
+        ${templateBtns}
+        <div class="nudge-section-label">DM individually</div>
+        ${targetBtns}
+        ${allBtn}
+      </div>
+    </div>`;
+  let teamsBtn = '';
+  if (mode === 'fresh' && CONFIG.teams && CONFIG.teams.length > 0) {
+    const teamItems = CONFIG.teams.map(t =>
+      `<button class="menu-item btn-nudge-team" type="button"
+         data-team-name="${escapeHtml(t.name)}"
+         data-team-reviewers="${escapeHtml(JSON.stringify(t.reviewers))}"
+         title="Ask ${escapeHtml(t.name)} reviewers on Slack">${escapeHtml(t.name)}</button>`
+    ).join('');
+    teamsBtn = `<div class="nudge-teams-split">
+      <button class="btn-nudge-teams-caret" type="button" aria-label="Nudge a team" aria-haspopup="true" aria-expanded="false">Teams ▾</button>
+      <div class="nudge-teams-menu" hidden>${teamItems}</div>
+    </div>`;
+  }
+  const defaultChannelLabel = (CONFIG.fresh_reviewers || []).join(' and ') || 'the team';
+  let channelBtn = '';
+  if (CONFIG.team_channel_id) {
+    if (CONFIG.teams && CONFIG.teams.length > 0) {
+      const teamItems = CONFIG.teams.map(t =>
+        `<button class="menu-item btn-channel-team" type="button"
+           data-team-name="${escapeHtml(t.name)}"
+           data-team-channel-id="${escapeHtml(t.channel_id)}"
+           data-team-reviewers="${escapeHtml(JSON.stringify(t.reviewers))}"
+           title="Post in ${escapeHtml(t.name)} channel">${escapeHtml(t.name)}</button>`
+      ).join('');
+      channelBtn = `<div class="channel-split">
+        <button class="btn-channel" type="button" title="Post in team channel tagging ${escapeHtml(defaultChannelLabel)}">#dev channel</button>
+        <button class="btn-channel-caret" type="button" aria-label="Post in a different team's channel" aria-haspopup="true" aria-expanded="false">▾</button>
+        <div class="channel-menu" hidden>${teamItems}</div>
+      </div>`;
+    } else {
+      channelBtn = `<button class="btn-channel" type="button" title="Post in team channel tagging ${escapeHtml(defaultChannelLabel)}">#dev channel</button>`;
+    }
+  }
+
   return `
   <div class="pr"
        data-number="${p.number}"
@@ -2350,6 +2738,9 @@ function renderMyPR(p) {
     <div class="pr-actions">
       <a class="btn-open" href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">Open ↗</a>
       ${deployControls}
+      ${channelBtn}
+      ${nudgeBtn}
+      ${teamsBtn}
       ${actionBtn}
     </div>
   </div>`;
@@ -2450,6 +2841,252 @@ function onFixPipeline(btn) {
   startJob(ctx, '/api/fix-pipeline',
     { number: ctx.number, repo: ctx.repo, headRefName: ctx.card.dataset.head },
     'fix_pipeline', 'Fixing pipeline…', finishFixPipeline);
+}
+
+// ── Nudge / #Channel menu helpers ──────────────────────────────────────────
+
+function closeAllNudgeMenus() {
+  for (const menu of document.querySelectorAll('.nudge-menu')) {
+    menu.hidden = true;
+  }
+  for (const btn of document.querySelectorAll('.btn-nudge')) {
+    btn.setAttribute('aria-expanded', 'false');
+  }
+}
+
+function closeAllNudgeTeamsMenus() {
+  for (const menu of document.querySelectorAll('.nudge-teams-menu')) menu.hidden = true;
+  for (const caret of document.querySelectorAll('.btn-nudge-teams-caret')) caret.setAttribute('aria-expanded', 'false');
+}
+
+function closeAllChannelMenus() {
+  for (const menu of document.querySelectorAll('.channel-menu')) menu.hidden = true;
+  for (const caret of document.querySelectorAll('.btn-channel-caret')) caret.setAttribute('aria-expanded', 'false');
+}
+
+function onNudgeTeamsCaret(btn) {
+  const menu = btn.parentElement.querySelector('.nudge-teams-menu');
+  const willOpen = menu.hidden;
+  closeAllNudgeMenus();
+  closeAllChannelMenus();
+  closeAllNudgeTeamsMenus();
+  if (willOpen) {
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+  }
+}
+
+function onChannelCaret(btn) {
+  const menu = btn.parentElement.querySelector('.channel-menu');
+  const willOpen = menu.hidden;
+  closeAllNudgeMenus();
+  closeAllNudgeTeamsMenus();
+  closeAllChannelMenus();
+  if (willOpen) {
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+  }
+}
+
+// ── Nudge / #Channel core handlers (delegation-adapted: take btn element) ──
+
+function onNudge(btn) {
+  const menu = btn.parentElement.querySelector('.nudge-menu');
+  if (!menu) return;
+  const willOpen = menu.hidden;
+  closeAllNudgeTeamsMenus();
+  closeAllChannelMenus();
+  closeAllNudgeMenus();
+  if (willOpen) {
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+  }
+}
+
+function onNudgeTemplate(btn) {
+  const menu = btn.closest('.nudge-menu');
+  if (!menu) return;
+  for (const b of menu.querySelectorAll('.nudge-template-btn')) {
+    b.setAttribute('aria-pressed', b === btn ? 'true' : 'false');
+  }
+}
+
+function selectedTemplate(card) {
+  const pressed = card.querySelector('.nudge-template-btn[aria-pressed="true"]');
+  return pressed ? pressed.dataset.template : 'fresh';
+}
+
+async function fireNudge(card, reviewers, mode, runningLabel) {
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const title = card.dataset.title || '';
+  try {
+    const res = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, url, title, reviewers, mode }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, runningLabel, 'nudge');
+  streamJob(card, 'nudge', repo, number, url, finishNudge);
+}
+
+async function onNudgeTarget(btn) {
+  const card = btn.closest('.pr');
+  const user = btn.dataset.user;
+  if (!user) return;
+  const mode = selectedTemplate(card);
+  const label = mode === 're_review'
+    ? `Nudge ${user} on Slack to re-review?`
+    : `Ask ${user} on Slack to review this PR?`;
+  if (!confirm(label)) return;
+  closeAllNudgeMenus();
+  await fireNudge(card, [user], mode, `Nudging ${user}…`);
+}
+
+async function onNudgeAll(btn) {
+  const card = btn.closest('.pr');
+  const targets = (btn.dataset.targets || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!targets.length) {
+    toast('No one to nudge.');
+    return;
+  }
+  const mode = selectedTemplate(card);
+  const label = mode === 're_review'
+    ? `Nudge on Slack to re-review: ${targets.join(', ')}?`
+    : `Ask ${targets.join(' and ')} on Slack to review this PR?`;
+  if (!confirm(label)) return;
+  closeAllNudgeMenus();
+  await fireNudge(card, targets, mode, 'Nudging…');
+}
+
+function finishNudge(card, url, data) {
+  const actions = card.querySelector('.pr-actions');
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
+    if (data.result === 'No DMs sent' || data.result === 'Channel post failed') {
+      cls = 'commented'; label = 'ℹ ' + data.result;
+    } else {
+      cls = 'approved'; label = '✅ ' + data.result;
+    }
+  }
+  actions.innerHTML = `
+    <span class="review-status ${cls}">${escapeHtml(label)}</span>
+    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+  `;
+}
+
+async function onChannelPing(btn) {
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const title = card.dataset.title || '';
+  const targets = (CONFIG.fresh_reviewers || []).slice();
+  if (!targets.length) {
+    toast('No FRESH_REVIEWERS configured — set them in .env.', true);
+    return;
+  }
+  if (!CONFIG.team_channel_id) {
+    toast('No TEAM_CHANNEL_ID configured — set it in .env.', true);
+    return;
+  }
+  if (!confirm(`Post in team channel tagging ${targets.join(' and ')} to review this PR?`)) return;
+  try {
+    const res = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, url, title, reviewers: targets, mode: 'channel' }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, 'Posting in channel…', 'nudge');
+  streamJob(card, 'nudge', repo, number, url, finishNudge);
+}
+
+async function onNudgeTeam(btn) {
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const title = card.dataset.title || '';
+  const teamName = btn.dataset.teamName || 'team';
+  const reviewers = JSON.parse(btn.dataset.teamReviewers || '[]');
+  closeAllNudgeMenus();
+  closeAllNudgeTeamsMenus();
+  if (!reviewers.length) {
+    toast(`No reviewers configured for team "${teamName}".`, true);
+    return;
+  }
+  if (!confirm(`Ask ${reviewers.join(' and ')} (${teamName}) on Slack to review this PR?`)) return;
+  try {
+    const res = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, url, title, reviewers, mode: 'fresh' }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, 'Nudging…', 'nudge');
+  streamJob(card, 'nudge', repo, number, url, finishNudge);
+}
+
+async function onChannelTeam(btn) {
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const title = card.dataset.title || '';
+  const teamName = btn.dataset.teamName || 'team';
+  const channelId = btn.dataset.teamChannelId || '';
+  const reviewers = JSON.parse(btn.dataset.teamReviewers || '[]');
+  closeAllChannelMenus();
+  closeAllNudgeTeamsMenus();
+  if (!channelId) {
+    toast(`No channel_id configured for team "${teamName}".`, true);
+    return;
+  }
+  if (!reviewers.length) {
+    toast(`No reviewers configured for team "${teamName}".`, true);
+    return;
+  }
+  if (!confirm(`Post in ${teamName} channel tagging ${reviewers.join(' and ')}?`)) return;
+  try {
+    const res = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, url, title, reviewers, mode: 'channel', channel_id: channelId }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, 'Posting in channel…', 'nudge');
+  streamJob(card, 'nudge', repo, number, url, finishNudge);
 }
 
 function onRebase(btn) {
@@ -2702,6 +3339,15 @@ const CARD_ACTIONS = {
   'btn-deploy': onDeploy,
   'btn-stop': onStop,
   'btn-move': onMove,
+  'btn-nudge': onNudge,
+  'btn-nudge-target': onNudgeTarget,
+  'btn-nudge-all': onNudgeAll,
+  'nudge-template-btn': onNudgeTemplate,
+  'btn-channel': onChannelPing,
+  'btn-nudge-teams-caret': onNudgeTeamsCaret,
+  'btn-channel-caret': onChannelCaret,
+  'btn-nudge-team': onNudgeTeam,
+  'btn-channel-team': onChannelTeam,
 };
 
 function onContentClick(ev) {
@@ -3290,6 +3936,19 @@ async function load(fresh) {
 document.getElementById('refreshBtn').addEventListener('click', () => load(true));
 // Single delegated listener for all PR-card buttons across re-renders.
 document.getElementById('content').addEventListener('click', onContentClick);
+// Close nudge/channel menus when clicking outside them; also on Escape.
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('.nudge-split')) closeAllNudgeMenus();
+  if (!ev.target.closest('.nudge-teams-split')) closeAllNudgeTeamsMenus();
+  if (!ev.target.closest('.channel-split')) closeAllChannelMenus();
+});
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    closeAllNudgeMenus();
+    closeAllNudgeTeamsMenus();
+    closeAllChannelMenus();
+  }
+});
 for (const el of document.querySelectorAll('.tab')) {
   el.addEventListener('click', () => {
     if (el.dataset.tab === currentTab) return;
@@ -3625,6 +4284,9 @@ class Handler(BaseHTTPRequestHandler):
                 "jira_status_filter": JIRA_STATUS_FILTER,
                 "cleanup_repos": CLEANUP_REPOS,
                 "cleanup_author_email": CLEANUP_AUTHOR_EMAIL,
+                "fresh_reviewers": FRESH_REVIEWERS,
+                "team_channel_id": TEAM_CHANNEL_ID,
+                "teams": TEAMS,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -3722,7 +4384,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, "bad number")
                 return
             kind = qs.get("kind", ["review"])[0]
-            if kind not in ("review", "re_review", "merge", "address", "fix_pipeline", "rebase"):
+            if kind not in ("review", "re_review", "merge", "address", "fix_pipeline", "rebase", "nudge"):
                 self.send_error(400, "bad kind")
                 return
             if "/" not in repo or number <= 0:
@@ -3771,6 +4433,9 @@ class Handler(BaseHTTPRequestHandler):
         route = _JOB_POST_ROUTES.get(parsed.path)
         if route:
             self._dispatch_job_post(*route)
+            return
+        if parsed.path == "/api/nudge":
+            self._handle_nudge_post()
             return
         if parsed.path == "/api/job/stop":
             self._handle_stop_post()
@@ -3854,6 +4519,44 @@ class Handler(BaseHTTPRequestHandler):
             return
         job.stop()
         self._send_json(200, {"ok": True})
+
+    def _handle_nudge_post(self):
+        try:
+            data = self._read_json_body()
+            number = int(data["number"])
+            repo = str(data["repo"])
+            url = str(data["url"])
+            title = str(data.get("title") or "")
+            reviewers = data.get("reviewers") or []
+            mode = str(data.get("mode") or "re_review")
+            channel_id = str(data.get("channel_id") or TEAM_CHANNEL_ID)
+            allowed_channels = {TEAM_CHANNEL_ID, *(t["channel_id"] for t in TEAMS)} - {""}
+            if mode == "channel" and not channel_id:
+                raise ValueError("channel mode requires a channel_id (TEAM_CHANNEL_ID not configured)")
+            if channel_id and channel_id not in allowed_channels:
+                raise ValueError("channel_id not in allow-list")
+            if "/" not in repo:
+                raise ValueError("repo must be owner/name")
+            if mode not in ("re_review", "fresh", "channel"):
+                raise ValueError("mode must be re_review, fresh, or channel")
+            reviewers = [str(r) for r in reviewers if r]
+            if not reviewers:
+                raise ValueError("no reviewers to nudge")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        job, started = get_or_create_job(repo, number, "nudge")
+        if started:
+            threading.Thread(
+                target=run_nudge, args=(job, url, title, reviewers, mode, channel_id), daemon=True,
+            ).start()
+        self._send_json(202, {
+            "started": started,
+            "running": True,
+            "number": number,
+            "repo": repo,
+            "kind": "nudge",
+        })
 
     def _handle_create_dir_post(self):
         try:
