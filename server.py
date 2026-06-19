@@ -292,6 +292,17 @@ def determine_my_pr_status(pr, me):
         unresolved_inline_authors | review_body_authors | general_comment_authors
     )
 
+    stale_reviewers = set()
+    for r in latest_reviews:
+        if r.get("state") not in ("CHANGES_REQUESTED", "COMMENTED"):
+            continue
+        author = r.get("author") or {}
+        if not _is_human_author(author):
+            continue
+        login = author.get("login")
+        if login and login != me:
+            stale_reviewers.add(login)
+
     if review_decision == "APPROVED" and not active:
         status = "approved"
     elif active:
@@ -299,10 +310,24 @@ def determine_my_pr_status(pr, me):
     else:
         status = "not_reviewed_yet"
 
+    any_human_review = any(_is_human_author(r.get("author")) for r in latest_reviews)
+    if stale_reviewers:
+        nudge_mode = "re_review"
+        nudge_targets = sorted(stale_reviewers)
+    elif not any_human_review:
+        nudge_mode = "fresh"
+        nudge_targets = list(FRESH_REVIEWERS)
+    else:
+        nudge_mode = None
+        nudge_targets = []
+
     return {
         "status": status,
         "status_label": MY_STATUS_LABELS[status],
         "active_commenters": sorted(active),
+        "stale_reviewers": sorted(stale_reviewers),
+        "nudge_mode": nudge_mode,
+        "nudge_targets": nudge_targets,
     }
 
 

@@ -4,6 +4,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import server
 from server import determine_my_pr_status
 
 
@@ -199,6 +200,85 @@ class DetermineMyPrStatus(unittest.TestCase):
         )
         self.assertEqual(out["status"], "has_comments")
         self.assertEqual(out["active_commenters"], ["alice"])
+
+
+def _pr_with_reviews(latest_reviews_list):
+    """Build a minimal PR fixture with the given latestReviews nodes.
+
+    Uses the same dict shape as the existing `pr()` helper above but
+    focuses on latestReviews, leaving everything else empty/default.
+    """
+    return pr(
+        review_decision="REVIEW_REQUIRED",
+        latest_reviews=latest_reviews_list,
+    )
+
+
+class NudgeFields(unittest.TestCase):
+    """Tests for the stale_reviewers / nudge_mode / nudge_targets fields."""
+
+    def test_stale_reviewer_drives_re_review_nudge(self):
+        fixture = _pr_with_reviews([
+            {"state": "CHANGES_REQUESTED", "author": {"login": "alice", "__typename": "User"}},
+        ])
+        out = server.determine_my_pr_status(fixture, me="me")
+        self.assertEqual(out["stale_reviewers"], ["alice"])
+        self.assertEqual(out["nudge_mode"], "re_review")
+        self.assertEqual(out["nudge_targets"], ["alice"])
+
+    def test_commented_reviewer_drives_re_review_nudge(self):
+        fixture = _pr_with_reviews([
+            {"state": "COMMENTED", "author": {"login": "bob", "__typename": "User"}},
+        ])
+        out = server.determine_my_pr_status(fixture, me="me")
+        self.assertEqual(out["stale_reviewers"], ["bob"])
+        self.assertEqual(out["nudge_mode"], "re_review")
+        self.assertEqual(out["nudge_targets"], ["bob"])
+
+    def test_no_human_reviews_drives_fresh_nudge(self):
+        original = server.FRESH_REVIEWERS
+        server.FRESH_REVIEWERS = ["bob", "carol"]
+        try:
+            fixture = _pr_with_reviews([])
+            out = server.determine_my_pr_status(fixture, me="me")
+            self.assertEqual(out["nudge_mode"], "fresh")
+            self.assertEqual(out["nudge_targets"], ["bob", "carol"])
+        finally:
+            server.FRESH_REVIEWERS = original
+
+    def test_me_excluded_from_stale_reviewers(self):
+        fixture = _pr_with_reviews([
+            {"state": "CHANGES_REQUESTED", "author": {"login": "me", "__typename": "User"}},
+        ])
+        out = server.determine_my_pr_status(fixture, me="me")
+        self.assertEqual(out["stale_reviewers"], [])
+        self.assertIsNone(out["nudge_mode"])
+        self.assertEqual(out["nudge_targets"], [])
+
+    def test_bot_reviewer_excluded_from_stale(self):
+        fixture = _pr_with_reviews([
+            {"state": "CHANGES_REQUESTED", "author": {"login": "codecov", "__typename": "Bot"}},
+        ])
+        out = server.determine_my_pr_status(fixture, me="me")
+        self.assertEqual(out["stale_reviewers"], [])
+
+    def test_approved_review_gives_none_nudge(self):
+        fixture = _pr_with_reviews([
+            {"state": "APPROVED", "author": {"login": "alice", "__typename": "User"}},
+        ])
+        out = server.determine_my_pr_status(fixture, me="me")
+        self.assertEqual(out["stale_reviewers"], [])
+        self.assertIsNone(out["nudge_mode"])
+        self.assertEqual(out["nudge_targets"], [])
+
+    def test_stale_reviewers_sorted(self):
+        fixture = _pr_with_reviews([
+            {"state": "CHANGES_REQUESTED", "author": {"login": "zara", "__typename": "User"}},
+            {"state": "COMMENTED", "author": {"login": "alice", "__typename": "User"}},
+        ])
+        out = server.determine_my_pr_status(fixture, me="me")
+        self.assertEqual(out["stale_reviewers"], ["alice", "zara"])
+        self.assertEqual(out["nudge_targets"], ["alice", "zara"])
 
 
 if __name__ == "__main__":
