@@ -103,9 +103,6 @@ MY_STATUS_LABELS = {
 # Default reviewers to ping when a PR has no reviews yet.
 FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
 
-# Team Slack channel for broadcast-style review requests.
-TEAM_CHANNEL_ID = os.environ.get("TEAM_CHANNEL_ID", "")
-
 # Default deploy environment for all PRs (e.g. "csi-3"). Empty = no Deploy button shown.
 DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
 
@@ -857,11 +854,8 @@ _DEFAULT_NUDGE_WORKFLOW = """\
 2. Based on mode, send the appropriate message:
    - `fresh`: DM each reviewer asking them to review the PR for the first time.
    - `re_review`: DM each reviewer saying you have addressed their comments and asking them to take another look.
-   - `channel`: Post ONE message in the Slack channel tagging all reviewers with @mentions. Do NOT send individual DMs.
 
 3. Keep messages brief and friendly. Always include the PR title and URL.
-
-Do not DM when mode is `channel`. Do not post to channel when mode is `fresh` or `re_review`.
 """
 
 _DEFAULT_FIX_PIPELINE_WORKFLOW = """\
@@ -1639,15 +1633,12 @@ NUDGE_PROMPT = (
     "  PR: {url}\n"
     "  Title: {title}\n"
     "  Reviewers (GitHub logins): {reviewers}\n"
-    "  Mode: {mode}\n"
-    "  Channel ID: {channel}\n\n"
+    "  Mode: {mode}\n\n"
     "Mode meanings:\n"
     "  - re_review: I've addressed their previous review comments; "
     "DM each one asking them to take another look.\n"
     "  - fresh: nobody has reviewed this PR yet; "
-    "DM each one asking them to review it for the first time.\n"
-    "  - channel: post ONE message in the team channel (the Channel ID above) "
-    "tagging the listed reviewers with Slack mentions.\n\n"
+    "DM each one asking them to review it for the first time.\n\n"
 )
 
 
@@ -1657,7 +1648,7 @@ def _load_workflow(path):
         return f.read().strip()
 
 
-def derive_nudge_result(events, mode="re_review"):
+def derive_nudge_result(events):
     sent = 0
     for ev in events:
         if ev.get("type") != "assistant":
@@ -1669,15 +1660,8 @@ def derive_nudge_result(events, mode="re_review"):
             if "slack_send_message" in name and "draft" not in name:
                 sent += 1
     if sent == 0:
-        return {
-            "sent": 0,
-            "label": "Channel post failed" if mode == "channel" else "No DMs sent",
-        }
-    if mode == "channel":
-        label = "Posted in team channel"
-    else:
-        label = f"DM'd {sent} reviewer{'s' if sent != 1 else ''}"
-    return {"sent": sent, "label": label}
+        return {"sent": 0, "label": "No DMs sent"}
+    return {"sent": sent, "label": f"DM'd {sent} reviewer{'s' if sent != 1 else ''}"}
 
 
 def run_nudge(job, url, title, reviewers, mode):
@@ -1685,11 +1669,7 @@ def run_nudge(job, url, title, reviewers, mode):
     repo, number = job.repo, job.number
     log_path = _job_log_path("nudge-", repo, number)
     job.log_path = log_path
-    venue = (
-        f"#channel {TEAM_CHANNEL_ID}" if mode == "channel"
-        else f"{len(reviewers)} DM(s)"
-    )
-    job.append(f"Nudging on Slack ({mode}, {venue}): {', '.join(reviewers)}")
+    job.append(f"Nudging on Slack ({mode}, {len(reviewers)} DM(s)): {', '.join(reviewers)}")
     print(f"[nudge] starting #{number} in {repo} mode={mode} reviewers={reviewers}", flush=True)
 
     try:
@@ -1702,13 +1682,13 @@ def run_nudge(job, url, title, reviewers, mode):
 
     prompt = NUDGE_PROMPT.format(
         url=url, title=title, reviewers=", ".join(reviewers),
-        mode=mode, channel=TEAM_CHANNEL_ID,
+        mode=mode,
     ) + "\n" + workflow
     events = _stream_claude_job(job, prompt, log_path)
     if events is None:
         return
 
-    result = derive_nudge_result(events, mode=mode)
+    result = derive_nudge_result(events)
     job.append(result["label"])
     job.finish("done", result["label"])
     print(f"[nudge] finished #{number} result={result['label']}", flush=True)
@@ -1733,8 +1713,8 @@ def _extract_nudge(d):
     title = str(d.get("title") or "")
     reviewers = [str(r) for r in (d.get("reviewers") or []) if r]
     mode = str(d.get("mode") or "re_review")
-    if mode not in ("re_review", "fresh", "channel"):
-        raise ValueError("mode must be re_review, fresh, or channel")
+    if mode not in ("re_review", "fresh"):
+        raise ValueError("mode must be re_review or fresh")
     if not reviewers:
         raise ValueError("no reviewers to nudge")
     return (url, title, reviewers, mode)
@@ -1932,18 +1912,6 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-nudge:hover:not(:disabled) { background: #8957e5; }
   .btn-nudge:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
-  .btn-channel {
-    background: #d97706;
-    color: #fff;
-    border: none;
-    padding: 6px 14px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 500;
-  }
-  .btn-channel:hover:not(:disabled) { background: #f59e0b; }
-  .btn-channel:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
   .btn-deploy {
     background: #0d1117;
     color: #3fb950;
@@ -2499,14 +2467,12 @@ function renderMyPR(p) {
     actionBtn = infraFixBtn;
   }
   const nudgeTargetNames = (p.nudge_targets || []).join(' and ') || 'reviewers';
-  const channelTargetNames = (CONFIG.fresh_reviewers || []).join(' and ') || 'reviewers';
   const nudgeTitle = mode === 'fresh'
     ? `DM ${nudgeTargetNames} to ask for first review`
     : (mode === 're_review'
         ? `DM ${nudgeTargetNames} asking them to take another look`
         : 'No one to nudge');
   const nudgeBtn = `<button class="btn-nudge" type="button" title="${escapeHtml(nudgeTitle)}">Nudge</button>`;
-  const channelBtn = `<button class="btn-channel" type="button" title="Post in team channel tagging ${escapeHtml(channelTargetNames)}">#Channel</button>`;
   const deployTarget = CONFIG.deploy_target || '';
   const deployWorkflow = deployTarget && (CONFIG.deploy_targets || {})[p.repository]?.[deployTarget];
   const alreadyDeployed = deployTarget && (deployedState[deployTarget] || [])
@@ -2537,7 +2503,6 @@ function renderMyPR(p) {
     <div class="pr-actions">
       <a class="btn-open" href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">Open ↗</a>
       ${deployControls}
-      ${channelBtn}
       ${nudgeBtn}
       ${actionBtn}
     </div>
@@ -2667,24 +2632,6 @@ function onNudge(btn) {
     'nudge', 'Nudging…', finishNudge);
 }
 
-function onChannelPing(btn) {
-  const ctx = cardCtx(btn);
-  const title = ctx.card.dataset.title || '';
-  const targets = (CONFIG.fresh_reviewers || []).slice();
-  if (!targets.length) {
-    toast('No FRESH_REVIEWERS configured — set them in .env.', true);
-    return;
-  }
-  if (!CONFIG.team_channel_id) {
-    toast('No TEAM_CHANNEL_ID configured — set it in .env.', true);
-    return;
-  }
-  if (!confirm(`Post in team channel tagging ${targets.join(' and ')} to review this PR?`)) return;
-  startJob(ctx, '/api/nudge',
-    { number: ctx.number, repo: ctx.repo, url: ctx.url, title, reviewers: targets, mode: 'channel' },
-    'nudge', 'Posting in channel…', finishNudge);
-}
-
 async function onDeploy(btn) {
   const card = btn.closest('.pr');
   const repo = card.dataset.repo;
@@ -2768,7 +2715,7 @@ function finishNudge(card, url, data) {
   }
   let cls = 'failed', label = '❌ Failed';
   if (data.status === 'done') {
-    if (data.result === 'No DMs sent' || data.result === 'Channel post failed') {
+    if (data.result === 'No DMs sent') {
       cls = 'commented'; label = 'ℹ ' + data.result;
     } else { cls = 'approved'; label = '✅ ' + data.result; }
   }
@@ -2939,7 +2886,6 @@ const CARD_ACTIONS = {
   'btn-fix-pipeline': onFixPipeline,
   'btn-rebase': onRebase,
   'btn-nudge': onNudge,
-  'btn-channel': onChannelPing,
   'btn-deploy': onDeploy,
   'btn-stop': onStop,
   'btn-move': onMove,
@@ -3212,9 +3158,6 @@ function renderSettings() {
     { key: 'FRESH_REVIEWERS', label: 'Fresh reviewers', type: 'text',
       desc: 'GitHub logins to DM on Slack when nobody has reviewed your PR yet (comma-separated).',
       value: (c.fresh_reviewers || []).join(',') },
-    { key: 'TEAM_CHANNEL_ID', label: 'Team Slack channel ID', type: 'text',
-      desc: 'Slack channel ID for the #Channel button. Find it in Slack: right-click channel → View channel details.',
-      value: c.team_channel_id || '' },
     { key: 'DEPLOY_TARGET', label: 'Deploy target environment', type: 'text',
       desc: 'Default environment for the Deploy button on each PR card (e.g. csi-3).',
       value: c.deploy_target || '' },
@@ -3660,11 +3603,6 @@ def get_status():
           "Logins: " + ", ".join(FRESH_REVIEWERS) if FRESH_REVIEWERS else "Not set — add FRESH_REVIEWERS=login1,login2 to .env",
           fix={"action": "set_env", "key": "FRESH_REVIEWERS", "placeholder": "login1,login2"})
 
-    check("TEAM_CHANNEL_ID", "Team Slack channel (.env)",
-          bool(TEAM_CHANNEL_ID),
-          f"Channel ID: {TEAM_CHANNEL_ID}" if TEAM_CHANNEL_ID else "Not set — add TEAM_CHANNEL_ID=C... to .env",
-          fix={"action": "set_env", "key": "TEAM_CHANNEL_ID", "placeholder": "C0123456789"})
-
     check("DEPLOY_TARGET", "Default deploy environment (.env)",
           bool(DEPLOY_TARGET),
           f"Target: {DEPLOY_TARGET}" if DEPLOY_TARGET else "Not set — add DEPLOY_TARGET=csi-3 to .env to show Deploy buttons",
@@ -3870,7 +3808,6 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             config_json = json.dumps({
                 "fresh_reviewers": FRESH_REVIEWERS,
-                "team_channel_id": TEAM_CHANNEL_ID,
                 "deploy_targets": DEPLOY_TARGETS,
                 "deploy_target": DEPLOY_TARGET,
                 "cache_ttl": CACHE_TTL,
@@ -4134,7 +4071,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_set_env_post(self):
-        global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET
+        global FRESH_REVIEWERS, DEPLOY_TARGET
         try:
             data = self._read_json_body()
             key = str(data["key"])
@@ -4142,7 +4079,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": f"bad request: {e}"})
             return
-        if key not in ("FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "DEPLOY_TARGET"):
+        if key not in ("FRESH_REVIEWERS", "DEPLOY_TARGET"):
             self._send_json(403, {"error": "key not allowed"})
             return
         if not value:
@@ -4153,8 +4090,6 @@ class Handler(BaseHTTPRequestHandler):
                 write_env_var(key, value)
                 if key == "FRESH_REVIEWERS":
                     FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
-                elif key == "TEAM_CHANNEL_ID":
-                    TEAM_CHANNEL_ID = value
                 elif key == "DEPLOY_TARGET":
                     DEPLOY_TARGET = value
         except Exception as e:
@@ -4163,10 +4098,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_settings_post(self):
-        global FRESH_REVIEWERS, TEAM_CHANNEL_ID, DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
+        global FRESH_REVIEWERS, DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
         global JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_STATUS_FILTER
         global CLEANUP_REPOS, CLEANUP_AUTHOR_EMAIL
-        _allowed = {"FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "DEPLOY_TARGET",
+        _allowed = {"FRESH_REVIEWERS", "DEPLOY_TARGET",
                     "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
                     "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
                     "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL"}
@@ -4200,8 +4135,6 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if key == "FRESH_REVIEWERS":
                     FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
-                elif key == "TEAM_CHANNEL_ID":
-                    TEAM_CHANNEL_ID = value
                 elif key == "DEPLOY_TARGET":
                     DEPLOY_TARGET = value
                 elif key == "CACHE_TTL":
