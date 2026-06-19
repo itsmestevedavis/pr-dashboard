@@ -135,8 +135,9 @@ def _parse_teams():
 
 TEAMS = _parse_teams()
 
-# Maps GitHub logins to Slack member IDs (e.g. {"alice": "U01ABCDEF"}).
-# Used in run_nudge() to pass IDs directly, bypassing slack_search_users.
+# Maps GitHub logins to Slack handles (e.g. {"alice": "@alice"}) or member IDs
+# (e.g. {"alice": "U01ABCDEF"}). Used in run_nudge() to pass the Slack identity
+# directly, so the nudge workflow can DM without a GitHub→Slack lookup.
 def _parse_slack_ids():
     raw = os.environ.get("SLACK_IDS", "").strip()
     if not raw:
@@ -150,8 +151,9 @@ def _parse_slack_ids():
             print(f"[config] WARNING: SLACK_IDS pair missing ':' — {pair!r}", flush=True)
             continue
         login, slack_id = (s.strip() for s in pair.split(":", 1))
-        if not login or not slack_id.startswith("U"):
-            print(f"[config] WARNING: invalid SLACK_IDS pair — {pair!r}", flush=True)
+        if not login or not (slack_id.startswith("@") or slack_id.startswith("U")):
+            print(f"[config] WARNING: invalid SLACK_IDS pair (value must be a Slack "
+                  f"@handle or U… member ID) — {pair!r}", flush=True)
             continue
         result[login] = slack_id
     return result
@@ -1630,7 +1632,7 @@ NUDGE_PROMPT = (
     "I want to nudge these GitHub reviewers on Slack about my open PR:\n"
     "  PR: {url}\n"
     "  Title: {title}\n"
-    "  Reviewers (GitHub logins or Slack member IDs): {reviewers}\n"
+    "  Reviewers (GitHub logins, Slack @handles, or Slack member IDs): {reviewers}\n"
     "  Mode: {mode}\n"
     "  Channel ID: {channel}\n\n"
     "Mode meanings:\n"
@@ -3636,6 +3638,18 @@ function renderSettings() {
     { key: 'CLEANUP_AUTHOR_EMAIL', label: 'Cleanup: my email', type: 'text',
       desc: "Email treated as \"me\" for the Cleanup tab's \"Only my branches\" filter. Leave blank to use each repo's git config user.email.",
       value: c.cleanup_author_email || '' },
+    { key: 'FRESH_REVIEWERS', label: 'Nudge: fresh reviewers', type: 'text',
+      desc: 'Comma-separated GitHub logins to DM (fresh mode) and tag (#Channel) when nobody has reviewed your PR yet. Blank hides the fresh-mode targets.',
+      value: (c.fresh_reviewers || []).join(',') },
+    { key: 'TEAM_CHANNEL_ID', label: 'Nudge: team channel ID', type: 'text',
+      desc: 'Slack channel ID (e.g. C01ABCDEF) the #Channel button posts in. Blank hides the #Channel button.',
+      value: c.team_channel_id || '' },
+    { key: 'SLACK_IDS', label: 'Nudge: GitHub→Slack IDs', type: 'text',
+      desc: 'Maps each GitHub login to a Slack member ID (U…), or an @handle, so nudges DM the right person without a lookup. Format: githubid:U01ABC,login2:U02DEF (comma-separated).',
+      value: c.slack_ids || '' },
+    { key: 'TEAMS', label: 'Nudge: extra teams (JSON)', type: 'text',
+      desc: 'Optional JSON array of extra teams for the Nudge/#Channel dropdowns, e.g. [{"name":"Platform","channel_id":"C0DEF456","reviewers":["charlie"]}]. Blank for none.',
+      value: (c.teams && c.teams.length) ? JSON.stringify(c.teams) : '' },
     { key: 'EDITOR_CMD', label: 'Editor command', type: 'text',
       desc: 'Command used by "Open config folder ↗" on the Status tab. E.g. "code", "cursor", "subl". Leave blank to auto-detect (VS Code → system default).',
       value: c.editor_cmd || '' },
@@ -4287,6 +4301,7 @@ class Handler(BaseHTTPRequestHandler):
                 "fresh_reviewers": FRESH_REVIEWERS,
                 "team_channel_id": TEAM_CHANNEL_ID,
                 "teams": TEAMS,
+                "slack_ids": ",".join(f"{k}:{v}" for k, v in SLACK_ID_MAP.items()),
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -4605,10 +4620,12 @@ class Handler(BaseHTTPRequestHandler):
         global DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
         global JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_STATUS_FILTER
         global CLEANUP_REPOS, CLEANUP_AUTHOR_EMAIL
+        global FRESH_REVIEWERS, TEAM_CHANNEL_ID, TEAMS, SLACK_ID_MAP
         _allowed = {"DEPLOY_TARGET",
                     "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
                     "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
-                    "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL"}
+                    "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL",
+                    "FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "TEAMS", "SLACK_IDS"}
         try:
             data = self._read_json_body()
             settings = data.get("settings", {})
@@ -4629,7 +4646,8 @@ class Handler(BaseHTTPRequestHandler):
                 # These keys may be written empty (clears them); every other key
                 # keeps its current value when blank.
                 if not value and key not in (
-                    "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL"
+                    "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL",
+                    "FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "TEAMS", "SLACK_IDS"
                 ):
                     continue
                 try:
@@ -4658,6 +4676,14 @@ class Handler(BaseHTTPRequestHandler):
                     CLEANUP_REPOS = _env_list("CLEANUP_REPOS")
                 elif key == "CLEANUP_AUTHOR_EMAIL":
                     CLEANUP_AUTHOR_EMAIL = value
+                elif key == "FRESH_REVIEWERS":
+                    FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
+                elif key == "TEAM_CHANNEL_ID":
+                    TEAM_CHANNEL_ID = value
+                elif key == "TEAMS":
+                    TEAMS = _parse_teams()
+                elif key == "SLACK_IDS":
+                    SLACK_ID_MAP = _parse_slack_ids()
         self._send_json(200, {"ok": True})
 
     def _handle_open_dir_post(self):
