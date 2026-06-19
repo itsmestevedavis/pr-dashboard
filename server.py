@@ -1979,6 +1979,171 @@ INDEX_HTML = r"""<!doctype html>
   }
   .btn-re-review:hover:not(:disabled) { background: #d97706; }
   .btn-re-review:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .btn-nudge {
+    background: #6e40c9;
+    color: #fff;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .btn-nudge:hover:not(:disabled) { background: #8957e5; }
+  .btn-nudge:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .nudge-split { position: relative; display: inline-flex; }
+  .nudge-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 220px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 8px;
+    z-index: 10;
+  }
+  .nudge-menu .nudge-template {
+    display: flex;
+    gap: 4px;
+    padding: 2px 2px 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 6px;
+  }
+  .nudge-menu .nudge-template button {
+    flex: 1;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .nudge-menu .nudge-template button[aria-pressed="true"] {
+    background: #6e40c9;
+    border-color: #6e40c9;
+    color: #fff;
+  }
+  .nudge-menu .nudge-section-label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 4px 4px;
+  }
+  .nudge-menu .btn-nudge-target {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .nudge-menu .btn-nudge-target:hover { background: #1c2128; }
+  .nudge-menu .btn-nudge-all {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    margin-top: 4px;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+  }
+  .nudge-menu .btn-nudge-all:hover { background: #1c2128; }
+  .btn-channel {
+    background: #d97706;
+    color: #fff;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .btn-channel:hover:not(:disabled) { background: #f59e0b; }
+  .btn-channel:disabled { background: #1c2128; cursor: not-allowed; opacity: 0.7; }
+  .nudge-teams-split { position: relative; display: inline-flex; }
+  .btn-nudge-teams-caret {
+    background: #6e40c9;
+    color: #fff;
+    border: none;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1;
+  }
+  .btn-nudge-teams-caret:hover:not(:disabled) { background: #8957e5; }
+  .nudge-teams-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 160px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 4px;
+    z-index: 10;
+  }
+  .nudge-teams-menu .menu-item,
+  .channel-menu .menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .nudge-teams-menu .menu-item:hover,
+  .channel-menu .menu-item:hover { background: #1c2128; }
+  .channel-split { position: relative; display: inline-flex; }
+  .channel-split .btn-channel {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .btn-channel-caret {
+    background: #d97706;
+    color: #fff;
+    border: none;
+    border-left: 1px solid rgba(0,0,0,0.25);
+    padding: 6px 8px;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1;
+  }
+  .btn-channel-caret:hover:not(:disabled) { background: #f59e0b; }
+  .channel-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 160px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 4px;
+  }
   .empty { text-align: center; color: var(--muted); padding: 48px; font-size: 16px; }
   .toast {
     position: fixed;
