@@ -4028,6 +4028,8 @@ class Handler(BaseHTTPRequestHandler):
             mode = str(data.get("mode") or "re_review")
             channel_id = str(data.get("channel_id") or TEAM_CHANNEL_ID)
             allowed_channels = {TEAM_CHANNEL_ID, *(t["channel_id"] for t in TEAMS)} - {""}
+            if mode == "channel" and not channel_id:
+                raise ValueError("channel mode requires a channel_id (TEAM_CHANNEL_ID not configured)")
             if channel_id and channel_id not in allowed_channels:
                 raise ValueError("channel_id not in allow-list")
             if "/" not in repo:
