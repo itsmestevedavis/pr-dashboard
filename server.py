@@ -1624,6 +1624,79 @@ def run_fix_pipeline(job, head_ref: str) -> None:
     print(f"[fix-pipeline] finished #{job.number}", flush=True)
 
 
+# ---- Nudge dispatch --------------------------------------------------------
+
+NUDGE_PROMPT = (
+    "I want to nudge these GitHub reviewers on Slack about my open PR:\n"
+    "  PR: {url}\n"
+    "  Title: {title}\n"
+    "  Reviewers (GitHub logins or Slack member IDs): {reviewers}\n"
+    "  Mode: {mode}\n"
+    "  Channel ID: {channel}\n\n"
+    "Mode meanings:\n"
+    "  - re_review: I've addressed their previous review comments; "
+    "DM each one asking them to take another look.\n"
+    "  - fresh: nobody has reviewed this PR yet; "
+    "DM each one asking them to review it for the first time.\n"
+    "  - channel: post ONE message in the team channel (the Channel ID above) "
+    "using `<!here>` (do NOT tag the listed reviewers individually).\n\n"
+    "Follow the 'Nudging reviewers on Slack' workflow in your CLAUDE.md "
+    "exactly. Pick the message template that matches the mode. Do not deviate."
+)
+
+
+def count_slack_sends(events):
+    """Count `slack_send_message` tool calls in a Claude stream (excluding drafts)."""
+    sent = 0
+    for ev in events:
+        if ev.get("type") != "assistant":
+            continue
+        for c in ev.get("message", {}).get("content", []):
+            if c.get("type") != "tool_use":
+                continue
+            name = c.get("name") or ""
+            if "slack_send_message" in name and "draft" not in name:
+                sent += 1
+    return sent
+
+
+def derive_nudge_result(events, mode="re_review"):
+    sent = count_slack_sends(events)
+    if sent == 0:
+        return {
+            "sent": 0,
+            "label": "Channel post failed" if mode == "channel" else "No DMs sent",
+        }
+    if mode == "channel":
+        label = "Posted in team channel"
+    else:
+        label = f"DM'd {sent} reviewer{'s' if sent != 1 else ''}"
+    return {"sent": sent, "label": label}
+
+
+def run_nudge(job, url, title, reviewers, mode, channel_id=None):
+    """Spawn Claude to DM the reviewers on Slack via the Slack MCP."""
+    if channel_id is None:
+        channel_id = TEAM_CHANNEL_ID
+    resolved_reviewers = [SLACK_ID_MAP.get(r, r) for r in reviewers]
+    log_path = _job_log_path("nudge-", job.repo, job.number)
+    job.log_path = log_path
+    venue = f"#channel {channel_id}" if mode == "channel" else f"{len(resolved_reviewers)} DM(s)"
+    job.append(f"Nudging on Slack ({mode}, {venue}): {', '.join(reviewers)}")
+    print(f"[nudge] starting #{job.number} in {job.repo} mode={mode} reviewers={reviewers}", flush=True)
+    prompt = NUDGE_PROMPT.format(
+        url=url, title=title, reviewers=", ".join(resolved_reviewers),
+        mode=mode, channel=channel_id,
+    )
+    events = _stream_claude_job(job, prompt, log_path, stop_verb="Nudge stopped.")
+    if events is None:
+        return
+    result = derive_nudge_result(events, mode=mode)
+    job.append(result["label"])
+    job.finish("done", result["label"])
+    print(f"[nudge] finished #{job.number} result={result['label']}", flush=True)
+
+
 # ---- Rebase dispatch -------------------------------------------------------
 
 REBASE_PROMPT = (
@@ -3708,6 +3781,9 @@ class Handler(BaseHTTPRequestHandler):
                 "jira_status_filter": JIRA_STATUS_FILTER,
                 "cleanup_repos": CLEANUP_REPOS,
                 "cleanup_author_email": CLEANUP_AUTHOR_EMAIL,
+                "fresh_reviewers": FRESH_REVIEWERS,
+                "team_channel_id": TEAM_CHANNEL_ID,
+                "teams": TEAMS,
             })
             body = INDEX_HTML.replace(
                 "__PR_DASHBOARD_CONFIG__", config_json,
@@ -3805,7 +3881,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, "bad number")
                 return
             kind = qs.get("kind", ["review"])[0]
-            if kind not in ("review", "re_review", "merge", "address", "fix_pipeline", "rebase"):
+            if kind not in ("review", "re_review", "merge", "address", "fix_pipeline", "rebase", "nudge"):
                 self.send_error(400, "bad kind")
                 return
             if "/" not in repo or number <= 0:
@@ -3854,6 +3930,9 @@ class Handler(BaseHTTPRequestHandler):
         route = _JOB_POST_ROUTES.get(parsed.path)
         if route:
             self._dispatch_job_post(*route)
+            return
+        if parsed.path == "/api/nudge":
+            self._handle_nudge_post()
             return
         if parsed.path == "/api/job/stop":
             self._handle_stop_post()
@@ -3937,6 +4016,42 @@ class Handler(BaseHTTPRequestHandler):
             return
         job.stop()
         self._send_json(200, {"ok": True})
+
+    def _handle_nudge_post(self):
+        try:
+            data = self._read_json_body()
+            number = int(data["number"])
+            repo = str(data["repo"])
+            url = str(data["url"])
+            title = str(data.get("title") or "")
+            reviewers = data.get("reviewers") or []
+            mode = str(data.get("mode") or "re_review")
+            channel_id = str(data.get("channel_id") or TEAM_CHANNEL_ID)
+            allowed_channels = {TEAM_CHANNEL_ID, *(t["channel_id"] for t in TEAMS)} - {""}
+            if channel_id and channel_id not in allowed_channels:
+                raise ValueError("channel_id not in allow-list")
+            if "/" not in repo:
+                raise ValueError("repo must be owner/name")
+            if mode not in ("re_review", "fresh", "channel"):
+                raise ValueError("mode must be re_review, fresh, or channel")
+            reviewers = [str(r) for r in reviewers if r]
+            if not reviewers:
+                raise ValueError("no reviewers to nudge")
+        except Exception as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        job, started = get_or_create_job(repo, number, "nudge")
+        if started:
+            threading.Thread(
+                target=run_nudge, args=(job, url, title, reviewers, mode, channel_id), daemon=True,
+            ).start()
+        self._send_json(202, {
+            "started": started,
+            "running": True,
+            "number": number,
+            "repo": repo,
+            "kind": "nudge",
+        })
 
     def _handle_create_dir_post(self):
         try:
