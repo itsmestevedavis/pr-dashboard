@@ -2652,6 +2652,73 @@ function renderMyPR(p) {
         ? `<button class="btn-deploy btn-deploy-live" type="button" data-env="${escapeHtml(deployTarget)}" title="Branch ${escapeHtml(p.headRefName)} is live — click to re-deploy">✅ ${escapeHtml(deployTarget.toUpperCase())}</button>`
         : `<button class="btn-deploy" type="button" data-env="${escapeHtml(deployTarget)}">Deploy to ${escapeHtml(deployTarget.toUpperCase())}</button>`)
     : '';
+
+  // Nudge / #Channel buttons
+  const mode = p.nudge_mode || '';
+  const pickable = (CONFIG.fresh_reviewers || []);
+  const defaultTemplate = mode === 're_review' ? 're_review' : 'fresh';
+  const allTargets = (mode === 're_review' && (p.nudge_targets || []).length)
+    ? p.nudge_targets
+    : pickable;
+  const templateBtns = `
+    <div class="nudge-template" role="group" aria-label="Slack template">
+      <button type="button" class="nudge-template-btn" data-template="fresh"
+        aria-pressed="${defaultTemplate === 'fresh'}"
+        title="Friendly first-look DM: could you take a look">Fresh</button>
+      <button type="button" class="nudge-template-btn" data-template="re_review"
+        aria-pressed="${defaultTemplate === 're_review'}"
+        title="Re-review DM: I've addressed your comments">Re-review</button>
+    </div>`;
+  const targetBtns = pickable.length
+    ? pickable.map(u => `<button class="btn-nudge-target" type="button" data-user="${escapeHtml(u)}">${escapeHtml(u)}</button>`).join('')
+    : `<div class="nudge-section-label">No FRESH_REVIEWERS configured</div>`;
+  const allBtn = allTargets.length
+    ? `<button class="btn-nudge-all" type="button" data-targets="${escapeHtml(allTargets.join(','))}">DM all (${allTargets.length})</button>`
+    : '';
+  const nudgeBtn = `
+    <div class="nudge-split">
+      <button class="btn-nudge" type="button" aria-haspopup="true" aria-expanded="false" title="Pick who to DM on Slack">Nudge</button>
+      <div class="nudge-menu" hidden>
+        ${templateBtns}
+        <div class="nudge-section-label">DM individually</div>
+        ${targetBtns}
+        ${allBtn}
+      </div>
+    </div>`;
+  let teamsBtn = '';
+  if (mode === 'fresh' && CONFIG.teams && CONFIG.teams.length > 0) {
+    const teamItems = CONFIG.teams.map(t =>
+      `<button class="menu-item btn-nudge-team" type="button"
+         data-team-name="${escapeHtml(t.name)}"
+         data-team-reviewers="${escapeHtml(JSON.stringify(t.reviewers))}"
+         title="Ask ${escapeHtml(t.name)} reviewers on Slack">${escapeHtml(t.name)}</button>`
+    ).join('');
+    teamsBtn = `<div class="nudge-teams-split">
+      <button class="btn-nudge-teams-caret" type="button" aria-label="Nudge a team" aria-haspopup="true" aria-expanded="false">Teams ▾</button>
+      <div class="nudge-teams-menu" hidden>${teamItems}</div>
+    </div>`;
+  }
+  const defaultChannelLabel = (CONFIG.fresh_reviewers || []).join(' and ') || 'the team';
+  let channelBtn = '';
+  if (CONFIG.team_channel_id) {
+    if (CONFIG.teams && CONFIG.teams.length > 0) {
+      const teamItems = CONFIG.teams.map(t =>
+        `<button class="menu-item btn-channel-team" type="button"
+           data-team-name="${escapeHtml(t.name)}"
+           data-team-channel-id="${escapeHtml(t.channel_id)}"
+           data-team-reviewers="${escapeHtml(JSON.stringify(t.reviewers))}"
+           title="Post in ${escapeHtml(t.name)} channel">${escapeHtml(t.name)}</button>`
+      ).join('');
+      channelBtn = `<div class="channel-split">
+        <button class="btn-channel" type="button" title="Post in team channel tagging ${escapeHtml(defaultChannelLabel)}">#dev channel</button>
+        <button class="btn-channel-caret" type="button" aria-label="Post in a different team's channel" aria-haspopup="true" aria-expanded="false">▾</button>
+        <div class="channel-menu" hidden>${teamItems}</div>
+      </div>`;
+    } else {
+      channelBtn = `<button class="btn-channel" type="button" title="Post in team channel tagging ${escapeHtml(defaultChannelLabel)}">#dev channel</button>`;
+    }
+  }
+
   return `
   <div class="pr"
        data-number="${p.number}"
@@ -2671,6 +2738,9 @@ function renderMyPR(p) {
     <div class="pr-actions">
       <a class="btn-open" href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">Open ↗</a>
       ${deployControls}
+      ${channelBtn}
+      ${nudgeBtn}
+      ${teamsBtn}
       ${actionBtn}
     </div>
   </div>`;
@@ -2771,6 +2841,244 @@ function onFixPipeline(btn) {
   startJob(ctx, '/api/fix-pipeline',
     { number: ctx.number, repo: ctx.repo, headRefName: ctx.card.dataset.head },
     'fix_pipeline', 'Fixing pipeline…', finishFixPipeline);
+}
+
+// ── Nudge / #Channel menu helpers ──────────────────────────────────────────
+
+function closeAllNudgeMenus() {
+  for (const menu of document.querySelectorAll('.nudge-menu')) {
+    menu.hidden = true;
+  }
+  for (const btn of document.querySelectorAll('.btn-nudge')) {
+    btn.setAttribute('aria-expanded', 'false');
+  }
+}
+
+function closeAllNudgeTeamsMenus() {
+  for (const menu of document.querySelectorAll('.nudge-teams-menu')) menu.hidden = true;
+  for (const caret of document.querySelectorAll('.btn-nudge-teams-caret')) caret.setAttribute('aria-expanded', 'false');
+}
+
+function closeAllChannelMenus() {
+  for (const menu of document.querySelectorAll('.channel-menu')) menu.hidden = true;
+  for (const caret of document.querySelectorAll('.btn-channel-caret')) caret.setAttribute('aria-expanded', 'false');
+}
+
+function onNudgeTeamsCaret(btn) {
+  const menu = btn.parentElement.querySelector('.nudge-teams-menu');
+  const willOpen = menu.hidden;
+  closeAllNudgeTeamsMenus();
+  if (willOpen) {
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+  }
+}
+
+function onChannelCaret(btn) {
+  const menu = btn.parentElement.querySelector('.channel-menu');
+  const willOpen = menu.hidden;
+  closeAllChannelMenus();
+  if (willOpen) {
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+  }
+}
+
+// ── Nudge / #Channel core handlers (delegation-adapted: take btn element) ──
+
+function onNudge(btn) {
+  const menu = btn.parentElement.querySelector('.nudge-menu');
+  if (!menu) return;
+  const willOpen = menu.hidden;
+  closeAllNudgeMenus();
+  if (willOpen) {
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+  }
+}
+
+function onNudgeTemplate(btn) {
+  const menu = btn.closest('.nudge-menu');
+  if (!menu) return;
+  for (const b of menu.querySelectorAll('.nudge-template-btn')) {
+    b.setAttribute('aria-pressed', b === btn ? 'true' : 'false');
+  }
+}
+
+function selectedTemplate(card) {
+  const pressed = card.querySelector('.nudge-template-btn[aria-pressed="true"]');
+  return pressed ? pressed.dataset.template : 'fresh';
+}
+
+async function fireNudge(card, reviewers, mode, runningLabel) {
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const title = card.dataset.title || '';
+  try {
+    const res = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, url, title, reviewers, mode }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, runningLabel, 'nudge');
+  streamJob(card, 'nudge', repo, number, url, finishNudge);
+}
+
+async function onNudgeTarget(btn) {
+  const card = btn.closest('.pr');
+  const user = btn.dataset.user;
+  if (!user) return;
+  const mode = selectedTemplate(card);
+  const label = mode === 're_review'
+    ? `Nudge ${user} on Slack to re-review?`
+    : `Ask ${user} on Slack to review this PR?`;
+  if (!confirm(label)) return;
+  closeAllNudgeMenus();
+  await fireNudge(card, [user], mode, `Nudging ${user}…`);
+}
+
+async function onNudgeAll(btn) {
+  const card = btn.closest('.pr');
+  const targets = (btn.dataset.targets || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!targets.length) {
+    toast('No one to nudge.');
+    return;
+  }
+  const mode = selectedTemplate(card);
+  const label = mode === 're_review'
+    ? `Nudge on Slack to re-review: ${targets.join(', ')}?`
+    : `Ask ${targets.join(' and ')} on Slack to review this PR?`;
+  if (!confirm(label)) return;
+  closeAllNudgeMenus();
+  await fireNudge(card, targets, mode, 'Nudging…');
+}
+
+function finishNudge(card, url, data) {
+  const actions = card.querySelector('.pr-actions');
+  let cls = 'failed', label = '❌ Failed';
+  if (data.status === 'done') {
+    if (data.result === 'No DMs sent' || data.result === 'Channel post failed') {
+      cls = 'commented'; label = 'ℹ ' + data.result;
+    } else {
+      cls = 'approved'; label = '✅ ' + data.result;
+    }
+  }
+  actions.innerHTML = `
+    <span class="review-status ${cls}">${escapeHtml(label)}</span>
+    <a class="btn-open" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open PR ↗</a>
+  `;
+}
+
+async function onChannelPing(btn) {
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const title = card.dataset.title || '';
+  const targets = (CONFIG.fresh_reviewers || []).slice();
+  if (!targets.length) {
+    toast('No FRESH_REVIEWERS configured — set them in .env.', true);
+    return;
+  }
+  if (!CONFIG.team_channel_id) {
+    toast('No TEAM_CHANNEL_ID configured — set it in .env.', true);
+    return;
+  }
+  if (!confirm(`Post in team channel tagging ${targets.join(' and ')} to review this PR?`)) return;
+  try {
+    const res = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, url, title, reviewers: targets, mode: 'channel' }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, 'Posting in channel…', 'nudge');
+  streamJob(card, 'nudge', repo, number, url, finishNudge);
+}
+
+async function onNudgeTeam(btn) {
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const title = card.dataset.title || '';
+  const teamName = btn.dataset.teamName || 'team';
+  const reviewers = JSON.parse(btn.dataset.teamReviewers || '[]');
+  closeAllNudgeMenus();
+  if (!reviewers.length) {
+    toast(`No reviewers configured for team "${teamName}".`, true);
+    return;
+  }
+  if (!confirm(`Ask ${reviewers.join(' and ')} (${teamName}) on Slack to review this PR?`)) return;
+  try {
+    const res = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, url, title, reviewers, mode: 'fresh' }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, 'Nudging…', 'nudge');
+  streamJob(card, 'nudge', repo, number, url, finishNudge);
+}
+
+async function onChannelTeam(btn) {
+  const card = btn.closest('.pr');
+  const number = parseInt(card.dataset.number, 10);
+  const repo = card.dataset.repo;
+  const url = card.dataset.url;
+  const title = card.dataset.title || '';
+  const teamName = btn.dataset.teamName || 'team';
+  const channelId = btn.dataset.teamChannelId || '';
+  const reviewers = JSON.parse(btn.dataset.teamReviewers || '[]');
+  closeAllChannelMenus();
+  if (!channelId) {
+    toast(`No channel_id configured for team "${teamName}".`, true);
+    return;
+  }
+  if (!reviewers.length) {
+    toast(`No reviewers configured for team "${teamName}".`, true);
+    return;
+  }
+  if (!confirm(`Post in ${teamName} channel tagging ${reviewers.join(' and ')}?`)) return;
+  try {
+    const res = await fetch('/api/nudge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ number, repo, url, title, reviewers, mode: 'channel', channel_id: channelId }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ('HTTP ' + res.status));
+    }
+  } catch (e) {
+    toast(`Failed to start: ${e.message}`, true);
+    return;
+  }
+  setRunning(card, 'Posting in channel…', 'nudge');
+  streamJob(card, 'nudge', repo, number, url, finishNudge);
 }
 
 function onRebase(btn) {
@@ -3023,6 +3331,15 @@ const CARD_ACTIONS = {
   'btn-deploy': onDeploy,
   'btn-stop': onStop,
   'btn-move': onMove,
+  'btn-nudge': onNudge,
+  'btn-nudge-target': onNudgeTarget,
+  'btn-nudge-all': onNudgeAll,
+  'nudge-template-btn': onNudgeTemplate,
+  'btn-channel': onChannelPing,
+  'btn-nudge-teams-caret': onNudgeTeamsCaret,
+  'btn-channel-caret': onChannelCaret,
+  'btn-nudge-team': onNudgeTeam,
+  'btn-channel-team': onChannelTeam,
 };
 
 function onContentClick(ev) {
@@ -3611,6 +3928,19 @@ async function load(fresh) {
 document.getElementById('refreshBtn').addEventListener('click', () => load(true));
 // Single delegated listener for all PR-card buttons across re-renders.
 document.getElementById('content').addEventListener('click', onContentClick);
+// Close nudge/channel menus when clicking outside them; also on Escape.
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('.nudge-split')) closeAllNudgeMenus();
+  if (!ev.target.closest('.nudge-teams-split')) closeAllNudgeTeamsMenus();
+  if (!ev.target.closest('.channel-split')) closeAllChannelMenus();
+});
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    closeAllNudgeMenus();
+    closeAllNudgeTeamsMenus();
+    closeAllChannelMenus();
+  }
+});
 for (const el of document.querySelectorAll('.tab')) {
   el.addEventListener('click', () => {
     if (el.dataset.tab === currentTab) return;
