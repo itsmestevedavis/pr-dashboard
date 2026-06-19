@@ -2867,6 +2867,8 @@ function closeAllChannelMenus() {
 function onNudgeTeamsCaret(btn) {
   const menu = btn.parentElement.querySelector('.nudge-teams-menu');
   const willOpen = menu.hidden;
+  closeAllNudgeMenus();
+  closeAllChannelMenus();
   closeAllNudgeTeamsMenus();
   if (willOpen) {
     menu.hidden = false;
@@ -2877,6 +2879,8 @@ function onNudgeTeamsCaret(btn) {
 function onChannelCaret(btn) {
   const menu = btn.parentElement.querySelector('.channel-menu');
   const willOpen = menu.hidden;
+  closeAllNudgeMenus();
+  closeAllNudgeTeamsMenus();
   closeAllChannelMenus();
   if (willOpen) {
     menu.hidden = false;
@@ -2890,6 +2894,8 @@ function onNudge(btn) {
   const menu = btn.parentElement.querySelector('.nudge-menu');
   if (!menu) return;
   const willOpen = menu.hidden;
+  closeAllNudgeTeamsMenus();
+  closeAllChannelMenus();
   closeAllNudgeMenus();
   if (willOpen) {
     menu.hidden = false;
@@ -3021,6 +3027,7 @@ async function onNudgeTeam(btn) {
   const teamName = btn.dataset.teamName || 'team';
   const reviewers = JSON.parse(btn.dataset.teamReviewers || '[]');
   closeAllNudgeMenus();
+  closeAllNudgeTeamsMenus();
   if (!reviewers.length) {
     toast(`No reviewers configured for team "${teamName}".`, true);
     return;
@@ -3054,6 +3061,7 @@ async function onChannelTeam(btn) {
   const channelId = btn.dataset.teamChannelId || '';
   const reviewers = JSON.parse(btn.dataset.teamReviewers || '[]');
   closeAllChannelMenus();
+  closeAllNudgeTeamsMenus();
   if (!channelId) {
     toast(`No channel_id configured for team "${teamName}".`, true);
     return;
