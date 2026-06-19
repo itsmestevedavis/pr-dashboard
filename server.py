@@ -100,6 +100,64 @@ MY_STATUS_LABELS = {
     "not_reviewed_yet": "Not reviewed yet",
 }
 
+# Default reviewers to ping when a PR has no reviews yet.
+FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
+
+# Team Slack channel for broadcast-style review requests.
+TEAM_CHANNEL_ID = os.environ.get("TEAM_CHANNEL_ID", "")
+
+# Extra named teams selectable from the Channel / Nudge dropdowns.
+# Format: JSON array of {name, channel_id, reviewers: [...]} objects.
+def _parse_teams():
+    raw = os.environ.get("TEAMS", "").strip()
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            raise ValueError("TEAMS must be a JSON array")
+        out = []
+        for i in items:
+            name = (i.get("name") or "").strip()
+            chan = (i.get("channel_id") or "").strip()
+            if not name or not chan:
+                print(f"[config] WARNING: skipping TEAMS entry with missing name/channel_id: {i!r}", flush=True)
+                continue
+            out.append({
+                "name": name,
+                "channel_id": chan,
+                "reviewers": [str(r) for r in i.get("reviewers", [])],
+            })
+        return out
+    except Exception as e:
+        print(f"[config] WARNING: failed to parse TEAMS: {e}", flush=True)
+        return []
+
+TEAMS = _parse_teams()
+
+# Maps GitHub logins to Slack member IDs (e.g. {"alice": "U01ABCDEF"}).
+# Used in run_nudge() to pass IDs directly, bypassing slack_search_users.
+def _parse_slack_ids():
+    raw = os.environ.get("SLACK_IDS", "").strip()
+    if not raw:
+        return {}
+    result = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            print(f"[config] WARNING: SLACK_IDS pair missing ':' — {pair!r}", flush=True)
+            continue
+        login, slack_id = (s.strip() for s in pair.split(":", 1))
+        if not login or not slack_id.startswith("U"):
+            print(f"[config] WARNING: invalid SLACK_IDS pair — {pair!r}", flush=True)
+            continue
+        result[login] = slack_id
+    return result
+
+SLACK_ID_MAP = _parse_slack_ids()
+
 # Default deploy environment for all PRs (e.g. "csi-3"). Empty = no Deploy button shown.
 DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
 
