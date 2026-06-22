@@ -9,6 +9,10 @@ DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 SERVER="$DIR/server.py"
 URL="http://${HOST:-127.0.0.1}:${PORT:-8765}"
 
+# Run from the repo root so headless `claude -p` jobs inherit this cwd and load the
+# project CLAUDE.md (e.g. the Slack-nudge runbook).
+cd "$DIR" || exit 1
+
 PID=""
 cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; exit 0; }
 trap cleanup INT TERM
