@@ -447,6 +447,29 @@ def summarize_checks(rollup: dict) -> dict:
     }
 
 
+def pr_behind_count(repo: str, base: str, head: str) -> int:
+    """Commits the PR's head branch is behind its base, via the compare API.
+
+    GitHub's `mergeStateStatus` only reports BEHIND when an up-to-date-branch
+    protection rule makes being behind the *governing* merge blocker. When a
+    behind branch is also blocked by reviews/checks the status collapses to
+    BLOCKED and the "behind" signal is hidden — so it can't tell us whether a
+    branch can be rebased. The REST compare endpoint always exposes the real
+    divergence. Returns 0 on missing refs or any error (never blocks the UI).
+    """
+    if not (repo and base and head):
+        return 0
+    try:
+        out = gh_run([
+            "api", f"repos/{repo}/compare/{base}...{head}?per_page=1",
+            "--jq", ".behind_by",
+        ]).strip()
+    except Exception as e:
+        print(f"[warn] compare failed for {repo} {base}...{head}: {e}", flush=True)
+        return 0
+    return int(out) if out.isdigit() else 0
+
+
 def list_my_prs():
     """Return my open PRs across all repos, enriched with status."""
     me = get_my_login()
@@ -493,6 +516,21 @@ def list_my_prs():
             "merge_state_status": pr.get("mergeStateStatus") or "",
             **status,
         })
+
+    # GitHub's mergeStateStatus hides "behind" behind higher-priority block
+    # reasons: a PR that is behind *and* blocked by reviews/checks reports
+    # BLOCKED, not BEHIND. Ask the compare API per PR for the real divergence
+    # so the rebase signal fires whenever the branch can be rebased. These are
+    # independent blocking `gh` round trips, so fan out (mirrors list_prs).
+    def with_behind(pr):
+        return {**pr, "behind_by": pr_behind_count(
+            pr["repository"], pr["baseRefName"], pr["headRefName"])}
+
+    if out_list:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(out_list))
+        ) as pool:
+            out_list = list(pool.map(with_behind, out_list))
 
     out_list.sort(key=lambda p: p["updatedAt"])
     out_list.sort(key=lambda p: MY_STATUS_ORDER[p["status"]])
@@ -2610,7 +2648,11 @@ function renderMyPR(p) {
   const commenters = p.active_commenters && p.active_commenters.length
     ? `<div class="pr-detail">From: ${escapeHtml(p.active_commenters.join(', '))}</div>`
     : '';
-  const needsRebase = p.merge_state_status === 'BEHIND';
+  // "Behind" comes from the server's compare-based behind_by, not from
+  // mergeStateStatus: GitHub only reports BEHIND when an up-to-date-branch rule
+  // makes it the governing blocker, so a branch that is behind *and* blocked by
+  // reviews/checks would otherwise hide that it can still be rebased.
+  const needsRebase = (p.behind_by || 0) > 0;
   const hasConflicts = p.merge_state_status === 'DIRTY';
   const ciBlocked = ['FAILURE', 'ERROR'].includes(p.check_state);
   const reviewBlocked = p.review_decision === 'CHANGES_REQUESTED';
