@@ -8,6 +8,3 @@ __pycache__/
 
 # Design/spec/plan docs are local-only per CLAUDE.md rule.
 docs/
-
-# Modularization baseline snapshots — local only, regenerated per environment.
-scripts/_modref_baseline/

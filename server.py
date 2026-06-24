@@ -8,7 +8,7 @@ and lets me kick off a Claude Code review against each.
 import sys
 from http.server import ThreadingHTTPServer
 
-from app import config, github
+from app import github
 from app.config import HOST, PORT
 from app.http.handler import Handler
 
