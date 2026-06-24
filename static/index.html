@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PRs awaiting your review</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📋</text></svg>">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="pageTitle">📋 PRs awaiting your review</h1>
+    <button class="refresh" id="refreshBtn">Refresh</button>
+  </header>
+  <div class="tabs">
+    <button class="tab" data-tab="incoming">Awaiting my review</button>
+    <button class="tab" data-tab="mine">My PRs</button>
+    <button class="tab" data-tab="tickets">Tickets</button>
+    <button class="tab" data-tab="deployed">Deployed</button>
+    <button class="tab" data-tab="status">Status</button>
+    <button class="tab" data-tab="cleanup">Cleanup</button>
+    <button class="tab" data-tab="settings">Settings</button>
+  </div>
+  <main id="content">Loading…</main>
+</div>
+<script>window.PR_DASHBOARD_CONFIG = __PR_DASHBOARD_CONFIG__;</script>
+<script src="/static/app.js"></script>
+</body>
+</html>
