@@ -7,15 +7,19 @@ echo "== pytest =="
 python3 -m pytest -q
 
 echo "== HTTP surface =="
+if curl -sf http://127.0.0.1:8765/ -o /dev/null 2>/dev/null; then
+  echo "ERROR: port 8765 already in use — stop the existing server (e.g. ./start.sh) and re-run" >&2
+  exit 1
+fi
 python3 server.py & SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
 until curl -sf http://127.0.0.1:8765/ -o /dev/null; do sleep 0.2; done
 
-curl -s http://127.0.0.1:8765/ > /tmp/_modref_index.html
-diff -u scripts/_modref_baseline/index.html /tmp/_modref_index.html && echo "OK: / byte-stable"
+curl -s http://127.0.0.1:8765/ > /tmp/_modref_index_$$.html
+diff -u scripts/_modref_baseline/index.html /tmp/_modref_index_$$.html && echo "OK: / byte-stable"
 
-curl -s http://127.0.0.1:8765/api/status > /tmp/_modref_status.json
-diff -u scripts/_modref_baseline/status.json /tmp/_modref_status.json && echo "OK: /api/status byte-stable"
+curl -s http://127.0.0.1:8765/api/status > /tmp/_modref_status_$$.json
+diff -u scripts/_modref_baseline/status.json /tmp/_modref_status_$$.json && echo "OK: /api/status byte-stable"
 
 BASELINE_SHAPE=$(cat scripts/_modref_baseline/prs.shape)
 if [ "$BASELINE_SHAPE" = "UNAVAILABLE" ]; then
