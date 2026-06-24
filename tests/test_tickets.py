@@ -7,21 +7,21 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
-from app import config
+from app import config, jira
 
 
 class JiraRequestTest(unittest.TestCase):
     @mock.patch.object(config, "JIRA_API_TOKEN", "tok")
     @mock.patch.object(config, "JIRA_EMAIL", "me@example.com")
     @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
-    @mock.patch("server.urllib.request.urlopen")
+    @mock.patch("app.jira.urllib.request.urlopen")
     def test_get_sets_auth_and_parses_json(self, urlopen):
         resp = mock.MagicMock()
         resp.read.return_value = b'{"ok": true}'
         resp.__enter__.return_value = resp
         urlopen.return_value = resp
 
-        out = server.jira_request("GET", "/rest/api/3/myself")
+        out = jira.jira_request("GET", "/rest/api/3/myself")
 
         self.assertEqual(out, {"ok": True})
         req = urlopen.call_args[0][0]
@@ -46,7 +46,7 @@ def _issue(key="CSI-1234", summary="Do the thing", cat="indeterminate",
 
 class ParseTicketTest(unittest.TestCase):
     def test_maps_all_fields(self):
-        t = server.parse_ticket(_issue(), "ex.atlassian.net")
+        t = jira.parse_ticket(_issue(), "ex.atlassian.net")
         self.assertEqual(t["key"], "CSI-1234")
         self.assertEqual(t["summary"], "Do the thing")
         self.assertEqual(t["status"], "indeterminate")
@@ -57,43 +57,43 @@ class ParseTicketTest(unittest.TestCase):
         self.assertEqual(t["updatedAt"], "2026-06-09T10:00:00.000+0000")
 
     def test_missing_priority_is_none(self):
-        t = server.parse_ticket(_issue(priority=None), "ex.atlassian.net")
+        t = jira.parse_ticket(_issue(priority=None), "ex.atlassian.net")
         self.assertIsNone(t["priority"])
 
     def test_missing_status_defaults_to_new(self):
         issue = {"key": "X-1", "fields": {"summary": "s"}}
-        t = server.parse_ticket(issue, "ex.atlassian.net")
+        t = jira.parse_ticket(issue, "ex.atlassian.net")
         self.assertEqual(t["status"], "new")
 
 
 class JiraSearchTest(unittest.TestCase):
     @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
-    @mock.patch("server.jira_request")
+    @mock.patch("app.jira.jira_request")
     def test_parses_issue_list(self, jr):
         jr.return_value = {"issues": [_issue(), _issue(key="CSI-2", cat="new")]}
-        tickets = server.jira_search()
+        tickets = jira.jira_search()
         self.assertEqual([t["key"] for t in tickets], ["CSI-1234", "CSI-2"])
         self.assertEqual(jr.call_args[0][0], "GET")
         self.assertEqual(jr.call_args[0][1], "/rest/api/3/search/jql")
 
 
 class TransitionsTest(unittest.TestCase):
-    @mock.patch("server.jira_request")
+    @mock.patch("app.jira.jira_request")
     def test_lists_transitions(self, jr):
         jr.return_value = {"transitions": [
             {"id": "11", "name": "To Do", "extra": "ignored"},
             {"id": "21", "name": "In Progress"},
         ]}
-        out = server.jira_transitions("CSI-1")
+        out = jira.jira_transitions("CSI-1")
         self.assertEqual(out, [
             {"id": "11", "name": "To Do"},
             {"id": "21", "name": "In Progress"},
         ])
         self.assertEqual(jr.call_args[0], ("GET", "/rest/api/3/issue/CSI-1/transitions"))
 
-    @mock.patch("server.jira_request")
+    @mock.patch("app.jira.jira_request")
     def test_do_transition_posts_body(self, jr):
-        server.jira_do_transition("CSI-1", 21)
+        jira.jira_do_transition("CSI-1", 21)
         self.assertEqual(jr.call_args[0], ("POST", "/rest/api/3/issue/CSI-1/transitions"))
         self.assertEqual(jr.call_args[1]["body"], {"transition": {"id": "21"}})
 
@@ -103,13 +103,13 @@ class JiraConfiguredTest(unittest.TestCase):
     @mock.patch.object(config, "JIRA_EMAIL", "me@example.com")
     @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
     def test_false_when_token_missing(self):
-        self.assertFalse(server.jira_configured())
+        self.assertFalse(jira.jira_configured())
 
     @mock.patch.object(config, "JIRA_API_TOKEN", "tok")
     @mock.patch.object(config, "JIRA_EMAIL", "me@example.com")
     @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
     def test_true_when_all_present(self):
-        self.assertTrue(server.jira_configured())
+        self.assertTrue(jira.jira_configured())
 
 
 class NormalizeSiteTest(unittest.TestCase):
@@ -137,7 +137,7 @@ class NormalizeSiteTest(unittest.TestCase):
 
 
 class JiraStatusesTest(unittest.TestCase):
-    @mock.patch("server.jira_request")
+    @mock.patch("app.jira.jira_request")
     def test_dedupes_drops_done_and_sorts(self, jr):
         jr.return_value = [
             {"name": "In Progress", "statusCategory": {"key": "indeterminate"}},
@@ -146,7 +146,7 @@ class JiraStatusesTest(unittest.TestCase):
             {"name": "Done", "statusCategory": {"key": "done"}},                  # dropped
             {"name": "In Review", "statusCategory": {"key": "indeterminate"}},
         ]
-        out = server.jira_statuses()
+        out = jira.jira_statuses()
         # new-category first (To Do), then indeterminate sorted by name
         self.assertEqual(out, ["To Do", "In Progress", "In Review"])
         self.assertEqual(jr.call_args[0], ("GET", "/rest/api/3/status"))

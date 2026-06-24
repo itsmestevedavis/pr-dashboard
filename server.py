@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 
 import cleanup
-from app import config
+from app import config, github, jira
 from app.http import static_files
 from app.config import (
     HOST, PORT,
@@ -296,7 +296,7 @@ def pr_behind_count(repo: str, base: str, head: str) -> int:
     if not (repo and base and head):
         return 0
     try:
-        out = gh_run([
+        out = github.gh_run([
             "api", f"repos/{repo}/compare/{base}...{head}?per_page=1",
             "--jq", ".behind_by",
         ]).strip()
@@ -308,9 +308,9 @@ def pr_behind_count(repo: str, base: str, head: str) -> int:
 
 def list_my_prs():
     """Return my open PRs across all repos, enriched with status."""
-    me = get_my_login()
+    me = github.get_my_login()
     q = f"is:pr is:open author:{me} archived:false"
-    out = gh_run([
+    out = github.gh_run([
         "api", "graphql",
         "-f", f"query={MY_PRS_GRAPHQL}",
         "-f", f"q={q}",
@@ -373,188 +373,17 @@ def list_my_prs():
     return out_list
 
 
-# ---- Globals ---------------------------------------------------------------
-
-_me = None
-_detail_cache = {}  # (repo, number) -> (timestamp, payload)
-_cache_lock = threading.Lock()
-
-
-# ---- gh helpers ------------------------------------------------------------
-
-def gh_run(args):
-    """Run `gh` with args, return stdout text or raise."""
-    proc = subprocess.run(
-        ["gh", *args], capture_output=True, text=True, check=False
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"gh {' '.join(args)} failed (exit {proc.returncode}): {proc.stderr.strip()}"
-        )
-    return proc.stdout
-
-
-def gh_json(args):
-    out = gh_run(args)
-    return json.loads(out) if out.strip() else None
-
-
-def get_my_login():
-    global _me
-    if _me is None:
-        data = gh_json(["api", "user"])
-        _me = data["login"]
-    return _me
-
-
-# ---- Jira helpers ----------------------------------------------------------
-
-def jira_configured():
-    """True only when all three Jira credentials are present."""
-    return bool(config.JIRA_SITE and config.JIRA_EMAIL and config.JIRA_API_TOKEN)
-
-
-def jira_request(method, path, params=None, body=None):
-    """Call the Jira Cloud REST API. Returns parsed JSON (None for empty body).
-
-    Raises RuntimeError with a readable message on any non-2xx or transport error.
-    """
-    url = f"https://{config.JIRA_SITE}{path}"
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    token = base64.b64encode(f"{config.JIRA_EMAIL}:{config.JIRA_API_TOKEN}".encode()).decode()
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Basic {token}")
-    req.add_header("Accept", "application/json")
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:500]
-        raise RuntimeError(f"Jira {method} {path} failed (HTTP {e.code}): {detail}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Jira {method} {path} failed: {e.reason}")
-    return json.loads(raw) if raw.strip() else None
-
-
-def parse_ticket(issue, site):
-    """Map one Jira issue JSON object into the dashboard's ticket dict.
-
-    `status` carries the Jira statusCategory key ("new" | "indeterminate"),
-    which the frontend's group-by-status render() uses as the column key.
-    """
-    fields = issue.get("fields") or {}
-    status = fields.get("status") or {}
-    category = (status.get("statusCategory") or {}).get("key") or "new"
-    priority = fields.get("priority") or {}
-    issuetype = fields.get("issuetype") or {}
-    key = issue.get("key", "")
-    return {
-        "key": key,
-        "summary": fields.get("summary") or "",
-        "status": category,
-        "status_label": status.get("name") or "",
-        "status_category": category,
-        "priority": priority.get("name"),
-        "type": issuetype.get("name") or "",
-        "url": f"https://{site}/browse/{key}",
-        "updatedAt": fields.get("updated") or "",
-    }
-
-
-def jira_search():
-    """Return assigned, not-done tickets as a list of ticket dicts."""
-    data = jira_request("GET", "/rest/api/3/search/jql", params={
-        "jql": JIRA_JQL,
-        "fields": "summary,status,priority,issuetype,updated",
-        "maxResults": "100",
-    })
-    issues = (data or {}).get("issues") or []
-    return [parse_ticket(i, config.JIRA_SITE) for i in issues]
-
-
-def jira_transitions(key):
-    """Available workflow transitions for an issue: [{id, name}]."""
-    data = jira_request("GET", f"/rest/api/3/issue/{key}/transitions")
-    return [
-        {"id": t["id"], "name": t["name"]}
-        for t in (data or {}).get("transitions") or []
-    ]
-
-
-def jira_do_transition(key, transition_id):
-    """Move an issue through the given transition id."""
-    jira_request(
-        "POST", f"/rest/api/3/issue/{key}/transitions",
-        body={"transition": {"id": str(transition_id)}},
-    )
-
-
-def jira_statuses():
-    """Distinct, non-Done status names available in Jira.
-
-    Sorted by category (To Do before In Progress) then name. Done-category
-    statuses are dropped since the Tickets JQL never returns them.
-    """
-    data = jira_request("GET", "/rest/api/3/status")
-    cat_by_name = {}
-    for s in data or []:
-        category = (s.get("statusCategory") or {}).get("key") or "new"
-        if category == "done":
-            continue
-        name = s.get("name") or ""
-        if name and name not in cat_by_name:
-            cat_by_name[name] = category
-    rank = {"new": 0, "indeterminate": 1}
-    return sorted(cat_by_name, key=lambda n: (rank.get(cat_by_name[n], 2), n.lower()))
-
-
-# ---- PR enrichment ---------------------------------------------------------
-
-def fetch_detail(repo, number, fresh=False):
-    """Fetch (and cache) the PR detail blob used for status determination."""
-    key = (repo, number)
-    now = time.time()
-    if not fresh:
-        with _cache_lock:
-            entry = _detail_cache.get(key)
-        if entry and now - entry[0] < config.CACHE_TTL:
-            return entry[1]
-    detail = gh_json([
-        "pr", "view", str(number), "--repo", repo,
-        "--json", "reviews,reviewRequests,commits,latestReviews,author",
-    ])
-    with _cache_lock:
-        _detail_cache[key] = (now, detail)
-    return detail
-
-
-def fetch_review_comments(repo, number, fresh=False):
-    """Fetch all PR review comments (used for in_reply_to detection)."""
-    key = ("comments", repo, number)
-    now = time.time()
-    if not fresh:
-        with _cache_lock:
-            entry = _detail_cache.get(key)
-        if entry and now - entry[0] < config.CACHE_TTL:
-            return entry[1]
-    out = gh_run([
-        "api", f"repos/{repo}/pulls/{number}/comments", "--paginate",
-    ])
-    comments = json.loads(out) if out.strip() else []
-    with _cache_lock:
-        _detail_cache[key] = (now, comments)
-    return comments
+# ---- Globals (moved to app/github.py) -------------------------------------
+# gh_run, gh_json, get_my_login, fetch_detail, fetch_review_comments live in
+# app/github.py.  Jira helpers live in app/jira.py.  Both are imported above
+# via `from app import github, jira`.
 
 
 def author_reply_count(repo, number, me, author_login, since_iso, fresh):
     """Replies from the PR author to my review comments since my last review."""
     if not author_login or not since_iso:
         return 0
-    comments = fetch_review_comments(repo, number, fresh=fresh)
+    comments = github.fetch_review_comments(repo, number, fresh=fresh)
     my_ids = {
         c["id"]
         for c in comments
@@ -654,8 +483,8 @@ def determine_status(repo, number, detail, me, fresh):
 
 
 def list_prs(fresh=False):
-    me = get_my_login()
-    results = gh_json([
+    me = github.get_my_login()
+    results = github.gh_json([
         "search", "prs",
         "--review-requested=@me",
         "--state=open",
@@ -681,7 +510,7 @@ def list_prs(fresh=False):
     # (_detail_cache/_cache_lock) is thread-safe, so fan out across a small pool.
     def enrich(pr):
         try:
-            detail = fetch_detail(pr["repository"], pr["number"], fresh=fresh)
+            detail = github.fetch_detail(pr["repository"], pr["number"], fresh=fresh)
         except Exception as e:
             print(f"[warn] detail fetch failed for {pr['repository']}#{pr['number']}: {e}", flush=True)
             return None
@@ -1004,7 +833,7 @@ _RE_COMMENTS_API = re.compile(r"gh\s+api\s+repos/[^\s]+/pulls/\d+/comments\b")
 def count_pending_comments(repo, number, me):
     """Sum comments across all of my pending reviews on this PR."""
     try:
-        reviews = gh_json([
+        reviews = github.gh_json([
             "api", f"repos/{repo}/pulls/{number}/reviews", "--paginate",
         ]) or []
     except Exception:
@@ -1017,7 +846,7 @@ def count_pending_comments(repo, number, me):
             continue
         rid = r.get("id")
         try:
-            comments = gh_json([
+            comments = github.gh_json([
                 "api",
                 f"repos/{repo}/pulls/{number}/reviews/{rid}/comments",
                 "--paginate",
@@ -1174,7 +1003,7 @@ def _run_review_job(job, log_prefix, workflow_path, prompt_template, log_tag, st
         return
 
     try:
-        me = get_my_login()
+        me = github.get_my_login()
     except Exception:
         me = None
     result = derive_result(events, repo, number, me)
@@ -1697,8 +1526,8 @@ def get_status():
           fix={"action": "set_env", "key": "DEPLOY_TARGET", "placeholder": "csi-3"})
 
     check("JIRA", "Jira credentials for the Tickets tab (.env)",
-          jira_configured(),
-          f"Configured: {config.JIRA_EMAIL} @ {config.JIRA_SITE}" if jira_configured()
+          jira.jira_configured(),
+          f"Configured: {config.JIRA_EMAIL} @ {config.JIRA_SITE}" if jira.jira_configured()
           else "Not set — add JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN on the Settings tab")
 
     return checks
@@ -1736,20 +1565,20 @@ def list_my_branches(repo: str) -> dict:
     branch names + SHAs in one wave, then parallel GraphQL alias batches to check the
     commit author for each SHA. For a 200-branch repo this is ~1.5s vs ~4s sequential.
     """
-    me = get_my_login()
+    me = github.get_my_login()
     me_lower = me.lower()
     owner, repo_name = repo.split("/", 1)
 
     def fetch_page(page: int) -> list:
         try:
-            return json.loads(gh_run(["api", f"repos/{repo}/branches?per_page=100&page={page}"]))
+            return json.loads(github.gh_run(["api", f"repos/{repo}/branches?per_page=100&page={page}"]))
         except Exception:
             return []
 
     # Wave 1: default branch + first page in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         base_fut = pool.submit(
-            lambda: json.loads(gh_run(["api", f"repos/{repo}"])).get("default_branch", "main")
+            lambda: json.loads(github.gh_run(["api", f"repos/{repo}"])).get("default_branch", "main")
         )
         page1_fut = pool.submit(fetch_page, 1)
         base_branch = base_fut.result()
@@ -1778,7 +1607,7 @@ def list_my_branches(repo: str) -> dict:
         )
         query = f"query($o:String!,$n:String!){{repository(owner:$o,name:$n){{{aliases}}}}}"
         try:
-            data = json.loads(gh_run([
+            data = json.loads(github.gh_run([
                 "api", "graphql",
                 "-f", f"query={query}",
                 "-f", f"o={owner}",
@@ -1972,16 +1801,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, prs)
             return
         if parsed.path == "/api/tickets":
-            if not jira_configured():
+            if not jira.jira_configured():
                 self._send_json(200, {"configured": False, "tickets": []})
                 return
             try:
-                self._send_json(200, {"configured": True, "tickets": jira_search()})
+                self._send_json(200, {"configured": True, "tickets": jira.jira_search()})
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
         if parsed.path == "/api/tickets/transitions":
-            if not jira_configured():
+            if not jira.jira_configured():
                 self._send_json(503, {"error": "Jira not configured"})
                 return
             qs = parse_qs(parsed.query or "")
@@ -1990,16 +1819,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "invalid issue key"})
                 return
             try:
-                self._send_json(200, {"transitions": jira_transitions(key)})
+                self._send_json(200, {"transitions": jira.jira_transitions(key)})
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
         if parsed.path == "/api/jira/statuses":
-            if not jira_configured():
+            if not jira.jira_configured():
                 self._send_json(503, {"error": "Jira not configured"})
                 return
             try:
-                self._send_json(200, {"statuses": jira_statuses()})
+                self._send_json(200, {"statuses": jira.jira_statuses()})
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
@@ -2373,7 +2202,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_ticket_transition_post(self):
-        if not jira_configured():
+        if not jira.jira_configured():
             self._send_json(503, {"error": "Jira not configured"})
             return
         try:
@@ -2388,7 +2217,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"bad request: {e}"})
             return
         try:
-            jira_do_transition(key, transition_id)
+            jira.jira_do_transition(key, transition_id)
         except Exception as e:
             self._send_json(500, {"error": str(e)})
             return
@@ -2446,7 +2275,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     try:
-        me = get_my_login()
+        me = github.get_my_login()
     except Exception as e:
         print(f"Failed to determine GitHub login via gh: {e}", file=sys.stderr)
         sys.exit(1)
