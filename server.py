@@ -23,191 +23,26 @@ import urllib.parse
 import urllib.request
 
 import cleanup
+from app import config
 from app.http import static_files
+from app.config import (
+    HOST, PORT,
+    REVIEW_PROMPT, RE_REVIEW_PROMPT,
+    STATUS_ORDER, STATUS_LABELS, MY_STATUS_ORDER, MY_STATUS_LABELS,
+    JIRA_JQL, _JIRA_KEY_RE,
+    LOG_DIR, _WORKFLOW_DIR,
+    REVIEW_WORKFLOW, ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW,
+    REBASE_WORKFLOW, RE_REVIEW_WORKFLOW,
+    ADDRESS_PROMPT, FIX_PIPELINE_PROMPT, NUDGE_PROMPT, REBASE_PROMPT,
+)
 
-# ---- Configuration ---------------------------------------------------------
-
-def _load_dotenv(path):
-    """Tiny stdlib .env loader. Lines like KEY=value populate os.environ
-    (unless KEY is already set). Quotes around values are stripped.
-    Comments (#) and blank lines are ignored. Silently skips missing file.
-    """
-    try:
-        with open(path) as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        return
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = val
-
-
-_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+# ---- Configuration (moved to app/config.py) --------------------------------
 # Serializes .env rewrites and the config globals (DEPLOY_TARGET, etc.) that
 # settings POSTs reassign while job threads / status GETs read them.
 # Reentrant so a handler can hold it across both write_env_var and the global update.
 _env_lock = threading.RLock()
-_load_dotenv(_ENV_PATH)
-
-
-def _env_list(name, default=()):
-    raw = os.environ.get(name, "")
-    return [s.strip() for s in raw.split(",") if s.strip()] or list(default)
-
-
-HOST = os.environ.get("HOST", "127.0.0.1")
-PORT = int(os.environ.get("PORT", "8765"))
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))  # seconds
-
-REVIEW_PROMPT = "Review PR #{number} in {repo}.\n\n"
-RE_REVIEW_PROMPT = (
-    "Re-review PR #{number} in {repo}. "
-    "Check whether your previous review comments have been addressed since your last review.\n\n"
-)
-
-STATUS_ORDER = {
-    "re_requested": 0,
-    "new_commits": 1,
-    "author_replied": 2,
-    "untouched": 3,
-}
-
-STATUS_LABELS = {
-    "re_requested": "Re-review requested",
-    "new_commits": "Re-review needed",
-    "author_replied": "Author replied",
-    "untouched": "New",
-}
-
-# ---- My PRs (author=@me) ---------------------------------------------------
-
-MY_STATUS_ORDER = {
-    "approved": 0,
-    "has_comments": 1,
-    "not_reviewed_yet": 2,
-}
-
-MY_STATUS_LABELS = {
-    "approved": "Approved",
-    "has_comments": "Has comments",
-    "not_reviewed_yet": "Not reviewed yet",
-}
-
-# Default reviewers to ping when a PR has no reviews yet.
-FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
-
-# Team Slack channel for broadcast-style review requests.
-TEAM_CHANNEL_ID = os.environ.get("TEAM_CHANNEL_ID", "")
-
-# Extra named teams selectable from the Channel / Nudge dropdowns.
-# Format: JSON array of {name, channel_id, reviewers: [...]} objects.
-def _parse_teams():
-    raw = os.environ.get("TEAMS", "").strip()
-    if not raw:
-        return []
-    try:
-        items = json.loads(raw)
-        if not isinstance(items, list):
-            raise ValueError("TEAMS must be a JSON array")
-        out = []
-        for i in items:
-            name = (i.get("name") or "").strip()
-            chan = (i.get("channel_id") or "").strip()
-            if not name or not chan:
-                print(f"[config] WARNING: skipping TEAMS entry with missing name/channel_id: {i!r}", flush=True)
-                continue
-            out.append({
-                "name": name,
-                "channel_id": chan,
-                "reviewers": [str(r) for r in i.get("reviewers", [])],
-            })
-        return out
-    except Exception as e:
-        print(f"[config] WARNING: failed to parse TEAMS: {e}", flush=True)
-        return []
-
-TEAMS = _parse_teams()
-
-# Maps GitHub logins to Slack handles (e.g. {"alice": "@alice"}) or member IDs
-# (e.g. {"alice": "U01ABCDEF"}). Used in run_nudge() to pass the Slack identity
-# directly, so the nudge workflow can DM without a GitHub→Slack lookup.
-def _parse_slack_ids():
-    raw = os.environ.get("SLACK_IDS", "").strip()
-    if not raw:
-        return {}
-    result = {}
-    for pair in raw.split(","):
-        pair = pair.strip()
-        if not pair:
-            continue
-        if ":" not in pair:
-            print(f"[config] WARNING: SLACK_IDS pair missing ':' — {pair!r}", flush=True)
-            continue
-        login, slack_id = (s.strip() for s in pair.split(":", 1))
-        if not login or not (slack_id.startswith("@") or slack_id.startswith("U")):
-            print(f"[config] WARNING: invalid SLACK_IDS pair (value must be a Slack "
-                  f"@handle or U… member ID) — {pair!r}", flush=True)
-            continue
-        result[login] = slack_id
-    return result
-
-SLACK_ID_MAP = _parse_slack_ids()
-
-# Default deploy environment for all PRs (e.g. "csi-3"). Empty = no Deploy button shown.
-DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
-
-# Editor command for opening the config folder. Empty = auto-detect (code → open/xdg-open).
-EDITOR_CMD = os.environ.get("EDITOR_CMD", "")
-
-# Local repo paths the Cleanup tab scans for stale branches/worktrees (comma list,
-# ~ expanded). The agent-clone cache is always scanned in addition to these.
-CLEANUP_REPOS = _env_list("CLEANUP_REPOS")
-
-# "Me" for the Cleanup tab's authored-by-me filter. Empty = use each repo's
-# `git config user.email`.
-CLEANUP_AUTHOR_EMAIL = os.environ.get("CLEANUP_AUTHOR_EMAIL", "")
-
-# ---- Jira (assigned tickets) ----------------------------------------------
-def _normalize_jira_site(raw):
-    """Accept a Jira site as a bare host or a full URL; return just the host.
-
-    Users routinely paste "https://org.atlassian.net/"; the API URL is built as
-    https://{site}{path}, so a scheme/trailing slash here yields an unresolvable
-    host. Strip them at the boundary so both forms work.
-    """
-    return re.sub(r"^https?://", "", (raw or "").strip(), flags=re.IGNORECASE).rstrip("/")
-
-
-# Atlassian site host (e.g. "cognota.atlassian.net"), account email, and an API
-# token from id.atlassian.com. All three empty = Tickets tab shows a config hint.
-JIRA_SITE = _normalize_jira_site(os.environ.get("JIRA_SITE", ""))
-JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
-JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
-# Status names to show on the Tickets tab (comma list in .env). Empty = show all.
-JIRA_STATUS_FILTER = _env_list("JIRA_STATUS_FILTER")
-
-# Tickets assigned to me that are not finished, most-recently-updated first.
-JIRA_JQL = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
-
-# Jira issue keys look like ABC-123 — validate before interpolating into API paths.
-_JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
-
-
-def _is_human_author(author):
-    """True if the GraphQL author node is a real user (not a Bot, etc)."""
-    if not author:
-        return False
-    typename = author.get("__typename")
-    # When __typename isn't fetched, fall back to accepting it (legacy callers).
-    return typename in (None, "User", "Mannequin", "EnterpriseUserAccount")
+# Re-export _is_human_author from config for consumers still in this module.
+_is_human_author = config._is_human_author
 
 
 def determine_my_pr_status(pr, me):
@@ -319,7 +154,7 @@ def determine_my_pr_status(pr, me):
         nudge_targets = sorted(stale_reviewers)
     elif not any_human_review:
         nudge_mode = "fresh"
-        nudge_targets = list(FRESH_REVIEWERS)
+        nudge_targets = list(config.FRESH_REVIEWERS)
     else:
         nudge_mode = None
         nudge_targets = []
@@ -576,7 +411,7 @@ def get_my_login():
 
 def jira_configured():
     """True only when all three Jira credentials are present."""
-    return bool(JIRA_SITE and JIRA_EMAIL and JIRA_API_TOKEN)
+    return bool(config.JIRA_SITE and config.JIRA_EMAIL and config.JIRA_API_TOKEN)
 
 
 def jira_request(method, path, params=None, body=None):
@@ -584,11 +419,11 @@ def jira_request(method, path, params=None, body=None):
 
     Raises RuntimeError with a readable message on any non-2xx or transport error.
     """
-    url = f"https://{JIRA_SITE}{path}"
+    url = f"https://{config.JIRA_SITE}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    token = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+    token = base64.b64encode(f"{config.JIRA_EMAIL}:{config.JIRA_API_TOKEN}".encode()).decode()
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"Basic {token}")
     req.add_header("Accept", "application/json")
@@ -638,7 +473,7 @@ def jira_search():
         "maxResults": "100",
     })
     issues = (data or {}).get("issues") or []
-    return [parse_ticket(i, JIRA_SITE) for i in issues]
+    return [parse_ticket(i, config.JIRA_SITE) for i in issues]
 
 
 def jira_transitions(key):
@@ -686,7 +521,7 @@ def fetch_detail(repo, number, fresh=False):
     if not fresh:
         with _cache_lock:
             entry = _detail_cache.get(key)
-        if entry and now - entry[0] < CACHE_TTL:
+        if entry and now - entry[0] < config.CACHE_TTL:
             return entry[1]
     detail = gh_json([
         "pr", "view", str(number), "--repo", repo,
@@ -704,7 +539,7 @@ def fetch_review_comments(repo, number, fresh=False):
     if not fresh:
         with _cache_lock:
             entry = _detail_cache.get(key)
-        if entry and now - entry[0] < CACHE_TTL:
+        if entry and now - entry[0] < config.CACHE_TTL:
             return entry[1]
     out = gh_run([
         "api", f"repos/{repo}/pulls/{number}/comments", "--paginate",
@@ -868,15 +703,6 @@ def list_prs(fresh=False):
 
 
 # ---- Review dispatch -------------------------------------------------------
-
-LOG_DIR = "/tmp/pr-reviewer"
-
-_WORKFLOW_DIR = os.path.expanduser("~/.config/pr-dashboard")
-REVIEW_WORKFLOW        = os.path.join(_WORKFLOW_DIR, "review_workflow.md")
-ADDRESS_WORKFLOW       = os.path.join(_WORKFLOW_DIR, "address_workflow.md")
-FIX_PIPELINE_WORKFLOW  = os.path.join(_WORKFLOW_DIR, "fix_pipeline_workflow.md")
-REBASE_WORKFLOW        = os.path.join(_WORKFLOW_DIR, "rebase_workflow.md")
-RE_REVIEW_WORKFLOW     = os.path.join(_WORKFLOW_DIR, "re_review_workflow.md")
 
 _DEFAULT_REVIEW_WORKFLOW = """\
 ## Review steps
@@ -1486,7 +1312,7 @@ def _git_runner(args, cwd):
 def cleanup_repo_targets():
     """(path, label, kind) tuples to scan: configured repos + each agent clone."""
     targets = []
-    for raw in CLEANUP_REPOS:
+    for raw in config.CLEANUP_REPOS:
         targets.append((os.path.abspath(os.path.expanduser(raw)), raw, "configured"))
     if os.path.isdir(AGENT_CLONES_DIR):
         for name in sorted(os.listdir(AGENT_CLONES_DIR)):
@@ -1510,7 +1336,7 @@ def scan_cleanup(fresh=False):
             if fresh:
                 _git_runner(["fetch", "--prune"], path)
             entry["candidates"] = cleanup.scan_repo(
-                _git_runner, path, author_email=CLEANUP_AUTHOR_EMAIL or None
+                _git_runner, path, author_email=config.CLEANUP_AUTHOR_EMAIL or None
             )
         except Exception as e:  # pragma: no cover - defensive
             entry["ok"] = False
@@ -1520,13 +1346,6 @@ def scan_cleanup(fresh=False):
 
 
 # ---- Address dispatch ------------------------------------------------------
-
-ADDRESS_PROMPT = (
-    "Address review comments on PR #{number} in {repo}. "
-    "PR head branch on origin: {head_ref}. "
-    "Local branch in this worktree: {local_branch}. "
-    "Push with: git push origin {local_branch}:{head_ref}\n\n"
-)
 
 _RE_GIT_PUSH = re.compile(r"(^|[\s;&|])git\s+push\b")
 _RE_INLINE_REPLY = re.compile(r"gh\s+api[^|;&]*\bpulls/\d+/comments/\d+/replies\b")
@@ -1640,14 +1459,6 @@ def run_address(job, head_ref):
 
 # ---- Fix-pipeline dispatch -------------------------------------------------
 
-FIX_PIPELINE_PROMPT = (
-    "Fix the failing CI pipeline on PR #{number} in {repo}. "
-    "PR head branch on origin: {head_ref}. "
-    "Local branch in this worktree: {local_branch}. "
-    "Push fixes with: git push origin {local_branch}:{head_ref}\n\n"
-)
-
-
 def run_fix_pipeline(job, head_ref: str) -> None:
     """Spawn Claude in a worktree to diagnose and fix failing CI checks."""
     events = _run_worktree_job(
@@ -1666,25 +1477,6 @@ def run_fix_pipeline(job, head_ref: str) -> None:
 
 
 # ---- Nudge dispatch --------------------------------------------------------
-
-NUDGE_PROMPT = (
-    "I want to nudge these GitHub reviewers on Slack about my open PR:\n"
-    "  PR: {url}\n"
-    "  Title: {title}\n"
-    "  Reviewers (GitHub logins, Slack @handles, or Slack member IDs): {reviewers}\n"
-    "  Mode: {mode}\n"
-    "  Channel ID: {channel}\n\n"
-    "Mode meanings:\n"
-    "  - re_review: I've addressed their previous review comments; "
-    "DM each one asking them to take another look.\n"
-    "  - fresh: nobody has reviewed this PR yet; "
-    "DM each one asking them to review it for the first time.\n"
-    "  - channel: post ONE message in the team channel (the Channel ID above) "
-    "using `<!here>` (do NOT tag the listed reviewers individually).\n\n"
-    "Follow the 'Nudging reviewers on Slack' workflow in your CLAUDE.md "
-    "exactly. Pick the message template that matches the mode. Do not deviate."
-)
-
 
 def count_slack_sends(events):
     """Count `slack_send_message` tool calls in a Claude stream (excluding drafts)."""
@@ -1718,8 +1510,8 @@ def derive_nudge_result(events, mode="re_review"):
 def run_nudge(job, url, title, reviewers, mode, channel_id=None):
     """Spawn Claude to DM the reviewers on Slack via the Slack MCP."""
     if channel_id is None:
-        channel_id = TEAM_CHANNEL_ID
-    resolved_reviewers = [SLACK_ID_MAP.get(r, r) for r in reviewers]
+        channel_id = config.TEAM_CHANNEL_ID
+    resolved_reviewers = [config.SLACK_ID_MAP.get(r, r) for r in reviewers]
     log_path = _job_log_path("nudge-", job.repo, job.number)
     job.log_path = log_path
     venue = f"#channel {channel_id}" if mode == "channel" else f"{len(resolved_reviewers)} DM(s)"
@@ -1739,15 +1531,6 @@ def run_nudge(job, url, title, reviewers, mode, channel_id=None):
 
 
 # ---- Rebase dispatch -------------------------------------------------------
-
-REBASE_PROMPT = (
-    "Rebase PR #{number} in {repo} onto the base branch. "
-    "Base branch: {base_ref}. "
-    "PR head branch on origin: {head_ref}. "
-    "Local branch in this worktree: {local_branch}. "
-    "Push with: git push origin {local_branch}:{head_ref} --force-with-lease\n\n"
-)
-
 
 def run_rebase(job, head_ref: str, base_ref: str) -> None:
     """Spawn Claude in a worktree to rebase the PR branch onto its base."""
@@ -1909,13 +1692,13 @@ def get_status():
           gh_output[:500] if gh_output else "No output from gh auth status")
 
     check("DEPLOY_TARGET", "Default deploy environment (.env)",
-          bool(DEPLOY_TARGET),
-          f"Target: {DEPLOY_TARGET}" if DEPLOY_TARGET else "Not set — add DEPLOY_TARGET=csi-3 to .env to show Deploy buttons",
+          bool(config.DEPLOY_TARGET),
+          f"Target: {config.DEPLOY_TARGET}" if config.DEPLOY_TARGET else "Not set — add DEPLOY_TARGET=csi-3 to .env to show Deploy buttons",
           fix={"action": "set_env", "key": "DEPLOY_TARGET", "placeholder": "csi-3"})
 
     check("JIRA", "Jira credentials for the Tickets tab (.env)",
           jira_configured(),
-          f"Configured: {JIRA_EMAIL} @ {JIRA_SITE}" if jira_configured()
+          f"Configured: {config.JIRA_EMAIL} @ {config.JIRA_SITE}" if jira_configured()
           else "Not set — add JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN on the Settings tab")
 
     return checks
@@ -1930,8 +1713,8 @@ def open_in_editor(path: str) -> None:
     """
     import platform
     import shlex
-    if EDITOR_CMD:
-        cmd = shlex.split(EDITOR_CMD) + [path]
+    if config.EDITOR_CMD:
+        cmd = shlex.split(config.EDITOR_CMD) + [path]
         subprocess.Popen(cmd)
         return
     if shutil.which("code"):
@@ -2032,7 +1815,7 @@ def get_deployed() -> dict:
     deploy_targets.json — and is passed to ``gh run list -w`` which accepts
     either a workflow filename or its display name.
     """
-    target_env = DEPLOY_TARGET
+    target_env = config.DEPLOY_TARGET
 
     if target_env:
         combos = [
@@ -2125,23 +1908,23 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             config_json = json.dumps({
                 "deploy_targets": DEPLOY_TARGETS,
-                "deploy_target": DEPLOY_TARGET,
-                "cache_ttl": CACHE_TTL,
+                "deploy_target": config.DEPLOY_TARGET,
+                "cache_ttl": config.CACHE_TTL,
                 "host": HOST,
                 "port": PORT,
                 "workflow_dir": _WORKFLOW_DIR,
-                "editor_cmd": EDITOR_CMD,
-                "jira_site": JIRA_SITE,
-                "jira_email": JIRA_EMAIL,
+                "editor_cmd": config.EDITOR_CMD,
+                "jira_site": config.JIRA_SITE,
+                "jira_email": config.JIRA_EMAIL,
                 # Never echo the token itself to the browser — only whether it is set.
-                "jira_token_set": bool(JIRA_API_TOKEN),
-                "jira_status_filter": JIRA_STATUS_FILTER,
-                "cleanup_repos": CLEANUP_REPOS,
-                "cleanup_author_email": CLEANUP_AUTHOR_EMAIL,
-                "fresh_reviewers": FRESH_REVIEWERS,
-                "team_channel_id": TEAM_CHANNEL_ID,
-                "teams": TEAMS,
-                "slack_ids": ",".join(f"{k}:{v}" for k, v in SLACK_ID_MAP.items()),
+                "jira_token_set": bool(config.JIRA_API_TOKEN),
+                "jira_status_filter": config.JIRA_STATUS_FILTER,
+                "cleanup_repos": config.CLEANUP_REPOS,
+                "cleanup_author_email": config.CLEANUP_AUTHOR_EMAIL,
+                "fresh_reviewers": config.FRESH_REVIEWERS,
+                "team_channel_id": config.TEAM_CHANNEL_ID,
+                "teams": config.TEAMS,
+                "slack_ids": ",".join(f"{k}:{v}" for k, v in config.SLACK_ID_MAP.items()),
             })
             body = static_files.serve_index(config_json)
             self.send_response(200)
@@ -2382,8 +2165,8 @@ class Handler(BaseHTTPRequestHandler):
             title = str(data.get("title") or "")
             reviewers = data.get("reviewers") or []
             mode = str(data.get("mode") or "re_review")
-            channel_id = str(data.get("channel_id") or TEAM_CHANNEL_ID)
-            allowed_channels = {TEAM_CHANNEL_ID, *(t["channel_id"] for t in TEAMS)} - {""}
+            channel_id = str(data.get("channel_id") or config.TEAM_CHANNEL_ID)
+            allowed_channels = {config.TEAM_CHANNEL_ID, *(t["channel_id"] for t in config.TEAMS)} - {""}
             if mode == "channel" and not channel_id:
                 raise ValueError("channel mode requires a channel_id (TEAM_CHANNEL_ID not configured)")
             if channel_id and channel_id not in allowed_channels:
@@ -2430,7 +2213,6 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_set_env_post(self):
-        global DEPLOY_TARGET
         try:
             data = self._read_json_body()
             key = str(data["key"])
@@ -2448,17 +2230,13 @@ class Handler(BaseHTTPRequestHandler):
             with _env_lock:
                 write_env_var(key, value)
                 if key == "DEPLOY_TARGET":
-                    DEPLOY_TARGET = value
+                    config.DEPLOY_TARGET = value
         except Exception as e:
             self._send_json(500, {"error": str(e)})
             return
         self._send_json(200, {"ok": True})
 
     def _handle_settings_post(self):
-        global DEPLOY_TARGET, CACHE_TTL, EDITOR_CMD
-        global JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_STATUS_FILTER
-        global CLEANUP_REPOS, CLEANUP_AUTHOR_EMAIL
-        global FRESH_REVIEWERS, TEAM_CHANNEL_ID, TEAMS, SLACK_ID_MAP
         _allowed = {"DEPLOY_TARGET",
                     "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
                     "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
@@ -2480,7 +2258,7 @@ class Handler(BaseHTTPRequestHandler):
             for key, value in settings.items():
                 value = str(value).strip()
                 if key == "JIRA_SITE":
-                    value = _normalize_jira_site(value)
+                    value = config._normalize_jira_site(value)
                 # These keys may be written empty (clears them); every other key
                 # keeps its current value when blank.
                 if not value and key not in (
@@ -2494,34 +2272,34 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(500, {"error": f"failed to write {key}: {e}"})
                     return
                 if key == "DEPLOY_TARGET":
-                    DEPLOY_TARGET = value
+                    config.DEPLOY_TARGET = value
                 elif key == "CACHE_TTL":
                     try:
-                        CACHE_TTL = int(value)
+                        config.CACHE_TTL = int(value)
                     except ValueError:
                         pass
                 elif key == "EDITOR_CMD":
-                    EDITOR_CMD = value
+                    config.EDITOR_CMD = value
                 elif key == "JIRA_SITE":
-                    JIRA_SITE = value
+                    config.JIRA_SITE = value
                 elif key == "JIRA_EMAIL":
-                    JIRA_EMAIL = value
+                    config.JIRA_EMAIL = value
                 elif key == "JIRA_API_TOKEN":
-                    JIRA_API_TOKEN = value
+                    config.JIRA_API_TOKEN = value
                 elif key == "JIRA_STATUS_FILTER":
-                    JIRA_STATUS_FILTER = _env_list("JIRA_STATUS_FILTER")
+                    config.JIRA_STATUS_FILTER = config._env_list("JIRA_STATUS_FILTER")
                 elif key == "CLEANUP_REPOS":
-                    CLEANUP_REPOS = _env_list("CLEANUP_REPOS")
+                    config.CLEANUP_REPOS = config._env_list("CLEANUP_REPOS")
                 elif key == "CLEANUP_AUTHOR_EMAIL":
-                    CLEANUP_AUTHOR_EMAIL = value
+                    config.CLEANUP_AUTHOR_EMAIL = value
                 elif key == "FRESH_REVIEWERS":
-                    FRESH_REVIEWERS = _env_list("FRESH_REVIEWERS")
+                    config.FRESH_REVIEWERS = config._env_list("FRESH_REVIEWERS")
                 elif key == "TEAM_CHANNEL_ID":
-                    TEAM_CHANNEL_ID = value
+                    config.TEAM_CHANNEL_ID = value
                 elif key == "TEAMS":
-                    TEAMS = _parse_teams()
+                    config.TEAMS = config._parse_teams()
                 elif key == "SLACK_IDS":
-                    SLACK_ID_MAP = _parse_slack_ids()
+                    config.SLACK_ID_MAP = config._parse_slack_ids()
         self._send_json(200, {"ok": True})
 
     def _handle_open_dir_post(self):

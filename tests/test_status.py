@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 from server import determine_my_pr_status
+from app import config
 
 
 def pr(
@@ -236,15 +237,15 @@ class NudgeFields(unittest.TestCase):
         self.assertEqual(out["nudge_targets"], ["bob"])
 
     def test_no_human_reviews_drives_fresh_nudge(self):
-        original = server.FRESH_REVIEWERS
-        server.FRESH_REVIEWERS = ["bob", "carol"]
+        original = config.FRESH_REVIEWERS
+        config.FRESH_REVIEWERS = ["bob", "carol"]
         try:
             fixture = _pr_with_reviews([])
             out = server.determine_my_pr_status(fixture, me="me")
             self.assertEqual(out["nudge_mode"], "fresh")
             self.assertEqual(out["nudge_targets"], ["bob", "carol"])
         finally:
-            server.FRESH_REVIEWERS = original
+            config.FRESH_REVIEWERS = original
 
     def test_me_excluded_from_stale_reviewers(self):
         fixture = _pr_with_reviews([

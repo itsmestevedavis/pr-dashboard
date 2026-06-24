@@ -7,12 +7,13 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
+from app import config
 
 
 class JiraRequestTest(unittest.TestCase):
-    @mock.patch.object(server, "JIRA_API_TOKEN", "tok")
-    @mock.patch.object(server, "JIRA_EMAIL", "me@example.com")
-    @mock.patch.object(server, "JIRA_SITE", "ex.atlassian.net")
+    @mock.patch.object(config, "JIRA_API_TOKEN", "tok")
+    @mock.patch.object(config, "JIRA_EMAIL", "me@example.com")
+    @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
     @mock.patch("server.urllib.request.urlopen")
     def test_get_sets_auth_and_parses_json(self, urlopen):
         resp = mock.MagicMock()
@@ -66,7 +67,7 @@ class ParseTicketTest(unittest.TestCase):
 
 
 class JiraSearchTest(unittest.TestCase):
-    @mock.patch.object(server, "JIRA_SITE", "ex.atlassian.net")
+    @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
     @mock.patch("server.jira_request")
     def test_parses_issue_list(self, jr):
         jr.return_value = {"issues": [_issue(), _issue(key="CSI-2", cat="new")]}
@@ -98,15 +99,15 @@ class TransitionsTest(unittest.TestCase):
 
 
 class JiraConfiguredTest(unittest.TestCase):
-    @mock.patch.object(server, "JIRA_API_TOKEN", "")
-    @mock.patch.object(server, "JIRA_EMAIL", "me@example.com")
-    @mock.patch.object(server, "JIRA_SITE", "ex.atlassian.net")
+    @mock.patch.object(config, "JIRA_API_TOKEN", "")
+    @mock.patch.object(config, "JIRA_EMAIL", "me@example.com")
+    @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
     def test_false_when_token_missing(self):
         self.assertFalse(server.jira_configured())
 
-    @mock.patch.object(server, "JIRA_API_TOKEN", "tok")
-    @mock.patch.object(server, "JIRA_EMAIL", "me@example.com")
-    @mock.patch.object(server, "JIRA_SITE", "ex.atlassian.net")
+    @mock.patch.object(config, "JIRA_API_TOKEN", "tok")
+    @mock.patch.object(config, "JIRA_EMAIL", "me@example.com")
+    @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
     def test_true_when_all_present(self):
         self.assertTrue(server.jira_configured())
 
@@ -114,25 +115,25 @@ class JiraConfiguredTest(unittest.TestCase):
 class NormalizeSiteTest(unittest.TestCase):
     def test_strips_https_scheme(self):
         self.assertEqual(
-            server._normalize_jira_site("https://cognota.atlassian.net"),
+            config._normalize_jira_site("https://cognota.atlassian.net"),
             "cognota.atlassian.net",
         )
 
     def test_strips_http_scheme_and_trailing_slash(self):
         self.assertEqual(
-            server._normalize_jira_site("http://ex.atlassian.net/"),
+            config._normalize_jira_site("http://ex.atlassian.net/"),
             "ex.atlassian.net",
         )
 
     def test_passes_bare_host_through(self):
         self.assertEqual(
-            server._normalize_jira_site("ex.atlassian.net"),
+            config._normalize_jira_site("ex.atlassian.net"),
             "ex.atlassian.net",
         )
 
     def test_handles_empty_and_whitespace(self):
-        self.assertEqual(server._normalize_jira_site(""), "")
-        self.assertEqual(server._normalize_jira_site("  "), "")
+        self.assertEqual(config._normalize_jira_site(""), "")
+        self.assertEqual(config._normalize_jira_site("  "), "")
 
 
 class JiraStatusesTest(unittest.TestCase):
