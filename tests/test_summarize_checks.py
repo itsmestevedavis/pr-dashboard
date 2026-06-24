@@ -4,7 +4,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from server import summarize_checks
+from app.prs import summarize_checks
 
 
 def check_run(name, conclusion, status="COMPLETED", url="u"):

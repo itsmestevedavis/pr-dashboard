@@ -4,8 +4,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import server
-from server import determine_my_pr_status
+from app import config, prs
 
 
 def pr(
@@ -53,10 +52,10 @@ class DetermineMyPrStatus(unittest.TestCase):
     me = "abir-halwa"
 
     def test_draft_returns_none(self):
-        self.assertIsNone(determine_my_pr_status(pr(is_draft=True), self.me))
+        self.assertIsNone(prs.determine_my_pr_status(pr(is_draft=True), self.me))
 
     def test_approved_with_no_open_threads(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="APPROVED",
                latest_reviews=[review("alice", "APPROVED")]),
             self.me,
@@ -65,7 +64,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["active_commenters"], [])
 
     def test_approved_but_unresolved_thread_from_non_approver(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="APPROVED",
                latest_reviews=[review("alice", "APPROVED")],
                review_threads=[thread("bob", resolved=False)]),
@@ -75,7 +74,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["active_commenters"], ["bob"])
 
     def test_resolved_thread_doesnt_count(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="APPROVED",
                latest_reviews=[review("alice", "APPROVED")],
                review_threads=[thread("bob", resolved=True)]),
@@ -84,7 +83,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["status"], "approved")
 
     def test_thread_from_someone_who_then_approved_doesnt_count(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="APPROVED",
                latest_reviews=[review("alice", "APPROVED")],
                review_threads=[thread("alice", resolved=False)]),
@@ -95,7 +94,7 @@ class DetermineMyPrStatus(unittest.TestCase):
     def test_thread_addressed_when_author_replied_last(self):
         # Reviewer opened a thread; I replied last. Nothing left for me to
         # address — the ball is in the reviewer's court.
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="CHANGES_REQUESTED",
                review_threads=[thread("alice", resolved=False, last_author=self.me)]),
             self.me,
@@ -106,7 +105,7 @@ class DetermineMyPrStatus(unittest.TestCase):
     def test_author_replied_last_thread_inactive(self):
         # Author got the last word on an unresolved thread → not my-court, no
         # active commenter, status falls back to not_reviewed_yet.
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="CHANGES_REQUESTED",
                review_threads=[thread("alice", resolved=False, last_author=self.me)]),
             self.me,
@@ -116,7 +115,7 @@ class DetermineMyPrStatus(unittest.TestCase):
 
     def test_reviewer_replied_after_me_still_active(self):
         # Back-and-forth where the reviewer got the last word → still my court.
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="CHANGES_REQUESTED",
                review_threads=[thread("alice", resolved=False, last_author="alice")]),
             self.me,
@@ -125,7 +124,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["active_commenters"], ["alice"])
 
     def test_outdated_thread_doesnt_count(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="CHANGES_REQUESTED",
                review_threads=[thread("alice", resolved=False, outdated=True)]),
             self.me,
@@ -134,7 +133,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["active_commenters"], [])
 
     def test_changes_requested_review_body(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="CHANGES_REQUESTED",
                latest_reviews=[review("alice", "CHANGES_REQUESTED")]),
             self.me,
@@ -143,7 +142,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["active_commenters"], ["alice"])
 
     def test_general_pr_comment_from_non_approver_counts(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="REVIEW_REQUIRED",
                comments=[comment("alice")]),
             self.me,
@@ -151,7 +150,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["status"], "has_comments")
 
     def test_my_own_general_comments_dont_count(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="REVIEW_REQUIRED",
                comments=[comment(self.me)]),
             self.me,
@@ -159,14 +158,14 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["status"], "not_reviewed_yet")
 
     def test_no_reviews_no_comments(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="REVIEW_REQUIRED"),
             self.me,
         )
         self.assertEqual(out["status"], "not_reviewed_yet")
 
     def test_bot_general_comment_doesnt_count(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="REVIEW_REQUIRED",
                comments=[comment("codacy-production", typename="Bot")]),
             self.me,
@@ -175,7 +174,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["active_commenters"], [])
 
     def test_bot_inline_comment_doesnt_count(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="REVIEW_REQUIRED",
                review_threads=[thread("codacy-production", typename="Bot")]),
             self.me,
@@ -183,7 +182,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["status"], "not_reviewed_yet")
 
     def test_bot_changes_requested_review_doesnt_count(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="REVIEW_REQUIRED",
                latest_reviews=[review("codacy-production", "CHANGES_REQUESTED",
                                       typename="Bot")]),
@@ -192,7 +191,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         self.assertEqual(out["status"], "not_reviewed_yet")
 
     def test_human_and_bot_mixed_keeps_only_human(self):
-        out = determine_my_pr_status(
+        out = prs.determine_my_pr_status(
             pr(review_decision="REVIEW_REQUIRED",
                comments=[comment("alice"),
                          comment("codacy-production", typename="Bot")]),
@@ -221,7 +220,7 @@ class NudgeFields(unittest.TestCase):
         fixture = _pr_with_reviews([
             {"state": "CHANGES_REQUESTED", "author": {"login": "alice", "__typename": "User"}},
         ])
-        out = server.determine_my_pr_status(fixture, me="me")
+        out = prs.determine_my_pr_status(fixture, me="me")
         self.assertEqual(out["stale_reviewers"], ["alice"])
         self.assertEqual(out["nudge_mode"], "re_review")
         self.assertEqual(out["nudge_targets"], ["alice"])
@@ -230,27 +229,27 @@ class NudgeFields(unittest.TestCase):
         fixture = _pr_with_reviews([
             {"state": "COMMENTED", "author": {"login": "bob", "__typename": "User"}},
         ])
-        out = server.determine_my_pr_status(fixture, me="me")
+        out = prs.determine_my_pr_status(fixture, me="me")
         self.assertEqual(out["stale_reviewers"], ["bob"])
         self.assertEqual(out["nudge_mode"], "re_review")
         self.assertEqual(out["nudge_targets"], ["bob"])
 
     def test_no_human_reviews_drives_fresh_nudge(self):
-        original = server.FRESH_REVIEWERS
-        server.FRESH_REVIEWERS = ["bob", "carol"]
+        original = config.FRESH_REVIEWERS
+        config.FRESH_REVIEWERS = ["bob", "carol"]
         try:
             fixture = _pr_with_reviews([])
-            out = server.determine_my_pr_status(fixture, me="me")
+            out = prs.determine_my_pr_status(fixture, me="me")
             self.assertEqual(out["nudge_mode"], "fresh")
             self.assertEqual(out["nudge_targets"], ["bob", "carol"])
         finally:
-            server.FRESH_REVIEWERS = original
+            config.FRESH_REVIEWERS = original
 
     def test_me_excluded_from_stale_reviewers(self):
         fixture = _pr_with_reviews([
             {"state": "CHANGES_REQUESTED", "author": {"login": "me", "__typename": "User"}},
         ])
-        out = server.determine_my_pr_status(fixture, me="me")
+        out = prs.determine_my_pr_status(fixture, me="me")
         self.assertEqual(out["stale_reviewers"], [])
         self.assertIsNone(out["nudge_mode"])
         self.assertEqual(out["nudge_targets"], [])
@@ -259,14 +258,14 @@ class NudgeFields(unittest.TestCase):
         fixture = _pr_with_reviews([
             {"state": "CHANGES_REQUESTED", "author": {"login": "codecov", "__typename": "Bot"}},
         ])
-        out = server.determine_my_pr_status(fixture, me="me")
+        out = prs.determine_my_pr_status(fixture, me="me")
         self.assertEqual(out["stale_reviewers"], [])
 
     def test_approved_review_gives_none_nudge(self):
         fixture = _pr_with_reviews([
             {"state": "APPROVED", "author": {"login": "alice", "__typename": "User"}},
         ])
-        out = server.determine_my_pr_status(fixture, me="me")
+        out = prs.determine_my_pr_status(fixture, me="me")
         self.assertEqual(out["stale_reviewers"], [])
         self.assertIsNone(out["nudge_mode"])
         self.assertEqual(out["nudge_targets"], [])
@@ -276,7 +275,7 @@ class NudgeFields(unittest.TestCase):
             {"state": "CHANGES_REQUESTED", "author": {"login": "zara", "__typename": "User"}},
             {"state": "COMMENTED", "author": {"login": "alice", "__typename": "User"}},
         ])
-        out = server.determine_my_pr_status(fixture, me="me")
+        out = prs.determine_my_pr_status(fixture, me="me")
         self.assertEqual(out["stale_reviewers"], ["alice", "zara"])
         self.assertEqual(out["nudge_targets"], ["alice", "zara"])
 
