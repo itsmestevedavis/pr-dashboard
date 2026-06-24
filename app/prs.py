@@ -6,9 +6,7 @@ PR lists (both authored and review-requested), and check-run summarization.
 
 import concurrent.futures
 import json
-import subprocess
-
-from app import config, github, jira
+from app import config, github
 from app.config import STATUS_ORDER, STATUS_LABELS, MY_STATUS_ORDER, MY_STATUS_LABELS
 
 
