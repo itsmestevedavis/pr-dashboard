@@ -23,17 +23,16 @@ import urllib.parse
 import urllib.request
 
 import cleanup
-from app import config, github, jira, prs
+from app import config, github, jira, prs, workflows
 from app.http import static_files
 from app.config import (
     HOST, PORT,
-    REVIEW_PROMPT, RE_REVIEW_PROMPT,
     JIRA_JQL, _JIRA_KEY_RE,
     LOG_DIR, _WORKFLOW_DIR,
-    REVIEW_WORKFLOW, ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW,
-    REBASE_WORKFLOW, RE_REVIEW_WORKFLOW,
-    ADDRESS_PROMPT, FIX_PIPELINE_PROMPT, NUDGE_PROMPT, REBASE_PROMPT,
+    REVIEW_WORKFLOW, RE_REVIEW_WORKFLOW,
+    ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW,
 )
+from app.jobs import job as job_mod, events, clones, runners
 
 # ---- Configuration (moved to app/config.py) --------------------------------
 # Serializes .env rewrites and the config globals (DEPLOY_TARGET, etc.) that
@@ -49,137 +48,14 @@ _is_human_author = config._is_human_author
 # summarize_checks, pr_behind_count, list_my_prs, author_reply_count,
 # determine_status, list_prs all live in app/prs.py.
 
-
-# ---- Review dispatch -------------------------------------------------------
-
-_DEFAULT_REVIEW_WORKFLOW = """\
-## Review steps
-
-1. Read the PR title, description, and metadata:
-   `gh pr view {number} --repo {repo}`
-
-2. Get the list of changed files and their individual patches (do NOT use `gh pr diff` — it produces one giant file that is too large):
-   `gh api repos/{repo}/pulls/{number}/files --paginate`
-   This returns JSON. Each entry has: filename, patch, additions, deletions, status.
-   Review each file's patch field one at a time.
-
-3. Review the changes for bugs, logic errors, missing edge cases, and style issues.
-
-4. Post inline comments on specific lines where needed:
-   `gh api repos/{repo}/pulls/{number}/comments --method POST -f body="..." -f commit_id="<sha from step 1>" -f path="<filename>" -F line=<line number>`
-
-5. Submit your final review:
-   - If the code is good: `gh pr review {number} --repo {repo} --approve --body "..."`
-   - If changes are needed: `gh pr review {number} --repo {repo} --request-changes --body "..."`
-   - If you only want to comment: `gh pr review {number} --repo {repo} --comment --body "..."`
-
-Do not use `gh pr diff`. Do not ask the user any questions. Complete the review autonomously.
-"""
-
-_DEFAULT_ADDRESS_WORKFLOW = """\
-## Address steps
-
-For each open review thread on this PR:
-
-1. Decide: apply the fix in code, or reply explaining why the change is not appropriate.
-
-2. If fixing:
-   - Edit the relevant file.
-   - Commit with a clear message.
-
-3. If replying without a code change:
-   - `gh api repos/{repo}/pulls/{number}/comments/<comment_id>/replies --method POST -f body="..."`
-   - Or: `gh pr comment {number} --repo {repo} --body "..."`
-
-After all threads are addressed:
-
-4. Push: `git push origin {local_branch}:{head_ref}`
-
-5. Re-request review from original reviewers:
-   `gh api repos/{repo}/pulls/{number}/requested_reviewers --method POST -f "reviewers[]=<login>"`
-
-Do not ask questions. Do not open new PRs. Only modify files referenced in the comments.
-"""
-
-_DEFAULT_FIX_PIPELINE_WORKFLOW = """\
-## Fix failing pipeline steps
-
-1. Find the failing checks on this PR:
-   `gh pr checks {number} --repo {repo}`
-
-2. Identify the failing workflow run ID from the output and fetch its logs:
-   `gh run view <run-id> --repo {repo} --log-failed`
-
-   If the run ID is not obvious from the checks output, list recent runs:
-   `gh run list --repo {repo} --branch {head_ref} --limit 5`
-
-3. Read the error output carefully. Identify the root cause (failing test,
-   type error, lint violation, build error, etc.).
-
-4. Open the relevant source files and fix the issue. Make the smallest
-   change that makes the check pass — do not refactor unrelated code.
-
-5. Commit the fix with a clear message explaining what was broken and why.
-
-6. Push: `git push origin {local_branch}:{head_ref}`
-
-Do not ask questions. Do not open new PRs. Do not modify files unrelated to the failure.
-"""
-
-_DEFAULT_REBASE_WORKFLOW = """\
-## Rebase steps
-
-1. Fetch the latest from origin:
-   `git fetch origin`
-
-2. Rebase onto the base branch:
-   `git rebase origin/{base_ref}`
-
-3. If there are conflicts, resolve them:
-   - For each conflicted file, open it and resolve the conflict markers.
-   - Prefer the intent of this branch's changes — do not silently discard them.
-   - Stage resolved files: `git add <file>`
-   - Continue: `git rebase --continue`
-   - Repeat until no conflicts remain.
-
-4. Push the rebased branch:
-   `git push origin {local_branch}:{head_ref} --force-with-lease`
-
-Do not ask questions. Do not open new PRs. Do not squash commits unless explicitly required.
-"""
-
-_DEFAULT_RE_REVIEW_WORKFLOW = """\
-## Re-review steps
-
-You are re-reviewing this PR. Your job is NOT to do a fresh review — focus exclusively on
-whether your previous comments have been addressed, and check what changed since your last review.
-
-1. Fetch your previous review comments to understand what you originally flagged:
-   `gh api repos/{repo}/pulls/{number}/comments --paginate`
-   Filter for comments where `user.login` is your GitHub login.
-   Also check review-level feedback:
-   `gh api repos/{repo}/pulls/{number}/reviews --paginate`
-
-2. Find your most recent review's commit SHA from the reviews list (field: `commit_id`).
-   Compare what changed since then:
-   `gh api "repos/{repo}/pulls/{number}/files" --paginate`
-   This gives the full diff. Focus only on files you previously commented on.
-
-3. For each of your original threads:
-   - If `resolved: true` — the author addressed it. No action needed.
-   - If the relevant code has changed in a way that addresses your concern — approve the thread's intent,
-     even if the thread is still technically open.
-   - If your concern is unaddressed — note it in your final review body.
-
-4. Submit your verdict:
-   - All concerns resolved: `gh pr review {number} --repo {repo} --approve --body "..."`
-   - Concerns remain: `gh pr review {number} --repo {repo} --request-changes --body "..."`
-   - Progress acknowledged, minor notes: `gh pr review {number} --repo {repo} --comment --body "..."`
-
-Do not leave new inline comments on code unrelated to your original feedback.
-Do not re-review files you never commented on in your original review.
-Do not ask questions. Complete the re-review autonomously.
-"""
+# ---- Workflow templates and loader (moved to app/workflows.py) -------------
+# _DEFAULT_*_WORKFLOW and _load_workflow live in app/workflows.py.
+# Re-export the templates here so _handle_create_file_post can reference them.
+_DEFAULT_REVIEW_WORKFLOW = workflows._DEFAULT_REVIEW_WORKFLOW
+_DEFAULT_RE_REVIEW_WORKFLOW = workflows._DEFAULT_RE_REVIEW_WORKFLOW
+_DEFAULT_ADDRESS_WORKFLOW = workflows._DEFAULT_ADDRESS_WORKFLOW
+_DEFAULT_FIX_PIPELINE_WORKFLOW = workflows._DEFAULT_FIX_PIPELINE_WORKFLOW
+_DEFAULT_REBASE_WORKFLOW = workflows._DEFAULT_REBASE_WORKFLOW
 
 DEPLOY_TARGETS_PATH = os.path.join(_WORKFLOW_DIR, "deploy_targets.json")
 
@@ -218,462 +94,42 @@ def _load_deploy_targets():
 
 DEPLOY_TARGETS = _load_deploy_targets()
 
-_jobs = {}  # (repo, number, kind) -> Job
-_jobs_lock = threading.Lock()
-
-
-class Job:
-    def __init__(self, repo, number, kind):
-        self.repo = repo
-        self.number = number
-        self.kind = kind  # review | re_review | merge | address | fix_pipeline | rebase
-        self.status = "running"  # running | done | failed | stopped
-        self.result = None
-        self.log = []
-        self.subscribers = []
-        self.lock = threading.Lock()
-        self.start_time = time.time()
-        self.log_path = None
-        self.proc = None
-        self._stop_requested = False
-
-    def stop(self):
-        with self.lock:
-            self._stop_requested = True
-            proc = self.proc
-        if proc and proc.poll() is None:
-            proc.terminate()
-
-    def append(self, text):
-        line = {"ts": time.time(), "type": "line", "text": text}
-        with self.lock:
-            self.log.append(line)
-            subs = list(self.subscribers)
-        for q in subs:
-            try:
-                q.put_nowait(line)
-            except queue.Full:
-                pass
-
-    def subscribe(self):
-        q = queue.Queue(maxsize=2000)
-        with self.lock:
-            for line in self.log:
-                q.put_nowait(line)
-            self.subscribers.append(q)
-            if self.status != "running":
-                q.put_nowait({"ts": time.time(), "type": "done",
-                              "status": self.status, "result": self.result})
-        return q
-
-    def unsubscribe(self, q):
-        with self.lock:
-            try:
-                self.subscribers.remove(q)
-            except ValueError:
-                pass
-
-    def finish(self, status, result):
-        with self.lock:
-            self.status = status
-            self.result = result
-            subs = list(self.subscribers)
-        for q in subs:
-            try:
-                q.put_nowait({"ts": time.time(), "type": "done",
-                              "status": status, "result": result})
-            except queue.Full:
-                pass
-
-
-def get_or_create_job(repo, number, kind):
-    key = (repo, number, kind)
-    with _jobs_lock:
-        existing = _jobs.get(key)
-        if existing and existing.status == "running":
-            return existing, False
-        job = Job(repo, number, kind)
-        _jobs[key] = job
-    return job, True
-
-
-def format_event(ev):
-    """Turn a stream-json event into a one-line human-readable string, or None to skip."""
-    t = ev.get("type")
-    if t == "system" and ev.get("subtype") == "init":
-        model = ev.get("model") or "?"
-        return f"Started session ({model})"
-    if t == "assistant":
-        for c in ev.get("message", {}).get("content", []):
-            ct = c.get("type")
-            if ct == "text":
-                txt = (c.get("text") or "").strip()
-                if txt:
-                    return f"💬 {txt[:240]}"
-            elif ct == "tool_use":
-                name = c.get("name") or "?"
-                inp = c.get("input") or {}
-                if name == "Bash":
-                    cmd = (inp.get("command") or "").splitlines()[0]
-                    return f"$ {cmd[:240]}"
-                if name == "Read":
-                    return f"Read {inp.get('file_path', '?')}"
-                if name == "Edit":
-                    return f"Edit {inp.get('file_path', '?')}"
-                if name == "Write":
-                    return f"Write {inp.get('file_path', '?')}"
-                if name == "Grep":
-                    return f"Grep {inp.get('pattern', '?')}"
-                if name == "Glob":
-                    return f"Glob {inp.get('pattern', '?')}"
-                if name == "Task":
-                    desc = inp.get("description") or inp.get("subagent_type") or "?"
-                    return f"→ subagent: {desc}"
-                if name == "WebFetch":
-                    return f"Fetch {inp.get('url', '?')}"
-                return f"→ {name}"
-    if t == "user":
-        for c in ev.get("message", {}).get("content", []):
-            if c.get("type") == "tool_result" and c.get("is_error"):
-                content = c.get("content")
-                if isinstance(content, list):
-                    content = " ".join(
-                        x.get("text", "") for x in content if x.get("type") == "text"
-                    )
-                return f"⚠️ tool error: {str(content)[:200]}"
-    return None
-
-
-_RE_APPROVE = re.compile(r"gh\s+pr\s+review\b[^|;&]*--approve")
-_RE_REVIEW_API = re.compile(r"gh\s+api\s+repos/[^\s]+/pulls/\d+/reviews\b")
-_RE_COMMENTS_API = re.compile(r"gh\s+api\s+repos/[^\s]+/pulls/\d+/comments\b")
-
-
-def count_pending_comments(repo, number, me):
-    """Sum comments across all of my pending reviews on this PR."""
-    try:
-        reviews = github.gh_json([
-            "api", f"repos/{repo}/pulls/{number}/reviews", "--paginate",
-        ]) or []
-    except Exception:
-        return 0
-    total = 0
-    for r in reviews:
-        if r.get("state") != "PENDING":
-            continue
-        if (r.get("user") or {}).get("login") != me:
-            continue
-        rid = r.get("id")
-        try:
-            comments = github.gh_json([
-                "api",
-                f"repos/{repo}/pulls/{number}/reviews/{rid}/comments",
-                "--paginate",
-            ]) or []
-        except Exception:
-            continue
-        total += len(comments)
-    return total
-
-
-def derive_result(events, repo, number, me):
-    """Look at the tool_use stream + GH state to figure out what claude actually did."""
-    approves = 0
-    review_calls = 0
-    comment_calls = 0
-    for ev in events:
-        if ev.get("type") != "assistant":
-            continue
-        for c in ev.get("message", {}).get("content", []):
-            if c.get("type") != "tool_use" or c.get("name") != "Bash":
-                continue
-            cmd = (c.get("input") or {}).get("command") or ""
-            if _RE_APPROVE.search(cmd):
-                approves += 1
-            if _RE_REVIEW_API.search(cmd):
-                review_calls += 1
-            if _RE_COMMENTS_API.search(cmd):
-                comment_calls += 1
-    if approves > 0:
-        return "approved"
-    if review_calls > 0 or comment_calls > 0:
-        n = count_pending_comments(repo, number, me)
-        if n <= 0:
-            # fallback: at least one comment per API call observed
-            n = max(review_calls, comment_calls)
-        return f"commented:{n}"
-    return "no_action"
-
-
-CLAUDE_BASE_ARGS = [
-    "--permission-mode", "bypassPermissions",
-    "--output-format", "stream-json",
-    "--verbose",
-]
-
-
-def _job_log_path(prefix, repo, number):
-    """Build (and ensure the dir for) a per-job log path."""
-    os.makedirs(LOG_DIR, exist_ok=True)
-    return f"{LOG_DIR}/{prefix}{repo_flat(repo)}-{number}-{int(time.time())}.log"
-
-
-def _fill_refs(text, **refs):
-    """Substitute {key} placeholders in a user-editable workflow body.
-
-    Unlike str.format, this only touches the named keys via literal replace, so
-    stray braces in the file (JSON snippets, shell ${VAR}, etc.) pass through
-    untouched instead of raising KeyError/ValueError and killing the job.
-    """
-    for key, val in refs.items():
-        text = text.replace("{" + key + "}", val)
-    return text
-
-
-def _stream_claude_job(job, prompt, log_path, *, cwd=None, stop_verb="Stopped."):
-    """Spawn `claude -p`, stream stdout to the log file and job, handle exit.
-
-    Returns the list of parsed JSON events on success (exit 0). Returns None if
-    the job has already been finished here (spawn failure, stream error, stop, or
-    non-zero exit) — callers should return immediately without deriving a result.
-    """
-    events = []
-    try:
-        proc = subprocess.Popen(
-            ["claude", "-p", prompt, *CLAUDE_BASE_ARGS],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            cwd=cwd,
-        )
-    except Exception as e:
-        job.append(f"Failed to spawn claude: {e}")
-        job.finish("failed", "spawn_error")
-        return None
-
-    job.proc = proc
-
-    try:
-        with open(log_path, "w") as logf:
-            for line in proc.stdout:
-                logf.write(line)
-                logf.flush()
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                events.append(ev)
-                friendly = format_event(ev)
-                if friendly:
-                    job.append(friendly)
-        proc.wait()
-    except Exception as e:
-        job.append(f"Stream error: {e}")
-        job.finish("failed", "stream_error")
-        return None
-
-    if proc.returncode != 0:
-        if job._stop_requested:
-            job.append(stop_verb)
-            job.finish("stopped", "stopped")
-        else:
-            job.append(f"claude exited with code {proc.returncode}")
-            job.finish("failed", f"exit:{proc.returncode}")
-        return None
-
-    return events
-
-
-def _review_result_label(result):
-    """Map a derive_result() string to a human label for review/re-review."""
-    label = {
-        "approved": "Approved PR ✓",
-        "no_action": "Finished (no GitHub action taken)",
-    }.get(result)
-    if label is None and result.startswith("commented:"):
-        n = result.split(":", 1)[1]
-        label = f"Posted {n} pending comment(s)"
-    return label
-
-
-def _run_review_job(job, log_prefix, workflow_path, prompt_template, log_tag, stop_verb):
-    """Shared body for review and re-review (identical except labels/paths)."""
-    number, repo = job.number, job.repo
-    log_path = _job_log_path(log_prefix, repo, number)
-    job.log_path = log_path
-    job.append(f"Starting {log_tag} of #{number} in {repo}")
-    print(f"[{log_tag}] starting #{number} in {repo} (log: {log_path})", flush=True)
-
-    try:
-        workflow = _load_workflow(workflow_path)
-    except FileNotFoundError:
-        job.append(f"Workflow file not found: {workflow_path}")
-        job.append("Use the Status tab to create it.")
-        job.finish("failed", "missing_workflow")
-        return
-
-    prompt = prompt_template.format(number=number, repo=repo) + workflow
-    events = _stream_claude_job(job, prompt, log_path, stop_verb=stop_verb)
-    if events is None:
-        return
-
-    try:
-        me = github.get_my_login()
-    except Exception:
-        me = None
-    result = derive_result(events, repo, number, me)
-    job.append(_review_result_label(result) or f"Finished: {result}")
-    job.finish("done", result)
-    print(f"[{log_tag}] finished #{number} result={result}", flush=True)
-
-
-def run_review(job):
-    _run_review_job(
-        job, "", REVIEW_WORKFLOW, REVIEW_PROMPT,
-        log_tag="review", stop_verb="Review stopped.",
-    )
-
-
-def run_re_review(job):
-    _run_review_job(
-        job, "re-review-", RE_REVIEW_WORKFLOW, RE_REVIEW_PROMPT,
-        log_tag="re-review", stop_verb="Re-review stopped.",
-    )
-
-
-# ---- Merge dispatch --------------------------------------------------------
-
-GH_MERGE_METHOD_FLAG = {
-    "MERGE": "--merge",
-    "SQUASH": "--squash",
-    "REBASE": "--rebase",
-}
-
-
-def run_merge(job, default_method):
-    """Run `gh pr merge` with the repo's default method. Emulates the
-    GitHub Merge button: no --auto, no --delete-branch.
-    """
-    flag = GH_MERGE_METHOD_FLAG.get(default_method or "MERGE", "--merge")
-    job.append(f"Merging #{job.number} in {job.repo} ({flag})")
-    print(f"[merge] starting #{job.number} in {job.repo} method={flag}", flush=True)
-
-    proc = subprocess.run(
-        ["gh", "pr", "merge", str(job.number),
-         "--repo", job.repo, flag],
-        capture_output=True, text=True,
-    )
-    if proc.stdout:
-        for line in proc.stdout.splitlines():
-            job.append(line)
-    if proc.stderr:
-        for line in proc.stderr.splitlines():
-            job.append(line)
-
-    if proc.returncode == 0:
-        job.append("Merged ✓")
-        job.finish("done", "merged")
-        print(f"[merge] finished #{job.number} merged", flush=True)
-    else:
-        job.append(f"gh exited with code {proc.returncode}")
-        job.finish("failed", f"exit:{proc.returncode}")
-        print(f"[merge] finished #{job.number} failed", flush=True)
-
-
-# ---- Agent-clone management ------------------------------------------------
-
-AGENT_CLONES_DIR = os.path.expanduser("~/.cache/pr-tools/clones")
-_repo_locks = {}
-_repo_locks_lock = threading.Lock()
-
-
-def repo_flat(repo_full):
-    """owner/repo -> owner_repo."""
-    return repo_full.replace("/", "_")
-
-
-def agent_clone_path(repo_full):
-    """Path to the dedicated agent clone for a repo."""
-    return os.path.join(AGENT_CLONES_DIR, repo_flat(repo_full))
-
-
-def get_repo_lock(repo_full):
-    """Per-repo mutex so two agent jobs against the same repo serialize."""
-    with _repo_locks_lock:
-        lock = _repo_locks.get(repo_full)
-        if lock is None:
-            lock = threading.Lock()
-            _repo_locks[repo_full] = lock
-        return lock
-
-
-def prepare_agent_clone(repo_full, head_ref):
-    """Ensure ~/.cache/pr-tools/clones/<repo_flat> has the PR head checked out.
-
-    Clones if missing, then fetches origin/<head_ref>, discards local state,
-    and force-checks out the branch. Returns (clone_path, branch_name).
-
-    Raises subprocess.CalledProcessError on git failure.
-    """
-    path = agent_clone_path(repo_full)
-    if not os.path.isdir(os.path.join(path, ".git")):
-        os.makedirs(AGENT_CLONES_DIR, exist_ok=True)
-        # `gh repo clone` handles auth via the user's gh session.
-        subprocess.run(
-            ["gh", "repo", "clone", repo_full, path],
-            check=True, capture_output=True, text=True,
-        )
-    subprocess.run(
-        ["git", "-C", path, "fetch", "origin", head_ref],
-        check=True, capture_output=True, text=True,
-    )
-    # Discard any leftover state from a prior run before switching branch.
-    subprocess.run(
-        ["git", "-C", path, "reset", "--hard"],
-        check=True, capture_output=True, text=True,
-    )
-    subprocess.run(
-        ["git", "-C", path, "clean", "-fd"],
-        check=True, capture_output=True, text=True,
-    )
-    subprocess.run(
-        ["git", "-C", path, "checkout", "-B", head_ref, f"origin/{head_ref}"],
-        check=True, capture_output=True, text=True,
-    )
-    return path, head_ref
-
-
-# ---- Cleanup (stale branches / worktrees) ----------------------------------
-
-def _git_runner(args, cwd):
-    """Runner injected into cleanup.py: run `git -C cwd <args>` -> (code, out, err)."""
-    proc = subprocess.run(
-        ["git", "-C", cwd, *args], capture_output=True, text=True
-    )
-    return proc.returncode, proc.stdout, proc.stderr
-
-
-def cleanup_repo_targets():
-    """(path, label, kind) tuples to scan: configured repos + each agent clone."""
-    targets = []
-    for raw in config.CLEANUP_REPOS:
-        targets.append((os.path.abspath(os.path.expanduser(raw)), raw, "configured"))
-    if os.path.isdir(AGENT_CLONES_DIR):
-        for name in sorted(os.listdir(AGENT_CLONES_DIR)):
-            full = os.path.join(AGENT_CLONES_DIR, name)
-            if os.path.isdir(os.path.join(full, ".git")):
-                targets.append((full, name, "clone"))
-    return targets
+# ---- Job registry (moved to app/jobs/job.py) --------------------------------
+# Job, _jobs, _jobs_lock, get_or_create_job live in app/jobs/job.py.
+# Re-export frequently accessed names for the Handler still in this module.
+_jobs = job_mod._jobs
+_jobs_lock = job_mod._jobs_lock
+get_or_create_job = job_mod.get_or_create_job
+
+
+# ---- Events (moved to app/jobs/events.py) ----------------------------------
+# format_event, count_pending_comments, derive_result, count_slack_sends,
+# derive_nudge_result, _RE_APPROVE/_RE_REVIEW_API/_RE_COMMENTS_API live there.
+
+# ---- Runners (moved to app/jobs/runners.py) --------------------------------
+# CLAUDE_BASE_ARGS, _job_log_path, _fill_refs, _stream_claude_job,
+# _review_result_label, _run_review_job, run_review, run_re_review,
+# GH_MERGE_METHOD_FLAG, run_merge, _run_worktree_job, run_address,
+# run_fix_pipeline, run_nudge, run_rebase, derive_address_result live there.
+# _load_workflow moved to app/workflows.py.
+
+# ---- Agent clones (moved to app/jobs/clones.py) ----------------------------
+# AGENT_CLONES_DIR, _repo_locks, _repo_locks_lock, repo_flat, agent_clone_path,
+# get_repo_lock, prepare_agent_clone, _git_runner, cleanup_repo_targets live there.
+
+# Re-export for remaining server.py code (scan_cleanup, _handle_create_dir_post, etc.)
+# and for tests that still import from server (derive_address_result used by
+# test_address_result.py; will be removed in Task 6 when that test moves).
+AGENT_CLONES_DIR = clones.AGENT_CLONES_DIR
+cleanup_repo_targets = clones.cleanup_repo_targets
+_git_runner = clones._git_runner
+derive_address_result = runners.derive_address_result
 
 
 def scan_cleanup(fresh=False):
     """Scan all target repos. Returns {"repos": [{path,label,kind,ok,error?,candidates}]}."""
     repos = []
-    for path, label, kind in cleanup_repo_targets():
+    for path, label, kind in clones.cleanup_repo_targets():
         entry = {"path": path, "label": label, "kind": kind, "ok": True, "candidates": []}
         if not os.path.isdir(os.path.join(path, ".git")):
             entry["ok"] = False
@@ -682,227 +138,15 @@ def scan_cleanup(fresh=False):
             continue
         try:
             if fresh:
-                _git_runner(["fetch", "--prune"], path)
+                clones._git_runner(["fetch", "--prune"], path)
             entry["candidates"] = cleanup.scan_repo(
-                _git_runner, path, author_email=config.CLEANUP_AUTHOR_EMAIL or None
+                clones._git_runner, path, author_email=config.CLEANUP_AUTHOR_EMAIL or None
             )
         except Exception as e:  # pragma: no cover - defensive
             entry["ok"] = False
             entry["error"] = str(e)
         repos.append(entry)
     return {"repos": repos}
-
-
-# ---- Address dispatch ------------------------------------------------------
-
-_RE_GIT_PUSH = re.compile(r"(^|[\s;&|])git\s+push\b")
-_RE_INLINE_REPLY = re.compile(r"gh\s+api[^|;&]*\bpulls/\d+/comments/\d+/replies\b")
-_RE_GENERAL_PR_COMMENT = re.compile(r"gh\s+pr\s+comment\b")
-_RE_RERQUEST = re.compile(r"gh\s+api[^|;&]*\bpulls/\d+/requested_reviewers\b")
-
-
-def derive_address_result(events):
-    pushes = 0
-    replies = 0
-    rerequests = 0
-    slack_dms = 0
-    for ev in events:
-        if ev.get("type") != "assistant":
-            continue
-        for c in ev.get("message", {}).get("content", []):
-            if c.get("type") != "tool_use":
-                continue
-            tool_name = c.get("name") or ""
-            # Slack DMs: any MCP tool ending in slack_send_message (not draft).
-            if "slack_send_message" in tool_name and "draft" not in tool_name:
-                slack_dms += 1
-                continue
-            if tool_name != "Bash":
-                continue
-            cmd = (c.get("input") or {}).get("command") or ""
-            if _RE_GIT_PUSH.search(cmd):
-                pushes += 1
-            if _RE_INLINE_REPLY.search(cmd) or _RE_GENERAL_PR_COMMENT.search(cmd):
-                replies += 1
-            if _RE_RERQUEST.search(cmd):
-                rerequests += 1
-
-    parts = []
-    if pushes:
-        parts.append(f"Pushed {pushes} commit{'s' if pushes != 1 else ''}")
-    if replies:
-        parts.append(f"replied to {replies}")
-    if rerequests:
-        parts.append(f"re-requested {rerequests}")
-    if slack_dms:
-        parts.append(f"DM'd {slack_dms}")
-    if pushes:
-        label = ", ".join(parts)
-    elif replies:
-        label = "Replied only"
-    else:
-        label = "No action"
-
-    return {
-        "pushes": pushes,
-        "replies": replies,
-        "rerequests": rerequests,
-        "slack_dms": slack_dms,
-        "label": label,
-    }
-
-
-def _run_worktree_job(job, head_ref, *, log_prefix, workflow_path, log_tag, build_prompt):
-    """Shared body for the worktree-based jobs (address / fix-pipeline / rebase).
-
-    Refreshes the per-repo agent clone under its lock, loads the workflow, builds
-    the prompt via build_prompt(local_branch, workflow), and streams claude in the
-    clone. Returns the parsed events on success, or None if the job was already
-    finished here (clone failure, missing workflow, or any _stream_claude_job exit).
-    """
-    repo, number = job.repo, job.number
-    with get_repo_lock(repo):
-        try:
-            clone_path, local_branch = prepare_agent_clone(repo, head_ref)
-        except subprocess.CalledProcessError as e:
-            job.append(f"Agent-clone setup failed: {(e.stderr or '').strip()}")
-            job.finish("failed", "clone_error")
-            return None
-
-        log_path = _job_log_path(log_prefix, repo, number)
-        job.log_path = log_path
-        job.append(f"Agent clone ready at {clone_path} (branch: {local_branch})")
-        print(f"[{log_tag}] starting #{number} in {repo} (clone: {clone_path})", flush=True)
-
-        try:
-            workflow = _load_workflow(workflow_path)
-        except FileNotFoundError:
-            job.append(f"Workflow file not found: {workflow_path}")
-            job.append("Use the Status tab to create it.")
-            job.finish("failed", "missing_workflow")
-            return None
-
-        return _stream_claude_job(
-            job, build_prompt(local_branch, workflow), log_path, cwd=clone_path,
-        )
-
-
-def run_address(job, head_ref):
-    """Spawn Claude in a worktree to address PR comments."""
-    events = _run_worktree_job(
-        job, head_ref,
-        log_prefix="address-", workflow_path=ADDRESS_WORKFLOW, log_tag="address",
-        build_prompt=lambda local_branch, workflow: ADDRESS_PROMPT.format(
-            number=job.number, repo=job.repo,
-            head_ref=head_ref, local_branch=local_branch,
-        ) + workflow,
-    )
-    if events is None:
-        return
-    result = derive_address_result(events)
-    job.append(result["label"])
-    job.finish("done", result["label"])
-    print(f"[address] finished #{job.number} result={result['label']}", flush=True)
-
-
-# ---- Fix-pipeline dispatch -------------------------------------------------
-
-def run_fix_pipeline(job, head_ref: str) -> None:
-    """Spawn Claude in a worktree to diagnose and fix failing CI checks."""
-    events = _run_worktree_job(
-        job, head_ref,
-        log_prefix="fix-pipeline-", workflow_path=FIX_PIPELINE_WORKFLOW, log_tag="fix-pipeline",
-        build_prompt=lambda local_branch, workflow: FIX_PIPELINE_PROMPT.format(
-            number=job.number, repo=job.repo,
-            head_ref=head_ref, local_branch=local_branch,
-        ) + workflow,
-    )
-    if events is None:
-        return
-    job.append("Pipeline fix complete.")
-    job.finish("done", "pipeline_fixed")
-    print(f"[fix-pipeline] finished #{job.number}", flush=True)
-
-
-# ---- Nudge dispatch --------------------------------------------------------
-
-def count_slack_sends(events):
-    """Count `slack_send_message` tool calls in a Claude stream (excluding drafts)."""
-    sent = 0
-    for ev in events:
-        if ev.get("type") != "assistant":
-            continue
-        for c in ev.get("message", {}).get("content", []):
-            if c.get("type") != "tool_use":
-                continue
-            name = c.get("name") or ""
-            if "slack_send_message" in name and "draft" not in name:
-                sent += 1
-    return sent
-
-
-def derive_nudge_result(events, mode="re_review"):
-    sent = count_slack_sends(events)
-    if sent == 0:
-        return {
-            "sent": 0,
-            "label": "Channel post failed" if mode == "channel" else "No DMs sent",
-        }
-    if mode == "channel":
-        label = "Posted in team channel"
-    else:
-        label = f"DM'd {sent} reviewer{'s' if sent != 1 else ''}"
-    return {"sent": sent, "label": label}
-
-
-def run_nudge(job, url, title, reviewers, mode, channel_id=None):
-    """Spawn Claude to DM the reviewers on Slack via the Slack MCP."""
-    if channel_id is None:
-        channel_id = config.TEAM_CHANNEL_ID
-    resolved_reviewers = [config.SLACK_ID_MAP.get(r, r) for r in reviewers]
-    log_path = _job_log_path("nudge-", job.repo, job.number)
-    job.log_path = log_path
-    venue = f"#channel {channel_id}" if mode == "channel" else f"{len(resolved_reviewers)} DM(s)"
-    job.append(f"Nudging on Slack ({mode}, {venue}): {', '.join(reviewers)}")
-    print(f"[nudge] starting #{job.number} in {job.repo} mode={mode} reviewers={reviewers}", flush=True)
-    prompt = NUDGE_PROMPT.format(
-        url=url, title=title, reviewers=", ".join(resolved_reviewers),
-        mode=mode, channel=channel_id,
-    )
-    events = _stream_claude_job(job, prompt, log_path, stop_verb="Nudge stopped.")
-    if events is None:
-        return
-    result = derive_nudge_result(events, mode=mode)
-    job.append(result["label"])
-    job.finish("done", result["label"])
-    print(f"[nudge] finished #{job.number} result={result['label']}", flush=True)
-
-
-# ---- Rebase dispatch -------------------------------------------------------
-
-def run_rebase(job, head_ref: str, base_ref: str) -> None:
-    """Spawn Claude in a worktree to rebase the PR branch onto its base."""
-    events = _run_worktree_job(
-        job, head_ref,
-        log_prefix="rebase-", workflow_path=REBASE_WORKFLOW, log_tag="rebase",
-        build_prompt=lambda local_branch, workflow: REBASE_PROMPT.format(
-            number=job.number, repo=job.repo,
-            head_ref=head_ref, local_branch=local_branch, base_ref=base_ref,
-        ) + _fill_refs(
-            workflow, base_ref=base_ref, head_ref=head_ref, local_branch=local_branch,
-        ),
-    )
-    if events is None:
-        return
-    job.append("Rebase complete.")
-    job.finish("done", "rebased")
-    print(f"[rebase] finished #{job.number}", flush=True)
-
-
-def _load_workflow(path):
-    """Read a workflow .md file. Raises FileNotFoundError if missing."""
-    with open(path) as f:
-        return f.read().strip()
 
 
 # ---- Job POST routing ------------------------------------------------------
@@ -924,12 +168,12 @@ def _extract_merge(d):
 # job creation, thread spawn, and 202 envelope; `extract` returns the extra
 # positional args each runner needs (and may raise to reject the request).
 _JOB_POST_ROUTES = {
-    "/api/review":       ("review",       run_review,       None),
-    "/api/re-review":    ("re_review",    run_re_review,    None),
-    "/api/merge":        ("merge",        run_merge,        _extract_merge),
-    "/api/address":      ("address",      run_address,      lambda d: (_req_ref(d, "headRefName"),)),
-    "/api/fix-pipeline": ("fix_pipeline", run_fix_pipeline, lambda d: (_req_ref(d, "headRefName"),)),
-    "/api/rebase":       ("rebase",       run_rebase,       lambda d: (_req_ref(d, "headRefName"), _req_ref(d, "baseRefName"))),
+    "/api/review":       ("review",       runners.run_review,       None),
+    "/api/re-review":    ("re_review",    runners.run_re_review,    None),
+    "/api/merge":        ("merge",        runners.run_merge,        _extract_merge),
+    "/api/address":      ("address",      runners.run_address,      lambda d: (_req_ref(d, "headRefName"),)),
+    "/api/fix-pipeline": ("fix_pipeline", runners.run_fix_pipeline, lambda d: (_req_ref(d, "headRefName"),)),
+    "/api/rebase":       ("rebase",       runners.run_rebase,       lambda d: (_req_ref(d, "headRefName"), _req_ref(d, "baseRefName"))),
 }
 
 
@@ -1532,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
         job, started = get_or_create_job(repo, number, "nudge")
         if started:
             threading.Thread(
-                target=run_nudge, args=(job, url, title, reviewers, mode, channel_id), daemon=True,
+                target=runners.run_nudge, args=(job, url, title, reviewers, mode, channel_id), daemon=True,
             ).start()
         self._send_json(202, {
             "started": started,
