@@ -10,7 +10,11 @@ Local web UI with two views over your GitHub PRs:
 - Python 3.8+
 - `gh` CLI (authenticated)
 - `claude` CLI on PATH
-- For Slack nudges: the Slack MCP must be configured for `claude`
+- For Slack nudges: the Slack MCP must be configured for `claude` — and the
+  claude.ai Slack connector must be **enabled for this repo's project context**
+  (spawned jobs run with this repo as cwd; per-project `disabledMcpServers`
+  silently hides it). If nudge jobs report no Slack tool, see
+  [docs/slack-nudge-troubleshooting.md](docs/slack-nudge-troubleshooting.md).
 
 ## Setup
 

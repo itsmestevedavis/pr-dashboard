@@ -58,6 +58,7 @@ def parse_ticket(issue, site):
     category = (status.get("statusCategory") or {}).get("key") or "new"
     priority = fields.get("priority") or {}
     issuetype = fields.get("issuetype") or {}
+    assignee = fields.get("assignee") or {}
     key = issue.get("key", "")
     return {
         "key": key,
@@ -69,6 +70,29 @@ def parse_ticket(issue, site):
         "type": issuetype.get("name") or "",
         "url": f"https://{site}/browse/{key}",
         "updatedAt": fields.get("updated") or "",
+        # Team-tab additions (additive; ignored by the personal Tickets tab).
+        "assignee": assignee.get("accountId"),
+        "assignee_name": assignee.get("displayName"),
+        "epic": _parse_epic(fields.get("parent"), site),
+    }
+
+
+def _parse_epic(parent, site):
+    """Return {key, summary, url} when the issue's parent is an Epic, else None.
+
+    Uses the unified `fields.parent` link (modern Jira). A parent that is a Story
+    or other non-Epic type (e.g. a sub-task's parent) is not an epic and yields None.
+    """
+    parent = parent or {}
+    pfields = parent.get("fields") or {}
+    ptype = (pfields.get("issuetype") or {}).get("name") or ""
+    pkey = parent.get("key") or ""
+    if not pkey or ptype != "Epic":
+        return None
+    return {
+        "key": pkey,
+        "summary": pfields.get("summary") or "",
+        "url": f"https://{site}/browse/{pkey}",
     }
 
 
@@ -117,3 +141,92 @@ def jira_statuses():
             cat_by_name[name] = category
     rank = {"new": 0, "indeterminate": 1}
     return sorted(cat_by_name, key=lambda n: (rank.get(cat_by_name[n], 2), n.lower()))
+
+
+# ---- Team tab: account resolution, sprints, team issues, epics --------------
+
+# Fields fetched for every team ticket (adds assignee + parent over the Tickets tab).
+_TEAM_FIELDS = "summary,status,priority,issuetype,updated,assignee,parent"
+
+
+def _assignee_in_clause(account_ids):
+    """Build a JQL `assignee in ("id", ...)` clause from account ids.
+
+    Account ids are quoted (they can contain characters like ':') so the clause
+    is safe to interpolate.
+    """
+    quoted = ", ".join('"{}"'.format(a.replace('"', "")) for a in account_ids)
+    return "assignee in ({})".format(quoted)
+
+
+def resolve_account(email):
+    """Resolve an email to {accountId, displayName} via Jira user search, or None.
+
+    When the search returns several users, prefer an exact (case-insensitive)
+    email match; otherwise fall back to the sole result. Never guesses between
+    multiple ambiguous matches.
+    """
+    results = jira_request("GET", "/rest/api/3/user/search", params={"query": email}) or []
+    if not results:
+        return None
+    want = (email or "").strip().lower()
+    chosen = None
+    for u in results:
+        if (u.get("emailAddress") or "").strip().lower() == want:
+            chosen = u
+            break
+    if chosen is None:
+        if len(results) != 1:
+            return None
+        chosen = results[0]
+    return {"accountId": chosen.get("accountId"), "displayName": chosen.get("displayName") or ""}
+
+
+def active_sprint(board_id):
+    """Return the board's active sprint as {id, name, goal}, or None.
+
+    Only Scrum boards have sprints; Kanban boards (or a board between sprints)
+    yield no active sprint and return None.
+    """
+    data = jira_request(
+        "GET", f"/rest/agile/1.0/board/{board_id}/sprint", params={"state": "active"}
+    )
+    values = (data or {}).get("values") or []
+    if not values:
+        return None
+    s = values[0]
+    return {"id": s.get("id"), "name": s.get("name") or "", "goal": s.get("goal") or ""}
+
+
+def sprint_issues(sprint_id, account_ids):
+    """Tickets in the given sprint assigned to any of account_ids (parsed)."""
+    data = jira_request(
+        "GET", f"/rest/agile/1.0/sprint/{sprint_id}/issue",
+        params={"jql": _assignee_in_clause(account_ids), "fields": _TEAM_FIELDS, "maxResults": "100"},
+    )
+    issues = (data or {}).get("issues") or []
+    return [parse_ticket(i, config.JIRA_SITE) for i in issues]
+
+
+def open_issues(account_ids):
+    """Fallback: all not-Done tickets assigned to account_ids (parsed).
+
+    Used when the board has no active sprint.
+    """
+    jql = f"{_assignee_in_clause(account_ids)} AND statusCategory != Done ORDER BY updated DESC"
+    data = jira_request(
+        "GET", "/rest/api/3/search/jql",
+        params={"jql": jql, "fields": _TEAM_FIELDS, "maxResults": "100"},
+    )
+    issues = (data or {}).get("issues") or []
+    return [parse_ticket(i, config.JIRA_SITE) for i in issues]
+
+
+def derive_epics(tickets):
+    """Distinct epics referenced by a list of parsed tickets, first-seen order."""
+    seen = {}
+    for t in tickets:
+        epic = t.get("epic")
+        if epic and epic.get("key") and epic["key"] not in seen:
+            seen[epic["key"]] = epic
+    return list(seen.values())

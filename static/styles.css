@@ -632,3 +632,116 @@
   }
   .deployed-deploy-btn:hover:not(:disabled) { background: #2ea043; }
   .deployed-deploy-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  /* ---- Team tab ---- */
+  .team-banner {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+  }
+  .team-sprint { font-size: 15px; }
+  .team-sprint-name { font-weight: 600; }
+  .team-muted { color: var(--muted); }
+  .team-epics { margin-top: 8px; font-size: 13px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .team-epic {
+    display: inline-block;
+    background: #21262d;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2px 10px;
+    font-size: 12px;
+    text-decoration: none;
+  }
+  .team-epic:hover { border-color: var(--blue); color: var(--blue); }
+  .team-people { display: flex; flex-direction: column; gap: 10px; }
+  .team-person {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px 14px;
+  }
+  .team-person > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 8px 0;
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .team-person > summary::-webkit-details-marker { display: none; }
+  .team-person > summary::before { content: '▸'; color: var(--muted); transition: transform 0.15s; }
+  .team-person[open] > summary::before { transform: rotate(90deg); }
+  .team-person-name { font-weight: 600; }
+  .team-count { color: var(--muted); font-size: 13px; }
+  .team-warn { color: #f0a93a; font-size: 13px; }
+  .team-ok { color: #3fb950; }
+  .team-person-body { padding: 4px 0 10px 18px; display: flex; flex-direction: column; gap: 6px; }
+  .team-person-empty { font-size: 13px; padding: 4px 0; }
+  .team-ticket {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 13px;
+    padding: 4px 0;
+    border-top: 1px solid var(--border);
+  }
+  .team-ticket:first-child { border-top: none; }
+  .team-ticket-key { color: var(--blue); text-decoration: none; font-weight: 600; white-space: nowrap; }
+  .team-ticket-key:hover { text-decoration: underline; }
+  .team-ticket-status {
+    border-radius: 4px;
+    padding: 1px 7px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .team-status-new { background: #30363d; color: var(--text); }
+  .team-status-indeterminate { background: #1f6feb; color: #fff; }
+  .team-status-done { background: #238636; color: #fff; }
+  .team-ticket-summary { flex: 1; color: var(--text); }
+  .team-ticket-epic { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .team-resolve-row { font-size: 13px; padding: 2px 0; }
+
+  /* ---- Standup summary card (top of Team tab) ---- */
+  .standup-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+  }
+  .standup-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .standup-title { font-weight: 600; font-size: 15px; }
+  .standup-meta { font-size: 12px; }
+  .standup-btn {
+    margin-left: auto;
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .standup-btn:hover:not(:disabled) { border-color: var(--blue); }
+  .standup-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+  .standup-block { display: flex; gap: 12px; padding: 6px 0; }
+  .standup-block + .standup-block { border-top: 1px solid var(--border); }
+  .standup-label {
+    flex-shrink: 0;
+    width: 40px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding-top: 3px;
+  }
+  .standup-text { flex: 1; font-size: 14px; line-height: 1.5; color: var(--text); }
+  .standup-empty { font-size: 13px; }
+  .standup-error { font-size: 13px; color: #f85149; }

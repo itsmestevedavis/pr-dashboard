@@ -177,13 +177,34 @@ JIRA_STATUS_FILTER = _env_list("JIRA_STATUS_FILTER")
 # Tickets assigned to me that are not finished, most-recently-updated first.
 JIRA_JQL = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
 
+# ---- Team tab -------------------------------------------------------------
+# Teammates to show on the Team tab, configured by email (comma list in .env)
+# and resolved to Jira account ids (cached under ~/.config/pr-dashboard/).
+JIRA_TEAM = _env_list("JIRA_TEAM")
+# Numeric Scrum board id whose active sprint drives the Team tab's goal/epics.
+# Team tab needs Jira creds + this + at least one teammate; else it shows a hint.
+JIRA_BOARD_ID = os.environ.get("JIRA_BOARD_ID", "").strip()
+
 # Jira issue keys look like ABC-123 — validate before interpolating into API paths.
 _JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 
+# Logins of bot/machine *user* accounts whose comments must not count as human
+# review feedback (e.g. an org's CognotaBot service account). GitHub App bots
+# surface as __typename "Bot" and are filtered automatically; these are
+# indistinguishable from real users by type, so they must be named explicitly.
+# Comma list in .env, matched case-insensitively.
+BOT_LOGINS = {s.lower() for s in _env_list("BOT_LOGINS")}
+
 
 def _is_human_author(author):
-    """True if the GraphQL author node is a real user (not a Bot, etc)."""
+    """True if the GraphQL author node is a real user (not a Bot, etc).
+
+    Excludes two kinds of bots: GitHub Apps (__typename "Bot") and machine
+    *user* accounts listed in BOT_LOGINS (which look like real users by type).
+    """
     if not author:
+        return False
+    if (author.get("login") or "").lower() in BOT_LOGINS:
         return False
     typename = author.get("__typename")
     # When __typename isn't fetched, fall back to accepting it (legacy callers).
@@ -200,6 +221,7 @@ ADDRESS_WORKFLOW       = os.path.join(_WORKFLOW_DIR, "address_workflow.md")
 FIX_PIPELINE_WORKFLOW  = os.path.join(_WORKFLOW_DIR, "fix_pipeline_workflow.md")
 REBASE_WORKFLOW        = os.path.join(_WORKFLOW_DIR, "rebase_workflow.md")
 RE_REVIEW_WORKFLOW     = os.path.join(_WORKFLOW_DIR, "re_review_workflow.md")
+NUDGE_WORKFLOW         = os.path.join(_WORKFLOW_DIR, "nudge_workflow.md")
 
 # ---- Prompts ---------------------------------------------------------------
 
@@ -217,6 +239,8 @@ FIX_PIPELINE_PROMPT = (
     "Push fixes with: git push origin {local_branch}:{head_ref}\n\n"
 )
 
+# Data block only — the how-to (mode templates, send rules) lives in the editable
+# nudge_workflow.md, which run_nudge appends to this prompt (like REVIEW_PROMPT does).
 NUDGE_PROMPT = (
     "I want to nudge these GitHub reviewers on Slack about my open PR:\n"
     "  PR: {url}\n"
@@ -224,15 +248,6 @@ NUDGE_PROMPT = (
     "  Reviewers (GitHub logins, Slack @handles, or Slack member IDs): {reviewers}\n"
     "  Mode: {mode}\n"
     "  Channel ID: {channel}\n\n"
-    "Mode meanings:\n"
-    "  - re_review: I've addressed their previous review comments; "
-    "DM each one asking them to take another look.\n"
-    "  - fresh: nobody has reviewed this PR yet; "
-    "DM each one asking them to review it for the first time.\n"
-    "  - channel: post ONE message in the team channel (the Channel ID above) "
-    "using `<!here>` (do NOT tag the listed reviewers individually).\n\n"
-    "Follow the 'Nudging reviewers on Slack' workflow in your CLAUDE.md "
-    "exactly. Pick the message template that matches the mode. Do not deviate."
 )
 
 REBASE_PROMPT = (
@@ -241,4 +256,25 @@ REBASE_PROMPT = (
     "PR head branch on origin: {head_ref}. "
     "Local branch in this worktree: {local_branch}. "
     "Push with: git push origin {local_branch}:{head_ref} --force-with-lease\n\n"
+)
+
+# Standup summary for the Team tab. Instructions only — the per-request data block
+# (sprint goal, each teammate's tickets, my PRs) is appended by
+# app/standup.py:_build_prompt. NOT interpolated with str.format because the JSON
+# example below contains literal braces; the data is concatenated, not formatted.
+STANDUP_PROMPT = (
+    "You are helping me prepare for my team's daily standup. Below is the current "
+    "sprint goal, each teammate's Jira tickets this sprint, and my own open pull "
+    "requests. The teammate marked \"(me)\" is me — the person giving the update.\n\n"
+    "Write two short updates, grounded ONLY in the data below — do not invent work "
+    "or people that aren't listed:\n"
+    "1. \"team\": 1-2 sentences I can say out loud summarizing what the team as a "
+    "whole is working on this sprint. Mention notable themes or who is on what; keep "
+    "it natural and spoken, not a bulleted list.\n"
+    "2. \"me\": 1-2 sentences, first person, on what I'm working on — my in-progress "
+    "tickets and the state of my open PRs (e.g. waiting on review, needs a rebase, "
+    "checks failing). If I have nothing assigned, say so briefly.\n\n"
+    "Respond with ONLY a JSON object and nothing else — no markdown, no code fence, "
+    "no prose around it:\n"
+    "{\"team\": \"...\", \"me\": \"...\"}"
 )

@@ -10,13 +10,13 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import cleanup
-from app import config, workflows, jira, prs, deploy, branches, cleanup_scan, sysstatus
+from app import config, workflows, jira, prs, deploy, branches, cleanup_scan, sysstatus, team, standup
 from app.config import (
     HOST, PORT,
     _JIRA_KEY_RE,
     LOG_DIR, _WORKFLOW_DIR,
     REVIEW_WORKFLOW, RE_REVIEW_WORKFLOW,
-    ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW,
+    ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW, NUDGE_WORKFLOW,
 )
 from app.jobs import job, events, runners, clones
 from app.http import static_files, routes
@@ -66,6 +66,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Never echo the token itself to the browser — only whether it is set.
                 "jira_token_set": bool(config.JIRA_API_TOKEN),
                 "jira_status_filter": config.JIRA_STATUS_FILTER,
+                "jira_team": ",".join(config.JIRA_TEAM),
+                "jira_board_id": config.JIRA_BOARD_ID,
                 "cleanup_repos": config.CLEANUP_REPOS,
                 "cleanup_author_email": config.CLEANUP_AUTHOR_EMAIL,
                 "fresh_reviewers": config.FRESH_REVIEWERS,
@@ -124,6 +126,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 self._send_json(200, {"configured": True, "tickets": jira.jira_search()})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if parsed.path == "/api/team":
+            try:
+                self._send_json(200, team.team_overview())
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if parsed.path == "/api/team/standup":
+            # Cached summary only — never generates (that's the POST). Safe/fast on load.
+            try:
+                self._send_json(200, standup.standup_summary(force=False))
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
@@ -237,6 +252,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/settings":
             self._handle_settings_post()
+            return
+        if parsed.path == "/api/team/resolve":
+            self._handle_team_resolve_post()
+            return
+        if parsed.path == "/api/team/standup":
+            self._handle_standup_post()
             return
         if parsed.path == "/api/tickets/transition":
             self._handle_ticket_transition_post()
@@ -387,7 +408,8 @@ class Handler(BaseHTTPRequestHandler):
         _allowed = {"DEPLOY_TARGET",
                     "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
                     "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
-                    "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL",
+                    "JIRA_STATUS_FILTER", "JIRA_TEAM", "JIRA_BOARD_ID",
+                    "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL",
                     "FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "TEAMS", "SLACK_IDS"}
         try:
             data = self._read_json_body()
@@ -409,7 +431,8 @@ class Handler(BaseHTTPRequestHandler):
                 # These keys may be written empty (clears them); every other key
                 # keeps its current value when blank.
                 if not value and key not in (
-                    "JIRA_STATUS_FILTER", "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL",
+                    "JIRA_STATUS_FILTER", "JIRA_TEAM", "JIRA_BOARD_ID",
+                    "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL",
                     "FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "TEAMS", "SLACK_IDS"
                 ):
                     continue
@@ -435,6 +458,10 @@ class Handler(BaseHTTPRequestHandler):
                     config.JIRA_API_TOKEN = value
                 elif key == "JIRA_STATUS_FILTER":
                     config.JIRA_STATUS_FILTER = config._env_list("JIRA_STATUS_FILTER")
+                elif key == "JIRA_TEAM":
+                    config.JIRA_TEAM = config._env_list("JIRA_TEAM")
+                elif key == "JIRA_BOARD_ID":
+                    config.JIRA_BOARD_ID = value
                 elif key == "CLEANUP_REPOS":
                     config.CLEANUP_REPOS = config._env_list("CLEANUP_REPOS")
                 elif key == "CLEANUP_AUTHOR_EMAIL":
@@ -448,6 +475,45 @@ class Handler(BaseHTTPRequestHandler):
                 elif key == "SLACK_IDS":
                     config.SLACK_ID_MAP = config._parse_slack_ids()
         self._send_json(200, {"ok": True})
+
+    def _handle_team_resolve_post(self):
+        """Preview which configured emails resolve to Jira accounts (Settings button).
+
+        Accepts {emails: "a@x,b@y"} or {emails: [...]}, resolves them (updating the
+        cache), and returns each member's status so the UI can flag ⚠ not-found.
+        """
+        if not jira.jira_configured():
+            self._send_json(503, {"error": "Jira not configured"})
+            return
+        try:
+            data = self._read_json_body()
+            raw = data.get("emails", "")
+        except Exception as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        if isinstance(raw, str):
+            emails = [s.strip() for s in raw.split(",") if s.strip()]
+        elif isinstance(raw, list):
+            emails = [str(s).strip() for s in raw if str(s).strip()]
+        else:
+            self._send_json(400, {"error": "emails must be a string or list"})
+            return
+        try:
+            self._send_json(200, {"members": team.resolve_members(emails)})
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_standup_post(self):
+        """Regenerate the Team-tab standup summary (the Generate/Refresh button).
+
+        Blocks on `claude -p` (up to ~2 min), which is fine on ThreadingHTTPServer —
+        it ties up only this request thread. standup_summary handles the
+        not-configured / generation-error cases in its payload.
+        """
+        try:
+            self._send_json(200, standup.standup_summary(force=True))
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
 
     def _handle_open_dir_post(self):
         try:
@@ -473,6 +539,7 @@ class Handler(BaseHTTPRequestHandler):
             os.path.realpath(ADDRESS_WORKFLOW):   workflows._DEFAULT_ADDRESS_WORKFLOW,
             os.path.realpath(FIX_PIPELINE_WORKFLOW):  workflows._DEFAULT_FIX_PIPELINE_WORKFLOW,
             os.path.realpath(REBASE_WORKFLOW):         workflows._DEFAULT_REBASE_WORKFLOW,
+            os.path.realpath(NUDGE_WORKFLOW):          workflows._DEFAULT_NUDGE_WORKFLOW,
             os.path.realpath(deploy.DEPLOY_TARGETS_PATH): json.dumps(
                 deploy._DEFAULT_DEPLOY_TARGETS, indent=2
             ) + "\n",

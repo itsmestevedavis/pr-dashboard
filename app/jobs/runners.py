@@ -14,7 +14,7 @@ from app.config import (
     REVIEW_PROMPT, RE_REVIEW_PROMPT,
     ADDRESS_PROMPT, FIX_PIPELINE_PROMPT, NUDGE_PROMPT, REBASE_PROMPT,
     REVIEW_WORKFLOW, RE_REVIEW_WORKFLOW,
-    ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW,
+    ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW, NUDGE_WORKFLOW,
 )
 
 CLAUDE_BASE_ARGS = [
@@ -327,13 +327,22 @@ def run_nudge(job, url, title, reviewers, mode, channel_id=None):
     resolved_reviewers = [config.SLACK_ID_MAP.get(r, r) for r in reviewers]
     log_path = _job_log_path("nudge-", job.repo, job.number)
     job.log_path = log_path
+
+    try:
+        workflow = workflows._load_workflow(NUDGE_WORKFLOW)
+    except FileNotFoundError:
+        job.append(f"Workflow file not found: {NUDGE_WORKFLOW}")
+        job.append("Use the Status tab to create it.")
+        job.finish("failed", "missing_workflow")
+        return
+
     venue = f"#channel {channel_id}" if mode == "channel" else f"{len(resolved_reviewers)} DM(s)"
     job.append(f"Nudging on Slack ({mode}, {venue}): {', '.join(reviewers)}")
     print(f"[nudge] starting #{job.number} in {job.repo} mode={mode} reviewers={reviewers}", flush=True)
     prompt = NUDGE_PROMPT.format(
         url=url, title=title, reviewers=", ".join(resolved_reviewers),
         mode=mode, channel=channel_id,
-    )
+    ) + workflow
     job_events = _stream_claude_job(job, prompt, log_path, stop_verb="Nudge stopped.")
     if job_events is None:
         return

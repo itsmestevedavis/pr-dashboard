@@ -1,6 +1,6 @@
 """app/workflows.py — default workflow templates and workflow-file loader.
 
-Holds the five _DEFAULT_*_WORKFLOW markdown strings and _load_workflow().
+Holds the six _DEFAULT_*_WORKFLOW markdown strings and _load_workflow().
 Workflow file *paths* live in app/config.py; this module only reads them.
 """
 
@@ -132,6 +132,37 @@ whether your previous comments have been addressed, and check what changed since
 Do not leave new inline comments on code unrelated to your original feedback.
 Do not re-review files you never commented on in your original review.
 Do not ask questions. Complete the re-review autonomously.
+"""
+
+_DEFAULT_NUDGE_WORKFLOW = """\
+## Nudge steps
+
+You are nudging the listed GitHub reviewers about an open PR on Slack. The prompt
+above gives you the PR URL + title, the Reviewers list (each entry is a Slack
+`@handle`, a Slack member ID like `U01ABC...`, or a bare GitHub login), the Mode,
+and a Channel ID.
+
+1. **Resolve each reviewer to a Slack user:**
+   - If it starts with `@`, it's a Slack handle — DM that handle directly.
+   - If it starts with `U`, it's a Slack member ID — use it directly.
+   - Otherwise it's a GitHub login — look them up via the Slack MCP (search by the
+     login / display name). Skip anyone you can't resolve and note it.
+
+2. **Pick the message by Mode and SEND it for real** with the Slack send tool — the
+   tool whose name contains `slack_send_message`. **Never use a `*draft*` variant**
+   (the dashboard only counts a real `slack_send_message` call as a success).
+   - **fresh** — DM each reviewer individually:
+     `👋 Could you take a first look at my PR when you get a chance? <title> <url>`
+   - **re_review** — DM each reviewer individually:
+     `🙏 I've addressed your review comments on <title> — mind taking another look? <url>`
+   - **channel** — post ONE message to the given Channel ID, opening with `<!here>`
+     (do **not** @-mention the individual reviewers):
+     `<!here> Review requested on <title>: <url>`
+
+3. Send exactly one message per target. Never draft. When done, briefly report who
+   you messaged (and anyone you couldn't resolve).
+
+Do not ask the user any questions. Complete the nudge autonomously.
 """
 
 

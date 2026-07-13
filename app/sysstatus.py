@@ -10,7 +10,7 @@ from app import config, deploy
 from app.config import (
     LOG_DIR,
     REVIEW_WORKFLOW, RE_REVIEW_WORKFLOW,
-    ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW,
+    ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW, NUDGE_WORKFLOW,
 )
 from app.jobs import clones
 
@@ -90,6 +90,7 @@ def get_status():
         (ADDRESS_WORKFLOW,      "address_workflow.md",      "Address workflow instructions"),
         (FIX_PIPELINE_WORKFLOW, "fix_pipeline_workflow.md", "Fix pipeline workflow instructions"),
         (REBASE_WORKFLOW,       "rebase_workflow.md",       "Rebase workflow instructions"),
+        (NUDGE_WORKFLOW,        "nudge_workflow.md",        "Nudge workflow instructions"),
         (deploy.DEPLOY_TARGETS_PATH,   "deploy_targets.json",
          "Deploy targets (repo → env → workflow name)"),
     ]:

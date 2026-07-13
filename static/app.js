@@ -40,7 +40,7 @@ const TABS = {
 };
 
 const _tab = (new URLSearchParams(location.search)).get('tab');
-let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets', 'cleanup'].includes(_tab) ? _tab : 'incoming';
+let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets', 'team', 'cleanup'].includes(_tab) ? _tab : 'incoming';
 let deployedState = {};  // environments map from /api/deployed, populated when mine tab loads
 
 function escapeHtml(s) {
@@ -927,6 +927,7 @@ const CARD_ACTIONS = {
   'btn-channel-caret': onChannelCaret,
   'btn-nudge-team': onNudgeTeam,
   'btn-channel-team': onChannelTeam,
+  'btn-standup-generate': onGenerateStandup,
 };
 
 function onContentClick(ev) {
@@ -944,7 +945,7 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
-const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets', cleanup: '🧹 Branch cleanup' };
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets', team: '👥 Team', cleanup: '🧹 Branch cleanup' };
 
 function setActiveTab(tab) {
   currentTab = tab;
@@ -1190,6 +1191,124 @@ async function onCleanupDelete() {
   toast(`${okCount}/${results.length} removed`);
 }
 
+// Inner content of the standup card, for the stable #standup-card wrapper. `s` is
+// the /api/team/standup payload: {configured, cached, generated_at, team, me, error}.
+// Every interpolated value is escaped (values ultimately come from claude output).
+function standupInner(s) {
+  const hasSummary = !!(s.team || s.me);
+  const meta = s.generated_at
+    ? `<span class="standup-meta team-muted">generated ${escapeHtml(relativeTime(s.generated_at))}</span>`
+    : '';
+  let body;
+  if (s.error) {
+    body = `<div class="standup-error">Couldn't generate — ${escapeHtml(s.error)}</div>`;
+  } else if (hasSummary) {
+    body = `
+      <div class="standup-block">
+        <div class="standup-label">Team</div>
+        <div class="standup-text">${escapeHtml(s.team || '—')}</div>
+      </div>
+      <div class="standup-block">
+        <div class="standup-label">Me</div>
+        <div class="standup-text">${escapeHtml(s.me || '—')}</div>
+      </div>`;
+  } else {
+    body = `<div class="standup-empty team-muted">No standup summary yet — click Generate to draft one from the sprint tickets and your open PRs.</div>`;
+  }
+  return `
+    <div class="standup-head">
+      <span class="standup-title">🗣️ Daily standup</span>
+      ${meta}
+      <button class="btn-standup-generate standup-btn">${hasSummary ? 'Refresh' : 'Generate'}</button>
+    </div>
+    ${body}`;
+}
+
+// Generation is button-only (POST); the load-time fetch only renders cached state.
+function renderStandup(standup) {
+  return `<div class="standup-card" id="standup-card">${standupInner(standup || {})}</div>`;
+}
+
+async function onGenerateStandup(btn) {
+  const card = document.getElementById('standup-card');
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+  try {
+    const res = await fetch('/api/team/standup', { method: 'POST' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (card) card.innerHTML = standupInner(data);
+    if (data.error) toast('Standup generation failed', true);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Refresh';
+    toast(`Standup failed: ${e.message}`, true);
+  }
+}
+
+function renderTeam(data, standup) {
+  const content = document.getElementById('content');
+  if (!data.configured) {
+    const missing = [];
+    if (!data.jira_configured) missing.push('Jira credentials (JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN)');
+    if (!data.board_id_set) missing.push('a board ID (JIRA_BOARD_ID)');
+    if (!data.team_set) missing.push('at least one teammate (JIRA_TEAM)');
+    content.innerHTML =
+      `<div class="empty">Configure the Team tab in <strong>Settings</strong>: add ${escapeHtml(missing.join(', '))}, then refresh.</div>`;
+    return;
+  }
+
+  const s = data.sprint;
+  const sprintLine = s
+    ? `<div class="team-sprint"><span class="team-sprint-name">${escapeHtml(s.name)}</span>` +
+      (s.goal ? ` · Goal: ${escapeHtml(s.goal)}` : ' · <span class="team-muted">no goal set</span>') + '</div>'
+    : '<div class="team-sprint team-muted">No active sprint</div>';
+  const epics = (data.epics || []).map(e => {
+    const u = safeUrl(e.url);
+    const label = `${escapeHtml(e.key)} ${escapeHtml(e.summary)}`;
+    return u ? `<a class="team-epic" href="${u}" target="_blank" rel="noopener">${label}</a>`
+             : `<span class="team-epic">${label}</span>`;
+  }).join('');
+  const epicsLine = epics ? `<div class="team-epics"><span class="team-muted">Epics:</span> ${epics}</div>` : '';
+
+  const people = (data.people || []).map(p => {
+    if (p.unresolved) {
+      return `<details class="team-person team-person-unresolved">
+        <summary><span class="team-person-name">${escapeHtml(p.email)}</span> <span class="team-warn">⚠ not found in Jira</span></summary>
+        <div class="team-person-body"><div class="team-muted">Couldn't resolve this email to a Jira account — check it in Settings → Resolve members.</div></div>
+      </details>`;
+    }
+    const tickets = p.tickets || [];
+    const body = tickets.length
+      ? tickets.map(renderTeamTicket).join('')
+      : '<div class="team-muted team-person-empty">No tickets in the current sprint.</div>';
+    return `<details class="team-person" open>
+      <summary><span class="team-person-name">${escapeHtml(p.displayName || p.email)}</span> <span class="team-count">(${tickets.length})</span></summary>
+      <div class="team-person-body">${body}</div>
+    </details>`;
+  }).join('');
+
+  content.innerHTML = `
+    ${renderStandup(standup)}
+    <div class="team-banner">${sprintLine}${epicsLine}</div>
+    <div class="team-people">${people || '<div class="empty">No teammates configured.</div>'}</div>`;
+}
+
+function renderTeamTicket(t) {
+  const u = safeUrl(t.url);
+  const key = escapeHtml(t.key);
+  const keyEl = u ? `<a class="team-ticket-key" href="${u}" target="_blank" rel="noopener">${key}</a>`
+                  : `<span class="team-ticket-key">${key}</span>`;
+  const epic = t.epic ? `<span class="team-ticket-epic" title="${escapeHtml(t.epic.summary)}">${escapeHtml(t.epic.key)}</span>` : '';
+  const cat = escapeHtml(t.status_category || 'new');
+  return `<div class="team-ticket">
+    ${keyEl}
+    <span class="team-ticket-status team-status-${cat}">${escapeHtml(t.status_label || '')}</span>
+    <span class="team-ticket-summary">${escapeHtml(t.summary || '')}</span>
+    ${epic}
+  </div>`;
+}
+
 function renderSettings() {
   const c = CONFIG;
   const fields = [
@@ -1206,6 +1325,12 @@ function renderSettings() {
       desc: 'API token from id.atlassian.com/manage-profile/security/api-tokens. '
         + (c.jira_token_set ? 'Currently set — leave blank to keep it.' : 'Not set.'),
       value: '' },
+    { key: 'JIRA_TEAM', label: 'Team members (emails)', type: 'text',
+      desc: 'Comma-separated teammate emails for the Team tab. Resolved to Jira accounts (cached). Use “Resolve members” below to preview the mapping.',
+      value: c.jira_team || '' },
+    { key: 'JIRA_BOARD_ID', label: 'Team: Scrum board ID', type: 'text',
+      desc: 'Numeric board id the Team tab reads the active sprint (goal + epics) from. From the board URL: .../boards/123 → 123.',
+      value: c.jira_board_id || '' },
     { key: 'CACHE_TTL', label: 'Cache TTL (seconds)', type: 'number',
       desc: 'How long per-PR detail data is cached before a background refresh.',
       value: c.cache_ttl ?? 30 },
@@ -1254,12 +1379,48 @@ function renderSettings() {
         <button class="btn-fetch-statuses" id="fetchStatusesBtn" type="button">Fetch statuses from Jira</button>
         <div id="statusChecks" class="status-checks"></div>
       </div>
+      <div class="settings-row">
+        <label class="settings-label">Team: resolve members</label>
+        <div class="settings-desc">Check that each email in “Team members” maps to a Jira account. Resolves and caches the mapping.</div>
+        <button class="btn-fetch-statuses" id="resolveMembersBtn" type="button">Resolve members</button>
+        <div id="teamMembers" class="status-checks"></div>
+      </div>
       <div><button class="btn-settings-save" id="settingsSaveBtn">Save &amp; Reload</button></div>
     </div>`;
   // Pre-render the saved selection (all checked) so it shows without fetching.
   renderStatusChecks(c.jira_status_filter || [], c.jira_status_filter || []);
   document.getElementById('fetchStatusesBtn').addEventListener('click', fetchStatuses);
+  document.getElementById('resolveMembersBtn').addEventListener('click', resolveMembers);
   document.getElementById('settingsSaveBtn').addEventListener('click', saveSettings);
+}
+
+async function resolveMembers() {
+  const btn = document.getElementById('resolveMembersBtn');
+  const input = document.getElementById('s-JIRA_TEAM');
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = 'Resolving…';
+  try {
+    const res = await fetch('/api/team/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ emails: input ? input.value : '' }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+    const el = document.getElementById('teamMembers');
+    const members = body.members || [];
+    el.innerHTML = members.length
+      ? members.map(m => `<div class="team-resolve-row">` + (m.unresolved
+          ? `<span class="team-warn">⚠ ${escapeHtml(m.email)} — not found</span>`
+          : `<span class="team-ok">✓ ${escapeHtml(m.displayName || m.email)}</span> <span class="team-muted">${escapeHtml(m.email)}</span>`) + `</div>`).join('')
+      : '<div class="settings-desc">No emails entered.</div>';
+  } catch (e) {
+    toast('Failed to resolve members: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev;
+  }
 }
 
 // Render a checkbox per status name; `checked` is the subset that starts ticked.
@@ -1481,6 +1642,14 @@ async function load(fresh) {
       const res = await fetch('/api/cleanup' + (fresh ? '?fresh=1' : ''));
       if (!res.ok) throw new Error('HTTP ' + res.status);
       renderCleanup(await res.json());
+    } else if (currentTab === 'team') {
+      const [teamRes, standupRes] = await Promise.all([
+        fetch('/api/team' + (fresh ? '?fresh=1' : '')),
+        fetch('/api/team/standup'),
+      ]);
+      if (!teamRes.ok) throw new Error('HTTP ' + teamRes.status);
+      const standupData = standupRes.ok ? await standupRes.json() : { error: 'HTTP ' + standupRes.status };
+      renderTeam(await teamRes.json(), standupData);
     } else if (currentTab === 'tickets') {
       const res = await fetch('/api/tickets' + (fresh ? '?fresh=1' : ''));
       if (!res.ok) throw new Error('HTTP ' + res.status);

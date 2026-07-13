@@ -280,5 +280,47 @@ class NudgeFields(unittest.TestCase):
         self.assertEqual(out["nudge_targets"], ["alice", "zara"])
 
 
+class BotLoginFiltering(unittest.TestCase):
+    """A machine *user* account (GraphQL __typename 'User') named in BOT_LOGINS
+    must not count as human review feedback — mirrors the CognotaBot case on
+    Cognota/tasks#294, where a User-typename bot wrongly pinned the PR in
+    'Has comments'."""
+
+    me = "me"
+
+    def setUp(self):
+        self._orig = config.BOT_LOGINS
+        config.BOT_LOGINS = {"cognotabot"}  # stored lower-cased, matched case-insensitively
+
+    def tearDown(self):
+        config.BOT_LOGINS = self._orig
+
+    def test_is_human_author_excludes_user_typename_bot(self):
+        # Same login, different membership in BOT_LOGINS.
+        self.assertFalse(config._is_human_author({"login": "CognotaBot", "__typename": "User"}))
+        self.assertTrue(config._is_human_author({"login": "realperson", "__typename": "User"}))
+        # Case-insensitive.
+        self.assertFalse(config._is_human_author({"login": "cognotaBOT", "__typename": "User"}))
+
+    def test_bot_comment_does_not_make_pr_need_addressing(self):
+        # A PR whose ONLY general comment is from the bot user → not "has_comments".
+        out = prs.determine_my_pr_status(
+            pr(review_decision="CHANGES_REQUESTED",
+               comments=[comment("CognotaBot")]),
+            self.me,
+        )
+        self.assertEqual(out["status"], "not_reviewed_yet")
+        self.assertEqual(out["active_commenters"], [])
+
+    def test_real_human_comment_still_counts(self):
+        out = prs.determine_my_pr_status(
+            pr(review_decision="CHANGES_REQUESTED",
+               comments=[comment("realperson")]),
+            self.me,
+        )
+        self.assertEqual(out["status"], "has_comments")
+        self.assertEqual(out["active_commenters"], ["realperson"])
+
+
 if __name__ == "__main__":
     unittest.main()
