@@ -1129,6 +1129,7 @@ function cleanupShortError(err) {
   if (/not fully merged/i.test(err)) return 'not fully merged — tick Force to delete';
   if (/not clean|is dirty|contains modified|locked working tree|use .*--force/i.test(err)) return 'worktree not clean — tick Force';
   if (/protected branch/i.test(err)) return 'protected branch';
+  if (/remote ref does not exist/i.test(err)) return 'already deleted on origin — Refresh to prune';
   if (/not a current cleanup candidate/i.test(err)) return 'no longer a candidate — Refresh';
   return err.length > 80 ? err.slice(0, 80) + '…' : err;
 }

@@ -143,6 +143,53 @@ class DeleteCandidateTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(run.calls[0][0], ("push", "origin", "--delete", "feat"))
 
+    def test_remote_delete_already_gone_is_success_and_prunes(self):
+        # Branch was already deleted on origin (stale remote-tracking ref):
+        # treat as success and prune the phantom origin/<name> ref.
+        run = FakeRunner({
+            ("push", "origin", "--delete", "feat"):
+                (1, "", "error: unable to delete 'feat': remote ref does not exist\n"
+                        "error: failed to push some refs to 'github.com:org/repo.git'"),
+            ("branch", "-dr", "--", "origin/feat"): (0, "Deleted remote-tracking branch", ""),
+        })
+        ok, err = cleanup.delete_candidate(
+            run, {"kind": "remote_merged", "repo_path": "/x", "name": "feat"})
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertIn((("branch", "-dr", "--", "origin/feat"), "/x"), run.calls)
+
+    def test_remote_delete_already_gone_success_even_if_prune_fails(self):
+        run = FakeRunner({
+            ("push", "origin", "--delete", "feat"):
+                (1, "", "error: unable to delete 'feat': remote ref does not exist"),
+            ("branch", "-dr", "--", "origin/feat"): (1, "", "error: no such ref"),
+        })
+        ok, err = cleanup.delete_candidate(
+            run, {"kind": "remote_merged", "repo_path": "/x", "name": "feat"})
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+
+    def test_remote_delete_other_failure_still_errors(self):
+        run = FakeRunner({
+            ("push", "origin", "--delete", "feat"):
+                (1, "", "remote: error: GH006: Protected branch update failed"),
+        })
+        ok, err = cleanup.delete_candidate(
+            run, {"kind": "remote_merged", "repo_path": "/x", "name": "feat"})
+        self.assertFalse(ok)
+        self.assertIn("Protected branch", err)
+        # No prune attempted for a genuine failure.
+        self.assertNotIn((("branch", "-dr", "--", "origin/feat"), "/x"), run.calls)
+
+    def test_local_delete_gone_message_not_special_cased(self):
+        # The already-gone shortcut is scoped to remote_merged only.
+        run = FakeRunner({("branch", "-d", "--", "feat"):
+                          (1, "", "remote ref does not exist")})
+        ok, err = cleanup.delete_candidate(
+            run, {"kind": "local_merged", "repo_path": "/x", "name": "feat"})
+        self.assertFalse(ok)
+        self.assertIn("remote ref does not exist", err)
+
     def test_rejects_flag_like_name(self):
         run = FakeRunner({})
         ok, err = cleanup.delete_candidate(

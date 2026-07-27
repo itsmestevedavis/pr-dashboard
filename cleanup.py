@@ -238,4 +238,12 @@ def delete_candidate(run, action):
     code, out, err = run(args, path)
     if code == 0:
         return True, None
-    return False, (err or out or "git command failed").strip()
+    message = (err or out or "git command failed").strip()
+    if kind == "remote_merged" and "remote ref does not exist" in message:
+        # The branch is already gone on origin (e.g. auto-deleted at merge);
+        # it was only listed because of a stale remote-tracking ref, which a
+        # failed push does not remove. Prune it (best-effort — a fresh scan
+        # would also clear it) and report success: the end state holds.
+        run(["branch", "-dr", "--", "origin/" + name], path)
+        return True, None
+    return False, message
