@@ -1193,10 +1193,10 @@ async function onCleanupDelete() {
 }
 
 // Inner content of the standup card, for the stable #standup-card wrapper. `s` is
-// the /api/team/standup payload: {configured, cached, generated_at, team, me, error}.
+// the /api/team/standup payload: {configured, cached, generated_at, me, error}.
 // Every interpolated value is escaped (values ultimately come from claude output).
 function standupInner(s) {
-  const hasSummary = !!(s.team || s.me);
+  const hasSummary = !!s.me;
   const meta = s.generated_at
     ? `<span class="standup-meta team-muted">generated ${escapeHtml(relativeTime(s.generated_at))}</span>`
     : '';
@@ -1206,15 +1206,10 @@ function standupInner(s) {
   } else if (hasSummary) {
     body = `
       <div class="standup-block">
-        <div class="standup-label">Team</div>
-        <div class="standup-text">${escapeHtml(s.team || '—')}</div>
-      </div>
-      <div class="standup-block">
-        <div class="standup-label">Me</div>
-        <div class="standup-text">${escapeHtml(s.me || '—')}</div>
+        <div class="standup-text">${escapeHtml(s.me)}</div>
       </div>`;
   } else {
-    body = `<div class="standup-empty team-muted">No standup summary yet — click Generate to draft one from the sprint tickets and your open PRs.</div>`;
+    body = `<div class="standup-empty team-muted">No standup summary yet — click Generate to draft one from your assigned tickets and open PRs.</div>`;
   }
   return `
     <div class="standup-head">

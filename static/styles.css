@@ -730,18 +730,7 @@
   }
   .standup-btn:hover:not(:disabled) { border-color: var(--blue); }
   .standup-btn:disabled { opacity: 0.6; cursor: not-allowed; }
-  .standup-block { display: flex; gap: 12px; padding: 6px 0; }
-  .standup-block + .standup-block { border-top: 1px solid var(--border); }
-  .standup-label {
-    flex-shrink: 0;
-    width: 40px;
-    color: var(--muted);
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    padding-top: 3px;
-  }
-  .standup-text { flex: 1; font-size: 14px; line-height: 1.5; color: var(--text); }
+  .standup-block { padding: 6px 0; }
+  .standup-text { font-size: 14px; line-height: 1.5; color: var(--text); }
   .standup-empty { font-size: 13px; }
   .standup-error { font-size: 13px; color: #f85149; }

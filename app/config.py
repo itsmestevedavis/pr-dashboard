@@ -259,22 +259,21 @@ REBASE_PROMPT = (
 )
 
 # Standup summary for the Team tab. Instructions only — the per-request data block
-# (sprint goal, each teammate's tickets, my PRs) is appended by
+# (all tickets assigned to me across projects, my PRs) is appended by
 # app/standup.py:_build_prompt. NOT interpolated with str.format because the JSON
 # example below contains literal braces; the data is concatenated, not formatted.
 STANDUP_PROMPT = (
-    "You are helping me prepare for my team's daily standup. Below is the current "
-    "sprint goal, each teammate's Jira tickets this sprint, and my own open pull "
-    "requests. The teammate marked \"(me)\" is me — the person giving the update.\n\n"
-    "Write two short updates, grounded ONLY in the data below — do not invent work "
-    "or people that aren't listed:\n"
-    "1. \"team\": 1-2 sentences I can say out loud summarizing what the team as a "
-    "whole is working on this sprint. Mention notable themes or who is on what; keep "
-    "it natural and spoken, not a bulleted list.\n"
-    "2. \"me\": 1-2 sentences, first person, on what I'm working on — my in-progress "
-    "tickets and the state of my open PRs (e.g. waiting on review, needs a rebase, "
-    "checks failing). If I have nothing assigned, say so briefly.\n\n"
+    "You are helping me prepare for my team's daily standup. Below are the Jira "
+    "tickets currently assigned to me — across every project (stories, bugs, "
+    "chores, anything) — and my own open pull requests.\n\n"
+    "Write one short update, grounded ONLY in the data below — do not invent work "
+    "that isn't listed:\n"
+    "\"me\": 1-3 sentences, first person, on what I'm working on — lead with "
+    "in-progress tickets and the state of my open PRs (e.g. waiting on review, "
+    "needs a rebase, checks failing), and mention chores or other one-off work "
+    "worth calling out. Skip untouched backlog items. If I have nothing assigned, "
+    "say so briefly.\n\n"
     "Respond with ONLY a JSON object and nothing else — no markdown, no code fence, "
     "no prose around it:\n"
-    "{\"team\": \"...\", \"me\": \"...\"}"
+    "{\"me\": \"...\"}"
 )

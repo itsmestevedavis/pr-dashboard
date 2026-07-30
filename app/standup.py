@@ -1,13 +1,14 @@
 """app/standup.py — Team-tab standup summary.
 
-Builds a short "what to say at standup" summary from the team's sprint tickets
-(app.team.team_overview) and the user's own open PRs (app.prs.list_my_prs) by
-prompting the local `claude` CLI, then caches the result to disk so the Team tab
-can serve it instantly. Generation is button-only: `force=False` never calls
-`claude` (it only reads the cache), `force=True` regenerates.
+Builds a short "what to say at standup" summary from every Jira ticket assigned
+to me (app.jira.jira_search — all projects, so CP chores etc. count, not just
+the team board's sprint) and my own open PRs (app.prs.list_my_prs) by prompting
+the local `claude` CLI, then caches the result to disk so the Team tab can serve
+it instantly. Generation is button-only: `force=False` never calls `claude` (it
+only reads the cache), `force=True` regenerates.
 
 All Jira/config values are read at call time via `config.<NAME>` so live settings
-changes are picked up without a restart (same contract as app/team.py).
+changes are picked up without a restart (same contract as app/jira.py).
 """
 
 import datetime
@@ -15,10 +16,10 @@ import json
 import os
 import subprocess
 
-from app import config, team, prs
+from app import config, jira, prs
 
 # Cache of the last generated summary, alongside jira_team.json under the shared
-# config dir. Shape: {generated_at, team, me}.
+# config dir. Shape: {generated_at, me}.
 _CACHE_PATH = os.path.join(os.path.expanduser("~/.config/pr-dashboard"), "standup.json")
 
 # `claude -p` is a few-second call for two sentences; cap it so a wedged CLI can't
@@ -55,13 +56,12 @@ def _save_cache(data):
     os.replace(tmp, _CACHE_PATH)
 
 
-def _result(configured=True, cached=False, generated_at=None, team_line="", me_line="", error=None):
+def _result(configured=True, cached=False, generated_at=None, me_line="", error=None):
     """Build the standard endpoint payload (single shape for every path)."""
     return {
         "configured": configured,
         "cached": cached,
         "generated_at": generated_at,
-        "team": team_line,
         "me": me_line,
         "error": error,
     }
@@ -77,37 +77,24 @@ def _safe_my_prs():
         return []
 
 
-def _build_prompt(overview, my_prs, my_email):
+def _build_prompt(my_tickets, my_prs):
     """Assemble the full prompt: the STANDUP_PROMPT instructions + a data block.
 
     Pure function (no I/O), so it's unit-testable without a subprocess. The data
-    block lists the sprint goal, each teammate's tickets (marking "(me)"), and my
-    open PRs with their review/CI state.
+    block lists every ticket assigned to me (all projects — the Tickets-tab JQL,
+    so chores and non-board work count) and my open PRs with their review/CI state.
     """
-    me = (my_email or "").lower()
     lines = []
 
-    sprint = overview.get("sprint")
-    if sprint:
-        goal = sprint.get("goal") or "(no goal set)"
-        lines.append(f"Active sprint: {sprint.get('name')} — Goal: {goal}")
-    else:
-        lines.append("No active sprint.")
-
-    lines.append("")
-    lines.append("Team members and their tickets this sprint:")
-    for p in overview.get("people", []):
-        name = p.get("displayName") or p.get("email") or "Unknown"
-        tag = " (me)" if (p.get("email") or "").lower() == me else ""
-        tickets = p.get("tickets") or []
-        if not tickets:
-            lines.append(f"- {name}{tag}: no tickets in the sprint")
-            continue
-        lines.append(f"- {name}{tag}:")
-        for t in tickets:
+    lines.append("Tickets assigned to me (all projects, most recently updated first):")
+    if my_tickets:
+        for t in my_tickets:
+            kind = f" ({t.get('type')})" if t.get("type") else ""
             lines.append(
-                f"    - {t.get('key')} [{t.get('status_label') or ''}] {t.get('summary') or ''}"
+                f"- {t.get('key')} [{t.get('status_label') or ''}]{kind} {t.get('summary') or ''}"
             )
+    else:
+        lines.append("- (none)")
 
     lines.append("")
     lines.append("My open pull requests:")
@@ -181,16 +168,13 @@ def _extract_json_obj(text):
 
 
 def _parse_result(text):
-    """Turn claude's result text into {'team', 'me'}. Falls back to the raw text as
-    the team line (empty me) if it isn't the JSON we asked for, so the user still
-    gets something rather than an error."""
+    """Turn claude's result text into {'me'}. Falls back to the raw text as the
+    me line if it isn't the JSON we asked for, so the user still gets something
+    rather than an error."""
     obj = _extract_json_obj(text)
-    if obj is not None and ("team" in obj or "me" in obj):
-        return {
-            "team": str(obj.get("team") or "").strip(),
-            "me": str(obj.get("me") or "").strip(),
-        }
-    return {"team": text.strip(), "me": ""}
+    if obj is not None and "me" in obj:
+        return {"me": str(obj.get("me") or "").strip()}
+    return {"me": text.strip()}
 
 
 def standup_summary(force=False):
@@ -199,21 +183,20 @@ def standup_summary(force=False):
     force=False (GET / tab load): return the cached summary, or an empty
     "not generated yet" result. Never calls claude.
     force=True (POST / button): regenerate from live Jira + PR data, cache it,
-    and return it. Returns a not-configured result (no claude call) when the Team
-    tab isn't configured, and an error result (uncached) when generation fails.
+    and return it. Returns a not-configured result (no claude call) when Jira
+    isn't configured, and an error result (uncached) when generation fails.
     """
     if not force:
         cached = _load_cache()
         if cached:
             return _result(cached=True, generated_at=cached.get("generated_at"),
-                           team_line=cached.get("team") or "", me_line=cached.get("me") or "")
+                           me_line=cached.get("me") or "")
         return _result()  # configured=True, empty — "click Generate"
 
-    if not team.team_configured():
+    if not jira.jira_configured():
         return _result(configured=False)
 
-    overview = team.team_overview()
-    prompt = _build_prompt(overview, _safe_my_prs(), config.JIRA_EMAIL)
+    prompt = _build_prompt(jira.jira_search(), _safe_my_prs())
 
     try:
         raw = _run_claude(prompt)
@@ -223,5 +206,5 @@ def standup_summary(force=False):
 
     parsed = _parse_result(raw)
     generated_at = _now_iso()
-    _save_cache({"generated_at": generated_at, "team": parsed["team"], "me": parsed["me"]})
-    return _result(generated_at=generated_at, team_line=parsed["team"], me_line=parsed["me"])
+    _save_cache({"generated_at": generated_at, "me": parsed["me"]})
+    return _result(generated_at=generated_at, me_line=parsed["me"])
