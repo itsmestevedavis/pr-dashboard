@@ -425,6 +425,7 @@ def determine_status(repo, number, detail, me, fresh):
         other_verdicts = [
             r for r in latest_reviews
             if (r.get("author") or {}).get("login") not in (me, None, pr_author)
+            and config._is_human_author(r.get("author"))
             and r.get("state") in ("APPROVED", "CHANGES_REQUESTED")
         ]
         if other_verdicts:
