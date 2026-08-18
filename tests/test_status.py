@@ -253,6 +253,32 @@ class NudgeFields(unittest.TestCase):
         self.assertEqual(out["nudge_mode"], "re_review")
         self.assertEqual(out["nudge_targets"], ["bob"])
 
+    def test_general_commenter_drives_re_review_nudge(self):
+        # A human general comment (no review submitted) keeps the PR in
+        # has_comments even when approved — so the nudge must target that
+        # commenter for another review, not go quiet.
+        out = prs.determine_my_pr_status(
+            pr(review_decision="APPROVED",
+               latest_reviews=[review("alice", "APPROVED")],
+               comments=[comment("pratik12")]),
+            me="me",
+        )
+        self.assertEqual(out["status"], "has_comments")
+        self.assertEqual(out["stale_reviewers"], ["pratik12"])
+        self.assertEqual(out["nudge_mode"], "re_review")
+        self.assertEqual(out["nudge_targets"], ["pratik12"])
+
+    def test_approvers_general_comment_does_not_nudge(self):
+        # An approver who also left a comment has nothing left to re-review.
+        out = prs.determine_my_pr_status(
+            pr(review_decision="APPROVED",
+               latest_reviews=[review("alice", "APPROVED")],
+               comments=[comment("alice")]),
+            me="me",
+        )
+        self.assertEqual(out["status"], "approved")
+        self.assertIsNone(out["nudge_mode"])
+
     def test_no_human_reviews_drives_fresh_nudge(self):
         original = config.FRESH_REVIEWERS
         config.FRESH_REVIEWERS = ["bob", "carol"]

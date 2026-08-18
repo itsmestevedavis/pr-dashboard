@@ -113,6 +113,10 @@ def determine_my_pr_status(pr, me):
         login = author.get("login")
         if login and login != me:
             stale_reviewers.add(login)
+    # Humans whose general comment keeps the PR in has_comments never appear in
+    # latestReviews (a plain comment isn't a review), so fold them in here —
+    # otherwise the PR shows "has comments" with nobody to nudge for a re-review.
+    stale_reviewers |= general_comment_authors
 
     if review_decision == "APPROVED" and not active:
         status = "approved"
