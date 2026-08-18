@@ -4,9 +4,9 @@ import json
 import os
 import queue
 import re
-import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler
+from typing import Callable, NamedTuple, Optional
 from urllib.parse import urlparse, parse_qs
 
 import cleanup
@@ -18,8 +18,83 @@ from app.config import (
     REVIEW_WORKFLOW, RE_REVIEW_WORKFLOW,
     ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW, NUDGE_WORKFLOW,
 )
-from app.jobs import job, events, runners, clones
+from app.jobs import job, runners, clones
 from app.http import static_files, routes
+
+
+# ---- UI-writable settings ----------------------------------------------------
+
+class _Setting(NamedTuple):
+    """One .env key the Settings/Status UI may write.
+
+    `validate` runs before anything is persisted (raise ValueError to reject);
+    `apply` updates the in-process config after the .env write (None = takes
+    effect on restart); `allow_empty` keys may be saved blank to clear them —
+    every other key keeps its current value when submitted blank.
+    """
+    apply: Optional[Callable[[str], None]]
+    allow_empty: bool = False
+    validate: Optional[Callable[[str], object]] = None
+
+
+def _set(attr):
+    return lambda value: setattr(config, attr, value)
+
+
+def _reparse_list(attr):
+    # Comma-list keys re-read os.environ (updated by write_env_var), exactly as
+    # config.py parses them at startup.
+    return lambda value: setattr(config, attr, config._env_list(attr))
+
+
+def _apply_cache_ttl(value):
+    config.CACHE_TTL = int(value)
+
+
+def _apply_board_id(value):
+    config.JIRA_BOARD_ID = value
+    jira.clear_sprint_support_cache()  # a new board may support sprints — re-probe
+
+
+_SETTINGS = {
+    "DEPLOY_TARGET":        _Setting(_set("DEPLOY_TARGET"), allow_empty=True),  # empty hides Deploy buttons
+    "DEV_BOX_URL":          _Setting(_set("DEV_BOX_URL"), allow_empty=True),
+    "CACHE_TTL":            _Setting(_apply_cache_ttl, validate=int),
+    "HOST":                 _Setting(None),  # server bind — restart to take effect
+    "PORT":                 _Setting(None, validate=int),
+    "EDITOR_CMD":           _Setting(_set("EDITOR_CMD"), allow_empty=True),  # empty = auto-detect
+    "JIRA_SITE":            _Setting(_set("JIRA_SITE")),
+    "JIRA_EMAIL":           _Setting(_set("JIRA_EMAIL")),
+    "JIRA_API_TOKEN":       _Setting(_set("JIRA_API_TOKEN")),
+    "JIRA_STATUS_FILTER":   _Setting(_reparse_list("JIRA_STATUS_FILTER"), allow_empty=True),
+    "JIRA_TEAM":            _Setting(_reparse_list("JIRA_TEAM"), allow_empty=True),
+    "JIRA_BOARD_ID":        _Setting(_apply_board_id, allow_empty=True),
+    "CLEANUP_REPOS":        _Setting(_reparse_list("CLEANUP_REPOS"), allow_empty=True),
+    "CLEANUP_AUTHOR_EMAIL": _Setting(_set("CLEANUP_AUTHOR_EMAIL"), allow_empty=True),
+    "FRESH_REVIEWERS":      _Setting(_reparse_list("FRESH_REVIEWERS"), allow_empty=True),
+    "TEAM_CHANNEL_ID":      _Setting(_set("TEAM_CHANNEL_ID"), allow_empty=True),
+    "TEAMS":                _Setting(lambda v: setattr(config, "TEAMS", config._parse_teams()), allow_empty=True),
+    "SLACK_IDS":            _Setting(lambda v: setattr(config, "SLACK_ID_MAP", config._parse_slack_ids()), allow_empty=True),
+}
+
+
+def _write_setting(key, value):
+    """Persist one settings key to .env and apply it in-process.
+
+    Raises ValueError for an invalid value (nothing written) and propagates
+    write errors. Callers hold sysstatus._env_lock.
+    """
+    spec = _SETTINGS[key]
+    if key == "JIRA_SITE":
+        value = config._normalize_jira_site(value)
+    if value and spec.validate:
+        try:
+            spec.validate(value)
+        except ValueError:
+            raise ValueError(f"invalid value for {key}: {value!r}")
+    sysstatus.write_env_var(key, value)
+    if spec.apply:
+        spec.apply(value)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -56,6 +131,7 @@ class Handler(BaseHTTPRequestHandler):
             config_json = json.dumps({
                 "deploy_targets": deploy.DEPLOY_TARGETS,
                 "deploy_target": config.DEPLOY_TARGET,
+                "dev_box_url": config.DEV_BOX_URL,
                 "cache_ttl": config.CACHE_TTL,
                 "host": HOST,
                 "port": PORT,
@@ -388,7 +464,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": f"bad request: {e}"})
             return
-        if key not in ("DEPLOY_TARGET",):
+        if key not in _SETTINGS:
             self._send_json(403, {"error": "key not allowed"})
             return
         if not value:
@@ -396,21 +472,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             with sysstatus._env_lock:
-                sysstatus.write_env_var(key, value)
-                if key == "DEPLOY_TARGET":
-                    config.DEPLOY_TARGET = value
+                _write_setting(key, value)
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
         except Exception as e:
             self._send_json(500, {"error": str(e)})
             return
         self._send_json(200, {"ok": True})
 
     def _handle_settings_post(self):
-        _allowed = {"DEPLOY_TARGET",
-                    "CACHE_TTL", "HOST", "PORT", "EDITOR_CMD",
-                    "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
-                    "JIRA_STATUS_FILTER", "JIRA_TEAM", "JIRA_BOARD_ID",
-                    "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL",
-                    "FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "TEAMS", "SLACK_IDS"}
         try:
             data = self._read_json_body()
             settings = data.get("settings", {})
@@ -419,61 +490,25 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": str(e)})
             return
-        unknown = set(settings) - _allowed
+        unknown = set(settings) - set(_SETTINGS)
         if unknown:
             self._send_json(403, {"error": f"unknown keys: {', '.join(sorted(unknown))}"})
             return
         with sysstatus._env_lock:
             for key, value in settings.items():
                 value = str(value).strip()
-                if key == "JIRA_SITE":
-                    value = config._normalize_jira_site(value)
-                # These keys may be written empty (clears them); every other key
-                # keeps its current value when blank.
-                if not value and key not in (
-                    "JIRA_STATUS_FILTER", "JIRA_TEAM", "JIRA_BOARD_ID",
-                    "CLEANUP_REPOS", "CLEANUP_AUTHOR_EMAIL",
-                    "FRESH_REVIEWERS", "TEAM_CHANNEL_ID", "TEAMS", "SLACK_IDS"
-                ):
+                # Blank clears allow_empty keys; every other key keeps its
+                # current value when submitted blank.
+                if not value and not _SETTINGS[key].allow_empty:
                     continue
                 try:
-                    sysstatus.write_env_var(key, value)
+                    _write_setting(key, value)
+                except ValueError as e:
+                    self._send_json(400, {"error": str(e)})
+                    return
                 except Exception as e:
                     self._send_json(500, {"error": f"failed to write {key}: {e}"})
                     return
-                if key == "DEPLOY_TARGET":
-                    config.DEPLOY_TARGET = value
-                elif key == "CACHE_TTL":
-                    try:
-                        config.CACHE_TTL = int(value)
-                    except ValueError:
-                        pass
-                elif key == "EDITOR_CMD":
-                    config.EDITOR_CMD = value
-                elif key == "JIRA_SITE":
-                    config.JIRA_SITE = value
-                elif key == "JIRA_EMAIL":
-                    config.JIRA_EMAIL = value
-                elif key == "JIRA_API_TOKEN":
-                    config.JIRA_API_TOKEN = value
-                elif key == "JIRA_STATUS_FILTER":
-                    config.JIRA_STATUS_FILTER = config._env_list("JIRA_STATUS_FILTER")
-                elif key == "JIRA_TEAM":
-                    config.JIRA_TEAM = config._env_list("JIRA_TEAM")
-                elif key == "JIRA_BOARD_ID":
-                    config.JIRA_BOARD_ID = value
-                elif key == "CLEANUP_REPOS":
-                    config.CLEANUP_REPOS = config._env_list("CLEANUP_REPOS")
-                elif key == "CLEANUP_AUTHOR_EMAIL":
-                    config.CLEANUP_AUTHOR_EMAIL = value
-                elif key == "FRESH_REVIEWERS":
-                    config.FRESH_REVIEWERS = config._env_list("FRESH_REVIEWERS")
-                elif key == "TEAM_CHANNEL_ID":
-                    config.TEAM_CHANNEL_ID = value
-                elif key == "TEAMS":
-                    config.TEAMS = config._parse_teams()
-                elif key == "SLACK_IDS":
-                    config.SLACK_ID_MAP = config._parse_slack_ids()
         self._send_json(200, {"ok": True})
 
     def _handle_team_resolve_post(self):
@@ -571,20 +606,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": f"bad request: {e}"})
             return
-        workflow_name = deploy.DEPLOY_TARGETS.get(repo, {}).get(env)
-        if not workflow_name:
-            self._send_json(400, {"error": f"No workflow configured for {repo} / {env}"})
+        if env not in deploy.DEPLOY_TARGETS.get(repo, {}):
+            self._send_json(400, {"error": f"{repo} has no '{env}' deploy target configured"})
             return
-        result = subprocess.run(
-            ["gh", "workflow", "run", workflow_name, "-R", repo, "--ref", head_ref],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout).strip() or "workflow dispatch failed"
-            self._send_json(500, {"error": err})
+        try:
+            result = deploy.push_preview(repo, head_ref)
+        except RuntimeError as e:
+            self._send_json(502, {"error": str(e)})
             return
-        print(f"[deploy] dispatched '{workflow_name}' on {repo}@{head_ref} for {env}", flush=True)
-        self._send_json(200, {"ok": True})
+        print(f"[deploy] pushed {result['branch']} @ {result['sha'][:9]} on {repo} for {env}",
+              flush=True)
+        self._send_json(200, {"ok": True, "branch": result["branch"]})
 
     def _handle_ticket_transition_post(self):
         if not jira.jira_configured():

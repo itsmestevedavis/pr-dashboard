@@ -126,8 +126,8 @@ def get_status():
 
     check("DEPLOY_TARGET", "Default deploy environment (.env)",
           bool(config.DEPLOY_TARGET),
-          f"Target: {config.DEPLOY_TARGET}" if config.DEPLOY_TARGET else "Not set — add DEPLOY_TARGET=csi-3 to .env to show Deploy buttons",
-          fix={"action": "set_env", "key": "DEPLOY_TARGET", "placeholder": "csi-3"})
+          f"Target: {config.DEPLOY_TARGET}" if config.DEPLOY_TARGET else "Not set — add DEPLOY_TARGET=dev-box to .env to show Deploy buttons",
+          fix={"action": "set_env", "key": "DEPLOY_TARGET", "placeholder": "dev-box"})
 
     from app import jira
     check("JIRA", "Jira credentials for the Tickets tab (.env)",

@@ -2,8 +2,8 @@
 
 Assembles the team-overview payload from the Jira client: resolve configured
 teammates (email -> accountId, cached to disk), read the board's active sprint,
-fetch each teammate's sprint tickets (or all open tickets when there's no active
-sprint), bucket them by person, and derive the epics they roll up to.
+fetch each teammate's sprint tickets (or the board's open tickets when there's
+no active sprint), bucket them by person, and derive the epics they roll up to.
 
 All Jira credentials / config are read at call time via `config.<NAME>` so live
 settings changes are picked up without a restart (same contract as app/jira.py).
@@ -91,7 +91,8 @@ def team_overview():
 
     sprint = jira.active_sprint(config.JIRA_BOARD_ID)
     if account_ids:
-        tickets = jira.sprint_issues(sprint["id"], account_ids) if sprint else jira.open_issues(account_ids)
+        tickets = (jira.sprint_issues(sprint["id"], account_ids) if sprint
+                   else jira.board_issues(config.JIRA_BOARD_ID, account_ids))
     else:
         tickets = []
 

@@ -1,37 +1,21 @@
-"""app/deploy.py — deploy-targets loader and deployed-runs query."""
+"""app/deploy.py — deploy-targets loader, preview-branch push, deployed-runs query."""
 
 import json
 import os
-import subprocess
+import re
 import concurrent.futures
 
-from app import config
+from app import config, github
 from app.config import _WORKFLOW_DIR
 
 DEPLOY_TARGETS_PATH = os.path.join(_WORKFLOW_DIR, "deploy_targets.json")
 
 # Workflow names per repo per environment. Keys are "owner/repo"; values map
-# env slug to the exact GitHub Actions workflow name used for dispatch.
+# env slug to the GitHub Actions workflow whose runs the Deployed tab tracks.
+# Deploys themselves are push-driven (see push_preview), not dispatched.
 _DEFAULT_DEPLOY_TARGETS = {
-    "Cognota/cognota-frontend": {
-        "csi-1": "CSI 1 Pipeline",
-        "csi-2": "CSI 2 Pipeline",
-        "csi-3": "CSI 3 Pipeline",
-    },
-    "Cognota/cognota-be": {
-        "csi-1": "CSI-1 Deploy",
-        "csi-2": "CSI-2 Deploy",
-        "csi-3": "CSI-3 Deploy",
-    },
-    "Cognota/learnops": {
-        "csi-1": "CSI-1 Pipeline",
-        "csi-2": "CSI-2 Pipeline",
-        "csi-3": "CSI-3 Pipeline",
-    },
-    "Cognota/learnops-frontend": {
-        "csi-1": "CSI1 Pipeline",
-        "csi-2": "CSI2 Pipeline",
-        "csi-3": "CSI3 Pipeline",
+    "Cognota/next-gen": {
+        "dev-box": "Deploy preview branch to dev box",
     },
 }
 
@@ -45,11 +29,55 @@ def _load_deploy_targets():
 
 DEPLOY_TARGETS = _load_deploy_targets()
 
+# A branch prefix like "feat/", "fix/", "itsmestevedavis/" — stripped only when
+# what follows is a ticket key, so the preview name keeps its Jira link.
+_TYPE_PREFIX_RE = re.compile(r"^[\w.-]+/(?=[A-Z][A-Z0-9]*-\d)")
+
+
+def preview_branch(head_ref: str) -> str:
+    """Derive the preview branch name that deploys head_ref to the dev box.
+
+    The deploy workflow triggers on any pushed branch whose name contains
+    "preview"; keeping the ticket key keeps the deploy commits Jira-linked.
+    feat/NG-261-x -> preview/NG-261-x; NG-9-y -> preview/NG-9-y.
+    """
+    if head_ref.startswith("preview/"):
+        return head_ref
+    return "preview/" + _TYPE_PREFIX_RE.sub("", head_ref, count=1)
+
+
+def push_preview(repo: str, head_ref: str) -> dict:
+    """Point the preview branch for head_ref at its current SHA on origin.
+
+    Force-updates the ref if it exists, creates it otherwise — either way the
+    push event triggers the "Deploy preview branch to dev box" workflow, which
+    deploys to the pushing user's box and cancels any in-flight deploy for it.
+    Returns {branch, sha}; raises RuntimeError with gh's error output on failure.
+    """
+    try:
+        ref = github.gh_json(["api", f"repos/{repo}/git/ref/heads/{head_ref}"], timeout=30)
+    except RuntimeError as e:
+        raise RuntimeError(f"Could not resolve {head_ref} on {repo}: {e}")
+    sha = ref["object"]["sha"]
+
+    branch = preview_branch(head_ref)
+    try:
+        github.gh_run(["api", "-X", "PATCH", f"repos/{repo}/git/refs/heads/{branch}",
+                       "-f", f"sha={sha}", "-F", "force=true"], timeout=30)
+    except RuntimeError:
+        # PATCH fails when the ref doesn't exist yet — create it instead.
+        try:
+            github.gh_run(["api", "-X", "POST", f"repos/{repo}/git/refs",
+                           "-f", f"ref=refs/heads/{branch}", "-f", f"sha={sha}"], timeout=30)
+        except RuntimeError as e:
+            raise RuntimeError(f"Could not push {branch} on {repo}: {e}")
+    return {"branch": branch, "sha": sha}
+
 
 def get_deployed() -> dict:
     """Return the latest workflow run per repo for the configured DEPLOY_TARGET.
 
-    If DEPLOY_TARGET is set (e.g. "csi-3"), only that environment's workflow is
+    If DEPLOY_TARGET is set (e.g. "dev-box"), only that environment's workflow is
     queried for each repo. If not set, all configured environments are queried.
     The workflow name comes from DEPLOY_TARGETS[repo][env] — the value in
     deploy_targets.json — and is passed to ``gh run list -w`` which accepts
@@ -57,18 +85,12 @@ def get_deployed() -> dict:
     """
     target_env = config.DEPLOY_TARGET
 
-    if target_env:
-        combos = [
-            (repo, target_env, envs[target_env])
-            for repo, envs in DEPLOY_TARGETS.items()
-            if target_env in envs
-        ]
-    else:
-        combos = [
-            (repo, env, wf)
-            for repo, envs in DEPLOY_TARGETS.items()
-            for env, wf in envs.items()
-        ]
+    combos = [
+        (repo, env, wf)
+        for repo, envs in DEPLOY_TARGETS.items()
+        for env, wf in envs.items()
+        if not target_env or env == target_env
+    ]
 
     if not combos:
         return {"environments": {}, "target_env": target_env}
@@ -76,22 +98,17 @@ def get_deployed() -> dict:
     def fetch_one(combo: tuple) -> tuple:
         repo, env, workflow_name = combo
         try:
-            result = subprocess.run(
+            out = github.gh_run(
                 [
-                    "gh", "run", "list",
+                    "run", "list",
                     "-R", repo,
                     "-w", workflow_name,
                     "--limit", "1",
                     "--json", "status,conclusion,headBranch,createdAt,displayTitle",
                 ],
-                capture_output=True, text=True, timeout=15,
+                timeout=15,
             )
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout).strip() or "gh run list failed"
-                return repo, env, {"repo": repo, "env": env, "error": err}
-            if not result.stdout.strip():
-                return repo, env, {"repo": repo, "env": env, "error": "no runs found"}
-            runs = json.loads(result.stdout)
+            runs = json.loads(out) if out.strip() else []
             if not runs:
                 return repo, env, {"repo": repo, "env": env, "error": "no runs found"}
             run = runs[0]

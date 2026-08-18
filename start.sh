@@ -13,6 +13,9 @@ URL="http://${HOST:-127.0.0.1}:${PORT:-8765}"
 # project CLAUDE.md (e.g. the Slack-nudge runbook).
 cd "$DIR" || exit 1
 
+# Note: killing/respawning the server (and spawned claude/gh/git children) makes macOS
+# print benign "MallocStackLogging: can't turn off ..." lines. It's OS noise, not a bug —
+# see docs/mallocstacklogging-message.md.
 PID=""
 cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; exit 0; }
 trap cleanup INT TERM

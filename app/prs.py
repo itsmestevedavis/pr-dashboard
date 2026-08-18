@@ -6,7 +6,7 @@ PR lists (both authored and review-requested), and check-run summarization.
 
 import concurrent.futures
 import json
-from app import config, github
+from app import config, deploy, github
 from app.config import STATUS_ORDER, STATUS_LABELS, MY_STATUS_ORDER, MY_STATUS_LABELS
 
 
@@ -305,6 +305,10 @@ def list_my_prs():
             "url": pr.get("url") or "",
             "updatedAt": pr.get("updatedAt") or "",
             "headRefName": pr.get("headRefName") or "",
+            # The preview/… branch a deploy of this PR pushes — also the branch the
+            # tracked workflow run reports. Derived here so the client needs no copy
+            # of the naming rule.
+            "previewBranch": deploy.preview_branch(pr.get("headRefName") or ""),
             "baseRefName": pr.get("baseRefName") or "",
             "repository": repo,
             "defaultMergeMethod": (

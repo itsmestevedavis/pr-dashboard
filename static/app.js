@@ -224,11 +224,13 @@ function renderMyPR(p) {
   }
   const deployTarget = CONFIG.deploy_target || '';
   const deployWorkflow = deployTarget && (CONFIG.deploy_targets || {})[p.repository]?.[deployTarget];
+  // Deploys are preview-branch pushes, so the tracked run's branch is the
+  // server-derived preview/… name (p.previewBranch), not the PR's own head branch.
   const alreadyDeployed = deployTarget && (deployedState[deployTarget] || [])
-    .some(d => d.repo === p.repository && d.branch === p.headRefName && d.conclusion === 'success');
+    .some(d => d.repo === p.repository && d.branch === p.previewBranch && d.conclusion === 'success');
   const deployControls = deployWorkflow
     ? (alreadyDeployed
-        ? `<button class="btn-deploy btn-deploy-live" type="button" data-env="${escapeHtml(deployTarget)}" title="Branch ${escapeHtml(p.headRefName)} is live — click to re-deploy">✅ ${escapeHtml(deployTarget.toUpperCase())}</button>`
+        ? `<button class="btn-deploy btn-deploy-live" type="button" data-env="${escapeHtml(deployTarget)}" title="${escapeHtml(p.previewBranch)} is live — click to re-deploy">✅ ${escapeHtml(deployTarget.toUpperCase())}</button>`
         : `<button class="btn-deploy" type="button" data-env="${escapeHtml(deployTarget)}">Deploy to ${escapeHtml(deployTarget.toUpperCase())}</button>`)
     : '';
 
@@ -676,25 +678,37 @@ function onRebase(btn) {
     'rebase', 'Rebasing…', finishRebase);
 }
 
+// Shared by the My-PRs Deploy button and the Deployed tab. The server derives
+// the pushed preview/… branch (app/deploy.py preview_branch) and returns it.
+function confirmDeploy(repo, headRef, env) {
+  return confirm(`Deploy ${repo} (${headRef}) to ${env.toUpperCase()}?\n\nPushes a preview/… branch — replaces whatever is on the box.`);
+}
+
+async function postDeploy(repo, headRef, env) {
+  const res = await fetch('/api/deploy', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ repo, env, head_ref: headRef }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
+  return body;
+}
+
 async function onDeploy(btn) {
   const card = btn.closest('.pr');
   const repo = card.dataset.repo;
   const headRef = card.dataset.head;
   const env = btn.dataset.env;
 
-  if (!confirm(`Deploy ${repo} (${headRef}) to ${env.toUpperCase()}?`)) return;
+  if (!confirmDeploy(repo, headRef, env)) return;
 
   btn.disabled = true;
-  btn.textContent = 'Dispatching…';
+  btn.textContent = 'Pushing…';
   try {
-    const res = await fetch('/api/deploy', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ repo, env, head_ref: headRef }),
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
-    btn.textContent = 'Dispatched ✓';
+    const body = await postDeploy(repo, headRef, env);
+    btn.textContent = 'Pushed ✓';
+    btn.title = `${body.branch || ''} pushed`;
     btn.style.cssText = 'background:#238636;color:#fff;';
     setTimeout(() => { btn.textContent = 'Deploy'; btn.style.cssText = ''; btn.disabled = false; }, 4000);
   } catch (e) {
@@ -1309,8 +1323,11 @@ function renderSettings() {
   const c = CONFIG;
   const fields = [
     { key: 'DEPLOY_TARGET', label: 'Deploy target environment', type: 'text',
-      desc: 'Default environment for the Deploy button on each PR card (e.g. csi-3).',
+      desc: 'Default environment for the Deploy button on each PR card (e.g. dev-box). Deploys push a preview/… branch, which triggers the tracked workflow.',
       value: c.deploy_target || '' },
+    { key: 'DEV_BOX_URL', label: 'Dev box URL', type: 'text',
+      desc: 'Where the dev box serves the deployed app (VPN), e.g. https://<github-login>.internal.cognota.com. Linked from the Deployed tab; blank hides the link.',
+      value: c.dev_box_url || '' },
     { key: 'JIRA_SITE', label: 'Jira site', type: 'text',
       desc: 'Atlassian site host for the Tickets tab, e.g. your-org.atlassian.net.',
       value: c.jira_site || '' },
@@ -1324,8 +1341,8 @@ function renderSettings() {
     { key: 'JIRA_TEAM', label: 'Team members (emails)', type: 'text',
       desc: 'Comma-separated teammate emails for the Team tab. Resolved to Jira accounts (cached). Use “Resolve members” below to preview the mapping.',
       value: c.jira_team || '' },
-    { key: 'JIRA_BOARD_ID', label: 'Team: Scrum board ID', type: 'text',
-      desc: 'Numeric board id the Team tab reads the active sprint (goal + epics) from. From the board URL: .../boards/123 → 123.',
+    { key: 'JIRA_BOARD_ID', label: 'Team: board ID', type: 'text',
+      desc: 'Numeric board id the Team tab reads from (active sprint on Scrum boards; open board tickets on team-managed boards). From the board URL: .../boards/123 → 123.',
       value: c.jira_board_id || '' },
     { key: 'CACHE_TTL', label: 'Cache TTL (seconds)', type: 'number',
       desc: 'How long per-PR detail data is cached before a background refresh.',
@@ -1510,7 +1527,10 @@ function renderDeployed(data) {
     return;
   }
   const deployTargets = CONFIG.deploy_targets || {};
-  let html = '';
+  const boxUrl = safeUrl(CONFIG.dev_box_url || '');
+  let html = boxUrl
+    ? `<div class="deployed-box"><a class="deployed-box-link" href="${escapeHtml(boxUrl)}" target="_blank" rel="noopener" title="Open the dev box (VPN required)">${escapeHtml(boxUrl.replace(/^https?:\/\//, ''))}</a></div>`
+    : '';
   for (const env of envKeys) {
     const items = (envs[env] || []).slice().sort((a, b) => (a.repo || '').localeCompare(b.repo || ''));
     html += `<details class="deployed-section" open>
@@ -1594,18 +1614,13 @@ async function onDeployFromDeployed(ev) {
   const sel = btn.closest('.deployed-deploy-row').querySelector('.deployed-branch-select');
   const headRef = sel?.value;
   if (!headRef) return;
-  if (!confirm(`Deploy ${repo} (${headRef}) to ${env.toUpperCase()}?`)) return;
+  if (!confirmDeploy(repo, headRef, env)) return;
   btn.disabled = true;
-  btn.textContent = 'Deploying…';
+  btn.textContent = 'Pushing…';
   try {
-    const res = await fetch('/api/deploy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ repo, env, head_ref: headRef }),
-    });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json.error || 'Deploy failed');
-    btn.textContent = '✅ Dispatched';
+    const body = await postDeploy(repo, headRef, env);
+    btn.textContent = 'Pushed ✓';
+    btn.title = `${body.branch || ''} pushed`;
     btn.style.background = '#1a7f37';
     setTimeout(() => {
       btn.textContent = 'Deploy';

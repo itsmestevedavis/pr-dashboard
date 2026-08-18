@@ -573,6 +573,14 @@
     padding: 1px 7px;
     font-weight: 600;
   }
+  .deployed-box { margin: 0 0 8px; text-align: right; }
+  .deployed-box-link {
+    font-size: 11px;
+    color: var(--muted);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--muted);
+  }
+  .deployed-box-link:hover { color: var(--fg); }
   .deployed-chevron { margin-left: auto; color: var(--muted); font-size: 10px; transition: transform 0.15s; }
   .deployed-section[open] .deployed-chevron { transform: rotate(90deg); }
   .deployed-items { padding: 0 14px 6px; }

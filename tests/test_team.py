@@ -94,6 +94,9 @@ class ResolveAccountTest(unittest.TestCase):
 # ---- active_sprint ----
 
 class ActiveSprintTest(unittest.TestCase):
+    def setUp(self):
+        jira.clear_sprint_support_cache()
+
     @mock.patch("app.jira.jira_request")
     def test_returns_first_active_sprint_with_goal(self, jr):
         jr.return_value = {"values": [
@@ -115,8 +118,27 @@ class ActiveSprintTest(unittest.TestCase):
         jr.return_value = {"values": []}
         self.assertIsNone(jira.active_sprint("123"))
 
+    @mock.patch("app.jira.jira_request", side_effect=jira.JiraError(
+        "Jira GET /rest/agile/1.0/board/148/sprint failed (HTTP 400): "
+        '{"errorMessages":["The board does not support sprints"],"errors":{}}',
+        status=400))
+    def test_board_without_sprints_returns_none_and_is_remembered(self, jr):
+        # Team-managed (Kanban-style) boards reject the sprint endpoint with a 400;
+        # that must read as "no active sprint", not crash the Team tab — and the
+        # doomed request must not be repeated on the next load.
+        self.assertIsNone(jira.active_sprint("148"))
+        self.assertIsNone(jira.active_sprint("148"))
+        self.assertEqual(jr.call_count, 1)
 
-# ---- sprint_issues / open_issues ----
+    @mock.patch("app.jira.jira_request", side_effect=jira.JiraError(
+        "Jira GET /rest/agile/1.0/board/148/sprint failed (HTTP 401): bad credentials",
+        status=401))
+    def test_other_errors_propagate(self, _jr):
+        with self.assertRaises(RuntimeError):
+            jira.active_sprint("148")
+
+
+# ---- sprint_issues / board_issues ----
 
 class SprintIssuesTest(unittest.TestCase):
     @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
@@ -132,17 +154,22 @@ class SprintIssuesTest(unittest.TestCase):
         self.assertIn('"acct-bob"', jql)
 
 
-class OpenIssuesTest(unittest.TestCase):
+class BoardIssuesTest(unittest.TestCase):
     @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
     @mock.patch("app.jira.jira_request")
-    def test_open_issues_filters_not_done(self, jr):
+    def test_board_issues_filters_not_done(self, jr):
         jr.return_value = {"issues": [_issue()]}
-        out = jira.open_issues(["acct-alice"])
+        out = jira.board_issues("148", ["acct-alice"])
         self.assertEqual([t["key"] for t in out], ["CGP-100"])
-        self.assertEqual(jr.call_args[0][1], "/rest/api/3/search/jql")
+        self.assertEqual(jr.call_args[0][1], "/rest/agile/1.0/board/148/issue")
         jql = jr.call_args[1]["params"]["jql"]
         self.assertIn("statusCategory != Done", jql)
         self.assertIn('"acct-alice"', jql)
+
+    @mock.patch.object(config, "JIRA_SITE", "ex.atlassian.net")
+    @mock.patch("app.jira.jira_request", return_value={})
+    def test_no_issues_returns_empty(self, _jr):
+        self.assertEqual(jira.board_issues("148", ["acct-alice"]), [])
 
 
 # ---- derive_epics ----

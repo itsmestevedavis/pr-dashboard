@@ -89,17 +89,17 @@ class TeamOverviewTest(unittest.TestCase):
     @mock.patch("app.team.jira.jira_configured", return_value=True)
     @mock.patch("app.team.resolve_members")
     @mock.patch("app.team.jira.active_sprint", return_value=None)
-    @mock.patch("app.team.jira.open_issues")
-    def test_no_active_sprint_falls_back_to_open(self, open_issues, _sprint, resolve_members, _jc):
+    @mock.patch("app.team.jira.board_issues")
+    def test_no_active_sprint_falls_back_to_board_issues(self, board_issues, _sprint, resolve_members, _jc):
         resolve_members.return_value = [
             {"email": "alice@x.com", "accountId": "a1", "displayName": "Alice", "unresolved": False},
         ]
-        open_issues.return_value = [_ticket("CGP-20", "a1")]
+        board_issues.return_value = [_ticket("CGP-20", "a1")]
         with mock.patch.object(config, "JIRA_TEAM", ["alice@x.com"]), \
              mock.patch.object(config, "JIRA_BOARD_ID", "123"):
             out = team.team_overview()
         self.assertIsNone(out["sprint"])
-        open_issues.assert_called_once_with(["a1"])
+        board_issues.assert_called_once_with("123", ["a1"])
         self.assertEqual([t["key"] for t in out["people"][0]["tickets"]], ["CGP-20"])
 
     @mock.patch("app.team.jira.jira_configured", return_value=True)

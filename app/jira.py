@@ -11,10 +11,18 @@ import urllib.request
 import urllib.parse
 
 from app import config
-from app.config import JIRA_JQL, _JIRA_KEY_RE
+from app.config import JIRA_JQL
 
 
 # ---- Jira helpers ----------------------------------------------------------
+
+class JiraError(RuntimeError):
+    """Jira API failure. `status` is the upstream HTTP code (None for transport errors)."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
 
 def jira_configured():
     """True only when all three Jira credentials are present."""
@@ -41,9 +49,9 @@ def jira_request(method, path, params=None, body=None):
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:500]
-        raise RuntimeError(f"Jira {method} {path} failed (HTTP {e.code}): {detail}")
+        raise JiraError(f"Jira {method} {path} failed (HTTP {e.code}): {detail}", status=e.code)
     except urllib.error.URLError as e:
-        raise RuntimeError(f"Jira {method} {path} failed: {e.reason}")
+        raise JiraError(f"Jira {method} {path} failed: {e.reason}")
     return json.loads(raw) if raw.strip() else None
 
 
@@ -182,15 +190,36 @@ def resolve_account(email):
     return {"accountId": chosen.get("accountId"), "displayName": chosen.get("displayName") or ""}
 
 
+# Boards whose sprint endpoint 400'd ("does not support sprints") — remembered so
+# every Team-tab load doesn't repeat a request that can only fail. Cleared when
+# JIRA_BOARD_ID changes (see clear_sprint_support_cache).
+_NO_SPRINT_BOARDS = set()
+
+
+def clear_sprint_support_cache():
+    """Forget which boards lack sprint support (call when JIRA_BOARD_ID changes)."""
+    _NO_SPRINT_BOARDS.clear()
+
+
 def active_sprint(board_id):
     """Return the board's active sprint as {id, name, goal}, or None.
 
-    Only Scrum boards have sprints; Kanban boards (or a board between sprints)
-    yield no active sprint and return None.
+    Only Scrum boards have sprints. A Scrum board between sprints yields an
+    empty list; team-managed (Kanban-style) boards reject the endpoint outright
+    with HTTP 400 "does not support sprints" — both mean None here (the 400 is
+    remembered per board). Any other error (auth, network) propagates.
     """
-    data = jira_request(
-        "GET", f"/rest/agile/1.0/board/{board_id}/sprint", params={"state": "active"}
-    )
+    if board_id in _NO_SPRINT_BOARDS:
+        return None
+    try:
+        data = jira_request(
+            "GET", f"/rest/agile/1.0/board/{board_id}/sprint", params={"state": "active"}
+        )
+    except JiraError as e:
+        if e.status == 400 and "does not support sprints" in str(e):
+            _NO_SPRINT_BOARDS.add(board_id)
+            return None
+        raise
     values = (data or {}).get("values") or []
     if not values:
         return None
@@ -208,14 +237,16 @@ def sprint_issues(sprint_id, account_ids):
     return [parse_ticket(i, config.JIRA_SITE) for i in issues]
 
 
-def open_issues(account_ids):
-    """Fallback: all not-Done tickets assigned to account_ids (parsed).
+def board_issues(board_id, account_ids):
+    """Fallback: the board's not-Done tickets assigned to account_ids (parsed).
 
-    Used when the board has no active sprint.
+    Used when the board has no active sprint (e.g. a team-managed board). Board-
+    scoped on purpose: a bare JQL search would also surface teammates' tickets
+    from every other project they touch.
     """
     jql = f"{_assignee_in_clause(account_ids)} AND statusCategory != Done ORDER BY updated DESC"
     data = jira_request(
-        "GET", "/rest/api/3/search/jql",
+        "GET", f"/rest/agile/1.0/board/{board_id}/issue",
         params={"jql": jql, "fields": _TEAM_FIELDS, "maxResults": "100"},
     )
     issues = (data or {}).get("issues") or []

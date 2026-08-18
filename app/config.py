@@ -141,8 +141,12 @@ def _parse_slack_ids():
 
 SLACK_ID_MAP = _parse_slack_ids()
 
-# Default deploy environment for all PRs (e.g. "csi-3"). Empty = no Deploy button shown.
+# Default deploy environment for all PRs (e.g. "dev-box"). Empty = no Deploy button shown.
 DEPLOY_TARGET = os.environ.get("DEPLOY_TARGET", "")
+
+# URL where the dev box serves the deployed app (VPN), linked from the Deployed
+# tab. Empty = no link shown.
+DEV_BOX_URL = os.environ.get("DEV_BOX_URL", "")
 
 # Editor command for opening the config folder. Empty = auto-detect (code → open/xdg-open).
 EDITOR_CMD = os.environ.get("EDITOR_CMD", "")

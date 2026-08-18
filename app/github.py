@@ -20,10 +20,10 @@ _cache_lock = threading.Lock()
 
 # ---- gh helpers ------------------------------------------------------------
 
-def gh_run(args):
+def gh_run(args, timeout=None):
     """Run `gh` with args, return stdout text or raise."""
     proc = subprocess.run(
-        ["gh", *args], capture_output=True, text=True, check=False
+        ["gh", *args], capture_output=True, text=True, check=False, timeout=timeout
     )
     if proc.returncode != 0:
         raise RuntimeError(
@@ -32,8 +32,8 @@ def gh_run(args):
     return proc.stdout
 
 
-def gh_json(args):
-    out = gh_run(args)
+def gh_json(args, timeout=None):
+    out = gh_run(args, timeout=timeout)
     return json.loads(out) if out.strip() else None
 
 
