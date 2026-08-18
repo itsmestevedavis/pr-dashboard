@@ -19,11 +19,12 @@ const TABS = {
   mine: {
     title: '🚀 My open PRs',
     endpoint: '/api/prs/mine',
-    groups: ['approved', 'has_comments', 'not_reviewed_yet'],
+    groups: ['approved', 'has_comments', 'not_reviewed_yet', 'draft'],
     headers: {
       approved: 'Approved — ready to merge',
       has_comments: 'Has comments to address',
       not_reviewed_yet: 'Not reviewed yet',
+      draft: 'Drafts — not ready for review',
     },
     render: renderMyPR,
     subgroup: ticketKey,
@@ -319,9 +320,7 @@ function renderMyPR(p) {
     <div class="pr-actions">
       <a class="btn-open" href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">Open ↗</a>
       ${deployControls}
-      ${channelBtn}
-      ${nudgeBtn}
-      ${teamsBtn}
+      ${p.status === 'draft' ? '' : channelBtn + nudgeBtn + teamsBtn}
       ${actionBtn}
     </div>
   </div>`;

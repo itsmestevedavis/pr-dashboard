@@ -99,6 +99,7 @@
   .badge-approved { background: #238636; color: #fff; }
   .badge-has_comments { background: #fb8500; color: #fff; }
   .badge-not_reviewed_yet { background: #30363d; color: var(--text); }
+  .badge-draft { background: #6e7681; color: #fff; }
   .badge-warning { background: #7d4e00; color: #f0a93a; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-left: 6px; }
   .badge-new { background: #30363d; color: var(--text); }
   .badge-indeterminate { background: #1f6feb; color: #fff; }

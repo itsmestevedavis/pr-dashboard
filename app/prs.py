@@ -13,11 +13,19 @@ from app.config import STATUS_ORDER, STATUS_LABELS, MY_STATUS_ORDER, MY_STATUS_L
 def determine_my_pr_status(pr, me):
     """Categorize one of my open PRs.
 
-    Returns dict {status, status_label, active_commenters} or None if the
-    PR should be excluded (drafts).
+    Returns dict {status, status_label, active_commenters, ...}. Drafts get
+    their own bottom-sorted "draft" group — they aren't ready for review, so
+    review state and nudges don't apply to them.
     """
     if pr.get("isDraft"):
-        return None
+        return {
+            "status": "draft",
+            "status_label": MY_STATUS_LABELS["draft"],
+            "active_commenters": [],
+            "stale_reviewers": [],
+            "nudge_mode": None,
+            "nudge_targets": [],
+        }
 
     latest_reviews = (pr.get("latestReviews") or {}).get("nodes") or []
     threads = (pr.get("reviewThreads") or {}).get("nodes") or []

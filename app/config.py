@@ -73,12 +73,14 @@ MY_STATUS_ORDER = {
     "approved": 0,
     "has_comments": 1,
     "not_reviewed_yet": 2,
+    "draft": 3,
 }
 
 MY_STATUS_LABELS = {
     "approved": "Approved",
     "has_comments": "Has comments",
     "not_reviewed_yet": "Not reviewed yet",
+    "draft": "Draft",
 }
 
 # Default reviewers to ping when a PR has no reviews yet.

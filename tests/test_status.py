@@ -51,8 +51,27 @@ def comment(login, created_at="2026-05-01T00:00:00Z", typename="User"):
 class DetermineMyPrStatus(unittest.TestCase):
     me = "abir-halwa"
 
-    def test_draft_returns_none(self):
-        self.assertIsNone(prs.determine_my_pr_status(pr(is_draft=True), self.me))
+    def test_draft_gets_draft_status(self):
+        out = prs.determine_my_pr_status(pr(is_draft=True), self.me)
+        self.assertEqual(out["status"], "draft")
+        self.assertEqual(out["status_label"], "Draft")
+        self.assertIsNone(out["nudge_mode"])
+        self.assertEqual(out["nudge_targets"], [])
+        self.assertEqual(out["active_commenters"], [])
+
+    def test_draft_wins_over_review_state(self):
+        # A draft isn't ready for review, so it stays in the Draft group even
+        # when reviews already exist on it.
+        out = prs.determine_my_pr_status(
+            pr(is_draft=True, review_decision="APPROVED",
+               latest_reviews=[review("alice", "APPROVED")]),
+            self.me,
+        )
+        self.assertEqual(out["status"], "draft")
+
+    def test_draft_sorts_after_every_other_status(self):
+        others = [v for k, v in config.MY_STATUS_ORDER.items() if k != "draft"]
+        self.assertGreater(config.MY_STATUS_ORDER["draft"], max(others))
 
     def test_approved_with_no_open_threads(self):
         out = prs.determine_my_pr_status(
@@ -145,7 +164,7 @@ class DetermineMyPrStatus(unittest.TestCase):
         out = prs.determine_my_pr_status(
             pr(review_decision="REVIEW_REQUIRED",
                comments=[comment("alice")]),
-            self.me,
+            me="me",
         )
         self.assertEqual(out["status"], "has_comments")
 
