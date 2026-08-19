@@ -2,9 +2,10 @@
 
 Builds a short "what to say at standup" summary from every Jira ticket assigned
 to me (app.jira.jira_search — all projects, so CP chores etc. count, not just
-the team board's sprint) and my own open PRs (app.prs.list_my_prs) by prompting
-the local `claude` CLI, then caches the result to disk so the Team tab can serve
-it instantly. Generation is button-only: `force=False` never calls `claude` (it
+the team board's sprint), my own open PRs (app.prs.list_my_prs), and open GitHub
+issues assigned to me across all repos (app.github.list_my_issues — next-gen
+tracks work as issues, not Jira tickets) by prompting the local `claude` CLI,
+then caches the result to disk so the Team tab can serve it instantly. Generation is button-only: `force=False` never calls `claude` (it
 only reads the cache), `force=True` regenerates.
 
 All Jira/config values are read at call time via `config.<NAME>` so live settings
@@ -16,7 +17,7 @@ import json
 import os
 import subprocess
 
-from app import config, jira, prs
+from app import config, github, jira, prs
 
 # Cache of the last generated summary, alongside jira_team.json under the shared
 # config dir. Shape: {generated_at, me}.
@@ -77,12 +78,23 @@ def _safe_my_prs():
         return []
 
 
-def _build_prompt(my_tickets, my_prs):
+def _safe_my_issues():
+    """Open GitHub issues assigned to me, best-effort. Same degradation contract
+    as _safe_my_prs: issues enrich the summary, they must never sink it."""
+    try:
+        return github.list_my_issues()
+    except Exception as e:
+        print(f"[standup] WARNING: couldn't fetch my GitHub issues, continuing without them: {e}", flush=True)
+        return []
+
+
+def _build_prompt(my_tickets, my_prs, my_issues):
     """Assemble the full prompt: the STANDUP_PROMPT instructions + a data block.
 
     Pure function (no I/O), so it's unit-testable without a subprocess. The data
     block lists every ticket assigned to me (all projects — the Tickets-tab JQL,
-    so chores and non-board work count) and my open PRs with their review/CI state.
+    so chores and non-board work count), my open PRs with their review/CI state,
+    and open GitHub issues assigned to me (next-gen work lives there, not Jira).
     """
     lines = []
 
@@ -111,6 +123,15 @@ def _build_prompt(my_tickets, my_prs):
             if pr.get("behind_by"):
                 bits.append(f"behind base by {pr['behind_by']}")
             lines.append("- " + " ".join(str(b) for b in bits))
+    else:
+        lines.append("- (none)")
+
+    lines.append("")
+    lines.append("GitHub issues assigned to me:")
+    if my_issues:
+        for issue in my_issues:
+            ref = f"{issue.get('repository') or ''}#{issue.get('number')}"
+            lines.append(f"- {ref} {issue.get('title') or ''}")
     else:
         lines.append("- (none)")
 
@@ -196,7 +217,7 @@ def standup_summary(force=False):
     if not jira.jira_configured():
         return _result(configured=False)
 
-    prompt = _build_prompt(jira.jira_search(), _safe_my_prs())
+    prompt = _build_prompt(jira.jira_search(), _safe_my_prs(), _safe_my_issues())
 
     try:
         raw = _run_claude(prompt)

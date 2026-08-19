@@ -265,20 +265,23 @@ REBASE_PROMPT = (
 )
 
 # Standup summary for the Team tab. Instructions only — the per-request data block
-# (all tickets assigned to me across projects, my PRs) is appended by
-# app/standup.py:_build_prompt. NOT interpolated with str.format because the JSON
-# example below contains literal braces; the data is concatenated, not formatted.
+# (all tickets assigned to me across projects, my PRs, my assigned GitHub issues)
+# is appended by app/standup.py:_build_prompt. NOT interpolated with str.format
+# because the JSON example below contains literal braces; the data is
+# concatenated, not formatted.
 STANDUP_PROMPT = (
     "You are helping me prepare for my team's daily standup. Below are the Jira "
     "tickets currently assigned to me — across every project (stories, bugs, "
-    "chores, anything) — and my own open pull requests.\n\n"
+    "chores, anything) — my own open pull requests, and the open GitHub issues "
+    "assigned to me (some teams track work as GitHub issues instead of Jira "
+    "tickets; treat those as work of mine too).\n\n"
     "Write one short update, grounded ONLY in the data below — do not invent work "
     "that isn't listed:\n"
     "\"me\": 1-3 sentences, first person, on what I'm working on — lead with "
-    "in-progress tickets and the state of my open PRs (e.g. waiting on review, "
-    "needs a rebase, checks failing), and mention chores or other one-off work "
-    "worth calling out. Skip untouched backlog items. If I have nothing assigned, "
-    "say so briefly.\n\n"
+    "in-progress tickets and assigned GitHub issues and the state of my open PRs "
+    "(e.g. waiting on review, needs a rebase, checks failing), and mention chores "
+    "or other one-off work worth calling out. Skip untouched backlog items. If I "
+    "have nothing assigned, say so briefly.\n\n"
     "Respond with ONLY a JSON object and nothing else — no markdown, no code fence, "
     "no prose around it:\n"
     "{\"me\": \"...\"}"

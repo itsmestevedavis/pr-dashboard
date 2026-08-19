@@ -45,6 +45,34 @@ def get_my_login():
     return _me
 
 
+# ---- Issues ----------------------------------------------------------------
+
+def list_my_issues():
+    """Return open GitHub issues assigned to me across all repos, most recently
+    updated first. Issues only — `gh search issues` excludes PRs (those come from
+    app.prs.list_my_prs)."""
+    me = get_my_login()
+    issues = gh_json([
+        "search", "issues",
+        "--assignee", me,
+        "--state", "open",
+        "--archived=false",
+        "--sort", "updated",
+        "--limit", "50",
+        "--json", "number,title,url,repository,updatedAt",
+    ]) or []
+    return [
+        {
+            "number": issue.get("number"),
+            "title": issue.get("title") or "",
+            "url": issue.get("url") or "",
+            "updatedAt": issue.get("updatedAt") or "",
+            "repository": (issue.get("repository") or {}).get("nameWithOwner") or "",
+        }
+        for issue in issues
+    ]
+
+
 # ---- PR enrichment ---------------------------------------------------------
 
 def fetch_detail(repo, number, fresh=False):

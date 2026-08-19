@@ -28,36 +28,57 @@ def _my_prs():
              "check_state": "SUCCESS", "behind_by": 2}]
 
 
+def _my_issues():
+    """A github.list_my_issues()-shaped list: open issues assigned to me."""
+    return [
+        {"number": 3998, "title": "Currency picker loses selection",
+         "repository": "Cognota/next-gen",
+         "url": "https://github.com/Cognota/next-gen/issues/3998",
+         "updatedAt": "2026-08-18T12:00:00Z"},
+    ]
+
+
 # ---- _build_prompt (pure) ----
 
 class BuildPromptTest(unittest.TestCase):
     def test_includes_all_my_tickets_across_projects(self):
         # The whole point of sourcing from jira_search: CP chores and other
         # non-CGP tickets must appear alongside board tickets.
-        p = standup._build_prompt(_my_tickets(), _my_prs())
+        p = standup._build_prompt(_my_tickets(), _my_prs(), _my_issues())
         self.assertIn("CGP-180", p)
         self.assertIn("Export crash fix", p)
         self.assertIn("CP-10900", p)
         self.assertIn("Configure SSO for Otis", p)
 
     def test_includes_status_and_type(self):
-        p = standup._build_prompt(_my_tickets(), _my_prs())
+        p = standup._build_prompt(_my_tickets(), _my_prs(), _my_issues())
         self.assertIn("In Review", p)
         self.assertIn("(Chore)", p)
 
     def test_no_tickets_says_none(self):
-        p = standup._build_prompt([], _my_prs())
+        p = standup._build_prompt([], _my_prs(), _my_issues())
         self.assertIn("Tickets assigned to me", p)
         self.assertIn("- (none)", p)
 
     def test_includes_my_prs_with_state(self):
-        p = standup._build_prompt(_my_tickets(), _my_prs())
+        p = standup._build_prompt(_my_tickets(), _my_prs(), _my_issues())
         self.assertIn("Fix export crash", p)
         self.assertIn("Approved", p)
 
     def test_no_prs_says_none(self):
-        p = standup._build_prompt(_my_tickets(), [])
+        p = standup._build_prompt(_my_tickets(), [], _my_issues())
         self.assertIn("My open pull requests:\n- (none)", p)
+
+    def test_includes_my_github_issues(self):
+        # GitHub-assigned work (e.g. Cognota/next-gen#3998) must feed the
+        # standup alongside Jira tickets — issues are tracked there too.
+        p = standup._build_prompt(_my_tickets(), _my_prs(), _my_issues())
+        self.assertIn("Cognota/next-gen#3998", p)
+        self.assertIn("Currency picker loses selection", p)
+
+    def test_no_issues_says_none(self):
+        p = standup._build_prompt(_my_tickets(), _my_prs(), [])
+        self.assertIn("GitHub issues assigned to me:\n- (none)", p)
 
 
 # ---- _parse_result ----
@@ -118,13 +139,15 @@ class StandupSummaryTest(unittest.TestCase):
         self.assertEqual(out["me"], "")
         self.assertIsNone(out["generated_at"])
 
+    @mock.patch.object(standup, "github")
     @mock.patch.object(standup, "prs")
     @mock.patch.object(standup, "jira")
     @mock.patch.object(standup, "_run_claude")
-    def test_force_true_generates_parses_and_caches(self, run, jira_mod, prs_mod):
+    def test_force_true_generates_parses_and_caches(self, run, jira_mod, prs_mod, gh_mod):
         jira_mod.jira_configured.return_value = True
         jira_mod.jira_search.return_value = _my_tickets()
         prs_mod.list_my_prs.return_value = _my_prs()
+        gh_mod.list_my_issues.return_value = _my_issues()
         run.return_value = '{"me": "I am closing CGP-180 and posting SQL for CP-10900."}'
         out = standup.standup_summary(force=True)
         run.assert_called_once()
@@ -145,28 +168,49 @@ class StandupSummaryTest(unittest.TestCase):
         self.assertFalse(out["configured"])
         self.assertFalse(os.path.exists(self.cache_path))
 
+    @mock.patch.object(standup, "github")
     @mock.patch.object(standup, "prs")
     @mock.patch.object(standup, "jira")
     @mock.patch.object(standup, "_run_claude")
-    def test_force_true_claude_failure_returns_error_and_does_not_cache(self, run, jira_mod, prs_mod):
+    def test_force_true_claude_failure_returns_error_and_does_not_cache(self, run, jira_mod, prs_mod, gh_mod):
         jira_mod.jira_configured.return_value = True
         jira_mod.jira_search.return_value = _my_tickets()
         prs_mod.list_my_prs.return_value = []
+        gh_mod.list_my_issues.return_value = []
         run.side_effect = RuntimeError("claude exited 1: boom")
         out = standup.standup_summary(force=True)
         self.assertIsNotNone(out["error"])
         self.assertEqual(out["me"], "")
         self.assertFalse(os.path.exists(self.cache_path))
 
+    @mock.patch.object(standup, "github")
     @mock.patch.object(standup, "prs")
     @mock.patch.object(standup, "jira")
     @mock.patch.object(standup, "_run_claude")
-    def test_my_pr_fetch_failure_still_generates_from_jira(self, run, jira_mod, prs_mod):
+    def test_my_pr_fetch_failure_still_generates_from_jira(self, run, jira_mod, prs_mod, gh_mod):
         # A GitHub hiccup on the PR fetch must not sink the whole summary — the
         # personal line is enriched by PRs, not dependent on them.
         jira_mod.jira_configured.return_value = True
         jira_mod.jira_search.return_value = _my_tickets()
         prs_mod.list_my_prs.side_effect = RuntimeError("gh boom")
+        gh_mod.list_my_issues.return_value = _my_issues()
+        run.return_value = '{"me": "On CGP-180."}'
+        out = standup.standup_summary(force=True)
+        run.assert_called_once()
+        self.assertIsNone(out["error"])
+        self.assertEqual(out["me"], "On CGP-180.")
+
+    @mock.patch.object(standup, "github")
+    @mock.patch.object(standup, "prs")
+    @mock.patch.object(standup, "jira")
+    @mock.patch.object(standup, "_run_claude")
+    def test_issue_fetch_failure_still_generates(self, run, jira_mod, prs_mod, gh_mod):
+        # Same degradation contract as PRs: GitHub issues enrich the summary,
+        # they must never sink it.
+        jira_mod.jira_configured.return_value = True
+        jira_mod.jira_search.return_value = _my_tickets()
+        prs_mod.list_my_prs.return_value = _my_prs()
+        gh_mod.list_my_issues.side_effect = RuntimeError("gh boom")
         run.return_value = '{"me": "On CGP-180."}'
         out = standup.standup_summary(force=True)
         run.assert_called_once()
