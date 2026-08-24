@@ -960,11 +960,13 @@ function toast(msg, error) {
 
 const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets', team: '👥 Team', cleanup: '🧹 Branch cleanup', 'reliability-stg': '📈 Reliability — staging', 'reliability-prod': '📈 Reliability — production' };
 
-// External dashboards embedded as iframes. The browser loads these directly
-// (not proxied through server.py), so VPN-only hosts work.
+// External dashboards embedded as iframes, served same-origin via the
+// server's /embed/ reverse proxy (app/http/embed_proxy.py). A direct http://
+// iframe would be upgraded to https:// by Firefox's HTTPS-First and hang —
+// these hosts have no TLS listener.
 const EMBED_URLS = {
-  'reliability-stg': 'http://reliability.stg.internal.cognota.com/',
-  'reliability-prod': 'http://reliability.prod.cognota.com/index.html',
+  'reliability-stg': '/embed/reliability-stg/',
+  'reliability-prod': '/embed/reliability-prod/index.html',
 };
 
 function renderEmbed(tab) {

@@ -19,7 +19,7 @@ from app.config import (
     ADDRESS_WORKFLOW, FIX_PIPELINE_WORKFLOW, REBASE_WORKFLOW, NUDGE_WORKFLOW,
 )
 from app.jobs import job, runners, clones
-from app.http import static_files, routes
+from app.http import static_files, routes, embed_proxy
 
 
 # ---- UI-writable settings ----------------------------------------------------
@@ -266,7 +266,29 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._stream_job(repo, number, kind)
             return
+        # Last: the embed proxy's Referer fallback would happily claim any path
+        # (e.g. /sources/…) requested by an embedded dashboard page, so every
+        # real route above must get first refusal.
+        target = embed_proxy.resolve(parsed.path, self.headers.get("Referer"))
+        if target:
+            self._serve_embed(target[0], target[1], parsed.query or "")
+            return
         self.send_error(404)
+
+    def _serve_embed(self, name, upstream_path, query):
+        try:
+            status, ctype, body = embed_proxy.fetch(name, upstream_path, query)
+        except Exception as e:
+            self._send_json(502, {"error": f"embed proxy failed: {e}"})
+            return
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _stream_job(self, repo, number, kind):
         with job._jobs_lock:
