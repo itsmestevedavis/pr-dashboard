@@ -743,3 +743,14 @@
   .standup-text { font-size: 14px; line-height: 1.5; color: var(--text); }
   .standup-empty { font-size: 13px; }
   .standup-error { font-size: 13px; color: #f85149; }
+
+  /* Embedded external dashboards (Reliability tabs). Breaks out of the
+     960px .wrap column to use the full viewport width. */
+  .embed-frame {
+    display: block;
+    width: 100vw;
+    margin-left: calc(50% - 50vw);
+    height: calc(100vh - 160px);
+    border: 0;
+    background: #fff;
+  }

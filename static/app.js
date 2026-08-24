@@ -41,7 +41,7 @@ const TABS = {
 };
 
 const _tab = (new URLSearchParams(location.search)).get('tab');
-let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets', 'team', 'cleanup'].includes(_tab) ? _tab : 'incoming';
+let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets', 'team', 'cleanup', 'reliability-stg', 'reliability-prod'].includes(_tab) ? _tab : 'incoming';
 let deployedState = {};  // environments map from /api/deployed, populated when mine tab loads
 
 function escapeHtml(s) {
@@ -958,7 +958,20 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
-const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets', team: '👥 Team', cleanup: '🧹 Branch cleanup' };
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets', team: '👥 Team', cleanup: '🧹 Branch cleanup', 'reliability-stg': '📈 Reliability — staging', 'reliability-prod': '📈 Reliability — production' };
+
+// External dashboards embedded as iframes. The browser loads these directly
+// (not proxied through server.py), so VPN-only hosts work.
+const EMBED_URLS = {
+  'reliability-stg': 'http://reliability.stg.internal.cognota.com/',
+  'reliability-prod': 'http://reliability.prod.cognota.com/index.html',
+};
+
+function renderEmbed(tab) {
+  const url = EMBED_URLS[tab];
+  document.getElementById('content').innerHTML =
+    `<iframe class="embed-frame" src="${escapeHtml(url)}" title="${escapeHtml(TAB_TITLES[tab])}"></iframe>`;
+}
 
 function setActiveTab(tab) {
   currentTab = tab;
@@ -1640,6 +1653,8 @@ async function load(fresh) {
   try {
     if (currentTab === 'settings') {
       renderSettings();
+    } else if (EMBED_URLS[currentTab]) {
+      renderEmbed(currentTab);
     } else if (currentTab === 'status') {
       const res = await fetch('/api/status');
       if (!res.ok) throw new Error('HTTP ' + res.status);
