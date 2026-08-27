@@ -442,6 +442,10 @@
     gap: 4px;
     border-bottom: 1px solid var(--border);
     margin-bottom: 24px;
+    /* nowrap tabs scroll sideways on narrow windows; hidden-y stops the 1px
+       .tab margin overhang from spawning a vertical scrollbar. */
+    overflow-x: auto;
+    overflow-y: hidden;
   }
   .tab {
     background: none;
@@ -453,9 +457,13 @@
     cursor: pointer;
     border-bottom: 2px solid transparent;
     margin-bottom: -1px;
+    white-space: nowrap;
   }
   .tab.active { color: var(--text); border-bottom-color: var(--blue); }
   .tab:hover:not(.active) { color: var(--text); }
+  /* Meta tabs (Status/Cleanup/Settings): right-aligned, slightly de-emphasized. */
+  .tab-meta { font-size: 13px; }
+  .tab-meta-start { margin-left: auto; }
   .settings-form { max-width: 560px; display: flex; flex-direction: column; gap: 20px; padding: 8px 0 24px; }
   .settings-row { display: flex; flex-direction: column; gap: 5px; }
   .settings-label { font-weight: 600; color: #c9d1d9; font-size: 14px; }
@@ -744,13 +752,30 @@
   .standup-empty { font-size: 13px; }
   .standup-error { font-size: 13px; color: #f85149; }
 
-  /* Embedded external dashboards (Reliability tabs). Breaks out of the
-     960px .wrap column to use the full viewport width. */
+  /* Embedded reliability dashboards (Reliability tab). The iframe breaks out
+     of the 960px .wrap column to use the full viewport width. */
+  .embed-toolbar { display: flex; gap: 4px; margin-bottom: 12px; }
+  .embed-env-btn {
+    background: var(--card);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .embed-env-btn:hover:not([aria-pressed="true"]) { color: var(--text); }
+  .embed-env-btn[aria-pressed="true"] {
+    background: var(--blue);
+    border-color: var(--blue);
+    color: #fff;
+  }
   .embed-frame {
     display: block;
     width: 100vw;
     margin-left: calc(50% - 50vw);
-    height: calc(100vh - 160px);
+    height: calc(100vh - 205px);
     border: 0;
     background: #fff;
   }

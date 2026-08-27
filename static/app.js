@@ -40,8 +40,15 @@ const TABS = {
   },
 };
 
-const _tab = (new URLSearchParams(location.search)).get('tab');
-let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets', 'team', 'cleanup', 'reliability-stg', 'reliability-prod'].includes(_tab) ? _tab : 'incoming';
+const _params = new URLSearchParams(location.search);
+// Pre-merge deep links (?tab=reliability-stg / -prod) map onto the single
+// Reliability tab, carrying their environment over.
+const _LEGACY_EMBED_TABS = { 'reliability-stg': 'stg', 'reliability-prod': 'prod' };
+const _tab = _LEGACY_EMBED_TABS[_params.get('tab')] ? 'reliability' : _params.get('tab');
+let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets', 'team', 'cleanup', 'reliability'].includes(_tab) ? _tab : 'incoming';
+let embedEnv = ['stg', 'prod'].includes(_params.get('env'))
+  ? _params.get('env')
+  : (_LEGACY_EMBED_TABS[_params.get('tab')] || 'stg');
 let deployedState = {};  // environments map from /api/deployed, populated when mine tab loads
 
 function escapeHtml(s) {
@@ -941,6 +948,7 @@ const CARD_ACTIONS = {
   'btn-nudge-team': onNudgeTeam,
   'btn-channel-team': onChannelTeam,
   'btn-standup-generate': onGenerateStandup,
+  'embed-env-btn': onEmbedEnv,
 };
 
 function onContentClick(ev) {
@@ -958,21 +966,35 @@ function toast(msg, error) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
 }
 
-const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets', team: '👥 Team', cleanup: '🧹 Branch cleanup', 'reliability-stg': '📈 Reliability — staging', 'reliability-prod': '📈 Reliability — production' };
+const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My open PRs', deployed: '🚢 Currently deployed', status: '⚙️ App status', settings: '⚙️ Settings', tickets: '🎫 My Jira tickets', team: '👥 Team', cleanup: '🧹 Branch cleanup', reliability: '📈 Reliability' };
 
-// External dashboards embedded as iframes, served same-origin via the
+// Reliability dashboards embedded as iframes, served same-origin via the
 // server's /embed/ reverse proxy (app/http/embed_proxy.py). A direct http://
 // iframe would be upgraded to https:// by Firefox's HTTPS-First and hang —
-// these hosts have no TLS listener.
-const EMBED_URLS = {
-  'reliability-stg': '/embed/reliability-stg/',
-  'reliability-prod': '/embed/reliability-prod/index.html',
+// these hosts have no TLS listener. One tab; env picked by the toggle.
+const EMBED_ENV_URLS = {
+  stg: '/embed/reliability-stg/',
+  prod: '/embed/reliability-prod/index.html',
 };
 
-function renderEmbed(tab) {
-  const url = EMBED_URLS[tab];
+function renderEmbed() {
+  const buttons = Object.keys(EMBED_ENV_URLS).map(env =>
+    `<button class="embed-env-btn" type="button" data-env="${env}" aria-pressed="${env === embedEnv}">${env.toUpperCase()}</button>`
+  ).join('');
   document.getElementById('content').innerHTML =
-    `<iframe class="embed-frame" src="${escapeHtml(url)}" title="${escapeHtml(TAB_TITLES[tab])}"></iframe>`;
+    `<div class="embed-toolbar" role="group" aria-label="Environment">${buttons}</div>`
+    + `<iframe class="embed-frame" src="${escapeHtml(EMBED_ENV_URLS[embedEnv])}" title="Reliability — ${embedEnv}"></iframe>`;
+}
+
+function onEmbedEnv(btn) {
+  const env = btn.dataset.env;
+  if (!EMBED_ENV_URLS[env] || env === embedEnv) return;
+  embedEnv = env;
+  const url = new URL(location.href);
+  if (env === 'stg') url.searchParams.delete('env');
+  else url.searchParams.set('env', env);
+  history.replaceState({}, '', url);
+  renderEmbed();
 }
 
 function setActiveTab(tab) {
@@ -984,6 +1006,9 @@ function setActiveTab(tab) {
   const url = new URL(location.href);
   if (tab === 'incoming') url.searchParams.delete('tab');
   else url.searchParams.set('tab', tab);
+  // env only means something on the Reliability tab; stg is the default.
+  if (tab === 'reliability' && embedEnv !== 'stg') url.searchParams.set('env', embedEnv);
+  else url.searchParams.delete('env');
   history.replaceState({}, '', url);
 }
 
@@ -1655,8 +1680,8 @@ async function load(fresh) {
   try {
     if (currentTab === 'settings') {
       renderSettings();
-    } else if (EMBED_URLS[currentTab]) {
-      renderEmbed(currentTab);
+    } else if (currentTab === 'reliability') {
+      renderEmbed();
     } else if (currentTab === 'status') {
       const res = await fetch('/api/status');
       if (!res.ok) throw new Error('HTTP ' + res.status);
