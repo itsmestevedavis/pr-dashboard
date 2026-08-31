@@ -57,6 +57,30 @@
   }
   .ticket-header .ticket-link { color: var(--blue); text-decoration: none; }
   .ticket-group .pr:last-child { margin-bottom: 0; }
+  .epic-group {
+    border-left: 2px solid var(--purple, #a371f7);
+    padding-left: 12px;
+    margin-bottom: 12px;
+  }
+  .epic-header {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text);
+    margin: 4px 0 6px;
+  }
+  .epic-header .epic-summary {
+    font-weight: 500;
+    color: var(--muted);
+    margin-left: 4px;
+  }
+  .epic-header .ticket-count {
+    font-weight: 500;
+    font-size: 11px;
+    color: var(--muted);
+    margin-left: 6px;
+  }
+  .epic-header .ticket-link { color: var(--blue); text-decoration: none; }
+  .epic-group .pr:last-child, .epic-group .ticket-group:last-child { margin-bottom: 0; }
   .pr {
     background: var(--card);
     border: 1px solid var(--border);

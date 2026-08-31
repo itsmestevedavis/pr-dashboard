@@ -6,7 +6,8 @@ PR lists (both authored and review-requested), and check-run summarization.
 
 import concurrent.futures
 import json
-from app import config, deploy, github
+import re
+from app import config, deploy, github, jira
 from app.config import STATUS_ORDER, STATUS_LABELS, MY_STATUS_ORDER, MY_STATUS_LABELS
 
 
@@ -283,6 +284,33 @@ def pr_behind_count(repo: str, base: str, head: str) -> int:
     return int(out) if out.isdigit() else 0
 
 
+# Mirrors ticketKey() in static/app.js — the two must extract the same slug or
+# the frontend's ticket clusters and the backend's epic lookups will disagree.
+_TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+
+def ticket_key(pr: dict) -> str:
+    """Jira ticket slug for a PR — branch name by convention, title fallback."""
+    m = _TICKET_RE.search(f"{pr.get('headRefName') or ''} {pr.get('title') or ''}")
+    return m.group(1) if m else ""
+
+
+def attach_epics(pr_list: list) -> list:
+    """Return a copy of pr_list with each PR's parent epic attached under "epic".
+
+    Best-effort: an unconfigured or failing Jira yields epic=None everywhere —
+    the epic header is decoration, so Jira being down must never break My PRs.
+    """
+    keys = sorted({k for k in (ticket_key(p) for p in pr_list) if k})
+    epics = {}
+    if keys and jira.jira_configured():
+        try:
+            epics = jira.issue_epics(keys)
+        except Exception as e:
+            print(f"[warn] epic lookup failed: {e}", flush=True)
+    return [{**p, "epic": epics.get(ticket_key(p))} for p in pr_list]
+
+
 def list_my_prs():
     """Return my open PRs across all repos, enriched with status."""
     me = github.get_my_login()
@@ -348,6 +376,8 @@ def list_my_prs():
             max_workers=min(8, len(out_list))
         ) as pool:
             out_list = list(pool.map(with_behind, out_list))
+
+    out_list = attach_epics(out_list)
 
     out_list.sort(key=lambda p: p["updatedAt"])
     out_list.sort(key=lambda p: MY_STATUS_ORDER[p["status"]])

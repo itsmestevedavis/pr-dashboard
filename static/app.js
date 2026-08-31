@@ -28,6 +28,7 @@ const TABS = {
     },
     render: renderMyPR,
     subgroup: ticketKey,
+    supergroup: p => p.epic || null,  // parent epic attached by /api/prs/mine
   },
   tickets: {
     title: '🎫 My Jira tickets',
@@ -109,12 +110,42 @@ function render(prs) {
   // PR-card buttons are handled by the delegated #content listener (see initDelegation).
 }
 
-// Render the cards within one status group. When the tab opts into subgrouping
-// (tab.subgroup), PRs sharing a key (e.g. a Jira ticket) are clustered under a
-// sub-header. Clusters appear at the position of their first member, preserving
-// the backend ordering; singletons and keyless PRs render inline as before.
+// Render the cards within one status group. When the tab opts into supergrouping
+// (tab.supergroup — e.g. the ticket's parent epic), PRs sharing an epic are
+// wrapped in an epic section; ticket subgrouping then applies within it. Epic
+// sections appear at the position of their first member, preserving the backend
+// ordering; epic-less PRs render between sections exactly as before.
 function renderGroupBody(prs, tab) {
   if (!tab.subgroup) return prs.map(tab.render).join('');
+  if (!tab.supergroup) return renderTicketClusters(prs, tab);
+  const rendered = new Set();
+  let html = '';
+  let run = [];  // consecutive epic-less PRs, flushed as one ticket-clustered block
+  const flush = () => { if (run.length) { html += renderTicketClusters(run, tab); run = []; } };
+  for (const p of prs) {
+    const epic = tab.supergroup(p);
+    if (!epic || !epic.key) { run.push(p); continue; }
+    if (rendered.has(epic.key)) continue;
+    rendered.add(epic.key);
+    flush();
+    const members = prs.filter(q => (tab.supergroup(q) || {}).key === epic.key);
+    const noun = members.length === 1 ? 'PR' : 'PRs';
+    html += `<div class="epic-group">`
+      + `<div class="epic-header">${escapeHtml(epic.key)}${ticketLink(epic.key)}`
+      + ` <span class="epic-summary">${escapeHtml(epic.summary || '')}</span>`
+      + ` <span class="ticket-count">${members.length} ${noun}</span></div>`
+      + renderTicketClusters(members, tab)
+      + `</div>`;
+  }
+  flush();
+  return html;
+}
+
+// When the tab opts into subgrouping (tab.subgroup), PRs sharing a key (e.g. a
+// Jira ticket) are clustered under a sub-header. Clusters appear at the position
+// of their first member, preserving the backend ordering; singletons and keyless
+// PRs render inline as before.
+function renderTicketClusters(prs, tab) {
   const counts = {};
   for (const p of prs) {
     const k = tab.subgroup(p);

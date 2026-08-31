@@ -5,7 +5,9 @@ configuration changes (LIVE_CONFIG) are picked up without a restart.
 """
 
 import base64
+import concurrent.futures
 import json
+import time
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -149,6 +151,60 @@ def jira_statuses():
             cat_by_name[name] = category
     rank = {"new": 0, "indeterminate": 1}
     return sorted(cat_by_name, key=lambda n: (rank.get(cat_by_name[n], 2), n.lower()))
+
+
+# ---- My PRs tab: ticket -> parent-epic lookups -------------------------------
+
+# issue key -> (fetched_at_monotonic, epic-or-None). Epic membership changes
+# rarely, so a short TTL keeps the My PRs tab from re-asking Jira on every load
+# while still picking up re-parented tickets eventually.
+_EPIC_CACHE = {}
+_EPIC_CACHE_TTL = 900  # seconds
+
+
+def issue_epic(key):
+    """The issue's parent epic as {key, summary, url}, or None (cached).
+
+    A 404 caches None: branch names can carry slugs that look like Jira keys
+    but aren't real issues, and re-asking about them every load is pure waste.
+    Other Jira errors propagate (issue_epics converts them to None per key).
+    """
+    now = time.monotonic()
+    hit = _EPIC_CACHE.get(key)
+    if hit and now - hit[0] < _EPIC_CACHE_TTL:
+        return hit[1]
+    try:
+        data = jira_request("GET", f"/rest/api/3/issue/{key}", params={"fields": "parent"})
+    except JiraError as e:
+        if e.status == 404:
+            _EPIC_CACHE[key] = (now, None)
+            return None
+        raise
+    fields = (data or {}).get("fields") or {}
+    epic = _parse_epic(fields.get("parent"), config.JIRA_SITE)
+    _EPIC_CACHE[key] = (now, epic)
+    return epic
+
+
+def issue_epics(keys):
+    """Parent epic per issue key: {key: epic-or-None}.
+
+    Independent blocking lookups, so fan out (mirrors the behind-count pool in
+    app/prs.py). Any per-key failure yields None for that key — an epic header
+    is decoration, never worth failing the PR list over.
+    """
+    if not keys:
+        return {}
+
+    def safe(key):
+        try:
+            return issue_epic(key)
+        except Exception as e:
+            print(f"[warn] epic lookup failed for {key}: {e}", flush=True)
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(keys))) as pool:
+        return dict(zip(keys, pool.map(safe, keys)))
 
 
 # ---- Team tab: account resolution, sprints, team issues, epics --------------
