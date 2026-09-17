@@ -200,8 +200,8 @@ query($q: String!) {
                   totalCount
                   nodes {
                     __typename
-                    ... on CheckRun { name conclusion status detailsUrl }
-                    ... on StatusContext { context state targetUrl }
+                    ... on CheckRun { name conclusion status detailsUrl startedAt }
+                    ... on StatusContext { context state targetUrl createdAt }
                   }
                 }
               }
@@ -227,31 +227,42 @@ def summarize_checks(rollup: dict) -> dict:
 
     Normalizes both node types: CheckRun (GitHub Actions etc.) uses
     status/conclusion, while the legacy StatusContext uses a single state.
+    A re-pushed commit can carry several CheckRuns with the same name (an
+    older superseded run alongside its rerun) — only the most recently
+    started run per name is kept, mirroring how GitHub's own PR UI collapses
+    them, so a stale CANCELLED run doesn't outvote its passing rerun.
     Returns {passed: int, pending: [{name,url}], failed: [{name,url}], truncated: bool}.
     Greens are counted (not named); pending/failed are named with a details URL.
     """
     contexts = (rollup.get("contexts") or {})
     nodes = contexts.get("nodes") or []
-    passed = 0
-    pending: list = []
-    failed: list = []
+    latest_by_name: dict = {}
     for node in nodes:
         if node.get("__typename") == "CheckRun":
             name = node.get("name") or "check"
             url = node.get("detailsUrl") or ""
+            timestamp = node.get("startedAt") or ""
             # An incomplete CheckRun has no conclusion yet -> pending.
             verdict = node.get("conclusion") if node.get("status") == "COMPLETED" else None
         else:  # StatusContext (legacy commit status)
             name = node.get("context") or "check"
             url = node.get("targetUrl") or ""
+            timestamp = node.get("createdAt") or ""
             verdict = node.get("state")
         verdict = (verdict or "").upper()
-        if verdict in _CHECK_PASSED:
+        prior = latest_by_name.get(name)
+        if prior is None or timestamp >= prior["timestamp"]:
+            latest_by_name[name] = {"url": url, "verdict": verdict, "timestamp": timestamp}
+    passed = 0
+    pending: list = []
+    failed: list = []
+    for name, entry in latest_by_name.items():
+        if entry["verdict"] in _CHECK_PASSED:
             passed += 1
-        elif verdict in _CHECK_FAILED:
-            failed.append({"name": name, "url": url})
+        elif entry["verdict"] in _CHECK_FAILED:
+            failed.append({"name": name, "url": entry["url"]})
         else:
-            pending.append({"name": name, "url": url})
+            pending.append({"name": name, "url": entry["url"]})
     total = contexts.get("totalCount") or len(nodes)
     return {
         "passed": passed,
