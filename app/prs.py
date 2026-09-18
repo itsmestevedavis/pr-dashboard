@@ -160,6 +160,11 @@ query($q: String!) {
         headRefName
         baseRefName
         mergeStateStatus
+        isInMergeQueue
+        mergeQueueEntry {
+          state
+          position
+        }
         author { login __typename }
         repository {
           nameWithOwner
@@ -370,6 +375,12 @@ def list_my_prs():
             "check_state": rollup.get("state") or "",
             "checks": summarize_checks(rollup),
             "merge_state_status": pr.get("mergeStateStatus") or "",
+            # mergeStateStatus alone doesn't reflect the merge queue — a queued PR
+            # can still report BLOCKED/UNSTABLE while its queue-triggered checks run,
+            # which would otherwise show as a stuck/blocked Merge button.
+            "in_merge_queue": bool(pr.get("isInMergeQueue")),
+            "merge_queue_state": (pr.get("mergeQueueEntry") or {}).get("state") or "",
+            "merge_queue_position": (pr.get("mergeQueueEntry") or {}).get("position"),
             **status,
         })
 

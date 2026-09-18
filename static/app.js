@@ -244,7 +244,14 @@ function renderMyPR(p) {
   }
 
   let actionBtn = '';
-  if (p.status === 'approved') {
+  if (p.in_merge_queue) {
+    // Already enqueued — a Merge click here would just error, and the checks
+    // GitHub reruns for the queue can transiently look "blocked" even though
+    // the PR is actively progressing, so show queue state instead of a button.
+    const posText = p.merge_queue_position ? ` · #${p.merge_queue_position}` : '';
+    const stateText = p.merge_queue_state ? ` (${p.merge_queue_state.replace(/_/g, ' ').toLowerCase()})` : '';
+    actionBtn = infraFixBtn + `<span class="badge-meta" title="In the merge queue${stateText}">🚦 In merge queue${posText}</span>`;
+  } else if (p.status === 'approved') {
     const blocked = ciBlocked || reviewBlocked || needsRebase || hasConflicts;
     const reasons = [
       ciBlocked && 'CI failing',
@@ -349,7 +356,7 @@ function renderMyPR(p) {
        data-base="${escapeHtml(p.baseRefName)}"
        data-method="${escapeHtml(p.defaultMergeMethod)}">
     <div class="pr-main">
-      <div class="pr-meta">${escapeHtml(p.repository)} · #${p.number}<span class="badge badge-${p.status}">${escapeHtml(p.status_label)}</span>${needsRebase ? '<span class="badge-warning">⚠ Needs rebase</span>' : hasConflicts ? '<span class="badge-warning">⚠ Has conflicts</span>' : ''}</div>
+      <div class="pr-meta">${escapeHtml(p.repository)} · #${p.number}<span class="badge badge-${p.status}">${escapeHtml(p.status_label)}</span>${p.in_merge_queue ? '<span class="badge-meta">🚦 Queued</span>' : needsRebase ? '<span class="badge-warning">⚠ Needs rebase</span>' : hasConflicts ? '<span class="badge-warning">⚠ Has conflicts</span>' : ''}</div>
       <div class="pr-title"><a href="${escapeHtml(safeUrl(p.url))}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
       <div class="pr-sub">updated ${relativeTime(p.updatedAt)}</div>
       ${renderChecks(p)}
