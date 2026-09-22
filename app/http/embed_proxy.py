@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 # name -> backend origin (scheme + host, no trailing slash). The frontend's
 # EMBED_URLS in static/app.js points its iframes at /embed/<name>/….
 EMBED_BACKENDS = {
+    "reliability-dev": "http://reliability.dev.internal.cognota.com",
     "reliability-stg": "http://reliability.stg.internal.cognota.com",
     "reliability-prod": "http://reliability.prod.cognota.com",
 }

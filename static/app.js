@@ -47,7 +47,7 @@ const _params = new URLSearchParams(location.search);
 const _LEGACY_EMBED_TABS = { 'reliability-stg': 'stg', 'reliability-prod': 'prod' };
 const _tab = _LEGACY_EMBED_TABS[_params.get('tab')] ? 'reliability' : _params.get('tab');
 let currentTab = ['mine', 'deployed', 'status', 'settings', 'tickets', 'team', 'cleanup', 'reliability'].includes(_tab) ? _tab : 'incoming';
-let embedEnv = ['stg', 'prod'].includes(_params.get('env'))
+let embedEnv = ['dev', 'stg', 'prod'].includes(_params.get('env'))
   ? _params.get('env')
   : (_LEGACY_EMBED_TABS[_params.get('tab')] || 'stg');
 let deployedState = {};  // environments map from /api/deployed, populated when mine tab loads
@@ -1011,6 +1011,7 @@ const TAB_TITLES = { incoming: '📋 PRs awaiting your review', mine: '🚀 My o
 // iframe would be upgraded to https:// by Firefox's HTTPS-First and hang —
 // these hosts have no TLS listener. One tab; env picked by the toggle.
 const EMBED_ENV_URLS = {
+  dev: '/embed/reliability-dev/',
   stg: '/embed/reliability-stg/',
   prod: '/embed/reliability-prod/index.html',
 };
